@@ -28,7 +28,7 @@
  */
 
 const { tablasMostrador, agregarHojaDepositosEfectivo } = require('../cfdi-mapping/mostrador-hoja');
-const { agregarHojaResumen } = require('./reportes-por-facturar.resumen');
+const { agregarHojaResumen, estatusDe } = require('./reportes-por-facturar.resumen');
 
 const SECCIONES = {
   mostrador:  { titulo: 'MOSTRADOR',              hoja: 'MOSTRADOR' },
@@ -279,7 +279,7 @@ function _encabezado(row, n) {
 const COL_IMPORTE = 4;
 const COL_DESCRIPCION = 3;
 
-function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colImporte = COL_IMPORTE }) {
+function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colImporte = COL_IMPORTE, abonos = true, alEscribir = null }) {
   const n = columnas.length;
   for (const e of encabezados) _encabezado(ws.addRow(e), n);
   _encabezado(ws.addRow(columnas), n);
@@ -290,7 +290,8 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
       if (row.getCell(1).value instanceof Date) row.getCell(1).numFmt = 'd/m/yy';
       row.getCell(COL_DESCRIPCION).fill = _relleno(GRIS);
       row.getCell(colImporte).numFmt = DINERO;
-      _escribirAbonos(ws, d, n);
+      alEscribir?.(row, d);
+      if (abonos) _escribirAbonos(ws, d, n);
     }
     const sub = ws.addRow([]);
     sub.getCell(2).value = `Subtotal ${g.cliente}`;
@@ -363,19 +364,39 @@ function _totalesFormaPago(ws, bloques, colImporte = COL_IMPORTE) {
   }
 }
 
+// MOSTRADOR sin el historial de abonos debajo; en su lugar ESTATUS (SALDADA /
+// ABONADA) y SALDO PENDIENTE (2026-11-12, usuario: "a la de mostrador CEDIS A0
+// quítale los abonos y agrega una columna de estatus saldada o abonada"). El
+// desglose de abonos queda en la hoja RESUMEN POR FACTURAR.
+const ESTATUS_MOSTRADOR = { SALDADA: 'SALDADA', ABONADA: 'ABONADA' };
+function _estatusMostrador(d, tipoBloque) {
+  const e = estatusDe({ ...d, _seccion: tipoBloque === 'pendiente' ? 'pendiente' : null });
+  return { estatus: ESTATUS_MOSTRADOR[e.estatus] ?? null, saldo: e.estatus === 'ABONADA' ? e.saldo : null, el: e.pagadaEl };
+}
+
 function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.hoja) {
   if (!bloques.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 32 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 32 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 10 }, { width: 12 }, { width: 14 }, { width: 11 }];
   for (const b of bloques) {
     _escribirBloque(ws, {
       encabezados: [b.tipo === 'global'
-        ? [_fecha(b.fechaFactura, true), b.otrasFacturas?.length ? `TAMBIÉN FACTURADA EN: ${b.otrasFacturas.join(', ')}` : null, null, null, null, b.serie, b.factura, 'ID NUMO']
-        : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, null, 'ID NUMO']],
-      columnas: ['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', null],
+        ? [_fecha(b.fechaFactura, true), b.otrasFacturas?.length ? `TAMBIÉN FACTURADA EN: ${b.otrasFacturas.join(', ')}` : null, null, null, null, b.serie, b.factura, 'ID NUMO', null, null, null]
+        : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, null, 'ID NUMO', null, null, null]],
+      columnas: ['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', null, 'ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL'],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha, d.deKore), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.idNumo],
+      abonos: false,
+      fila: d => {
+        const e = _estatusMostrador(d, b.tipo);
+        return [_fecha(d.fecha, d.deKore), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.idNumo, e.estatus, e.saldo, _fecha(e.el)];
+      },
+      alEscribir: (row, d) => {
+        const e = row.getCell(9).value;
+        if (e) row.getCell(9).font = { bold: true, color: { argb: e === 'SALDADA' ? 'FF15803D' : 'FFB45309' } };
+        row.getCell(10).numFmt = DINERO;
+        row.getCell(11).numFmt = 'd/m/yy';
+      },
     });
   }
   _totalesFormaPago(ws, bloques);

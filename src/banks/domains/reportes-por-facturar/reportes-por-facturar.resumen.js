@@ -15,16 +15,21 @@
  *   K Observaciones · L Valida descuento extra · M Caja
  *   + N Fecha · O ID NUMO · P Banco (extra, para no perder de dónde salió)
  *   + Q No. abonos · R Último abono (2026-11-12)
- *   + S ESTATUS (ABONADA / PAGADA) · T Saldo pendiente · U Pagada el
- *   + V–AA historial COMPLETO de la remisión en Kore hasta quedar en $0:
+ *   + S IMPORTE TOTAL VENTA (2026-11-12, pedido del usuario: "también debe
+ *     venir importe total") · T ESTATUS (ABONADA / SALDADA; antes PAGADA) · U Saldo pendiente
+ *     · V Pagada el
+ *   + W–AB historial COMPLETO de la remisión en Kore hasta quedar en $0:
  *     fecha, TIPO, importe, movimiento, forma y saldo después de ese
  *     movimiento — un sub-renglón por movimiento; A–U de la venta combinadas a
  *     lo alto (2026-11-12, pedido del usuario: "dentro de la celda de esa venta
  *     se hagan más celdas"; y caso INTI CESAR GARCIA MENDEZ A0-261000641: antes
  *     solo salían los anteriores y la devolución contaba como abono).
  *
- * No consulta nada: se arma de las secciones ya calculadas (MOSTRADOR, REF.,
- * FACT ESPECIALES y X FAC CON FICHA); un depósito MIXTO se parte en un renglón
+ * No consulta nada: se arma de las secciones ya calculadas, SOLO con lo que
+ * todavía no tiene factura: PENDIENTE GENERAR FACTURA y X FAC CON FICHA
+ * (2026-11-12, usuario: "cuando se facturen salga de resumen por facturar";
+ * lo ya facturado — global, REF., FACT ESPECIALES — sigue en sus hojas). Al
+ * facturarse sale con ↻ Actualizar. Un depósito MIXTO se parte en un renglón
  * por forma. Se dejan VACÍOS para captura a mano: Observaciones ("LIR" =
  * liquidación), Valida descuento extra y Caja (cajera: Kore no la da). Fuera
  * de esta hoja: "Desglose de depósitos" y el bloque de Contabilidad (en su
@@ -56,24 +61,24 @@ const _diaFila = d => (!d.fecha ? null : String(d.fecha).length === 10 ? d.fecha
 /**
  * ESTATUS de la venta (2026-11-12, pedido del usuario: "saber si está abonada o
  * pagada por completo"), al momento de calcular / ↻ Actualizar el reporte:
- * con el historial de Kore, PAGADA si todas sus remisiones quedaron en saldo 0
+ * con el historial de Kore, SALDADA si todas sus remisiones quedaron en saldo 0
  * (fecha = la última en saldarse), si no ABONADA con lo que deben. Sin
  * historial: X FAC CON FICHA (todavía deben) → ABONADA; PENDIENTE GENERAR
- * FACTURA (saldo 0 por definición) → PAGADA; lo demás "SIN DATO".
+ * FACTURA (saldo 0 por definición) → SALDADA; lo demás "SIN DATO".
  */
 function estatusDe(d) {
   const hs = d.historialAbonos ?? [];
   if (hs.length) {
     const deben = hs.filter(h => !h.saldadaEl);
-    if (!deben.length) return { estatus: 'PAGADA', saldo: 0, pagadaEl: hs.map(h => _diaMx(h.saldadaEl)).sort().at(-1) };
+    if (!deben.length) return { estatus: 'SALDADA', saldo: 0, pagadaEl: hs.map(h => _diaMx(h.saldadaEl)).sort().at(-1) };
     return { estatus: 'ABONADA', saldo: _r2(deben.reduce((s, h) => s + (Number(h.saldo) || 0), 0)), pagadaEl: null };
   }
   if ((Number(d.saldo) || 0) > 0.005 || d._seccion === 'ficha') return { estatus: 'ABONADA', saldo: d.saldo != null ? _r2(d.saldo) : null, pagadaEl: null };
-  if (d._seccion === 'pendiente') return { estatus: 'PAGADA', saldo: 0, pagadaEl: null };
+  if (d._seccion === 'pendiente') return { estatus: 'SALDADA', saldo: 0, pagadaEl: null };
   return { estatus: 'SIN DATO', saldo: null, pagadaEl: null };
 }
 
-/** Depósitos de las secciones que entran al resumen (con la factura, si ya tiene). */
+/** Depósitos que entran al resumen: solo los que siguen sin factura (2026-11-12). */
 function _depositos(secciones) {
   const deBloques = (bloques, seccion) => (bloques ?? []).flatMap(b => (b.grupos ?? []).flatMap(g => g.depositos ?? [])
     .map(d => ({ ...d, _seccion: seccion ?? (b.tipo === 'pendiente' ? 'pendiente' : null) })));
@@ -82,7 +87,7 @@ function _depositos(secciones) {
     ...(secciones?.ref ?? []).flatMap(a => deBloques(a.bloques)),
     ...deBloques(secciones?.especiales),
     ...deBloques(secciones?.ficha ? [secciones.ficha] : [], 'ficha'),
-  ];
+  ].filter(d => !d.factura);
 }
 
 /**
@@ -100,6 +105,7 @@ function _depositos(secciones) {
  *   ABONO POSTERIOR — pago real de un día posterior al renglón.
  */
 const ORIGEN_TIPO = { DEV: 'DEVOLUCIÓN', BON: 'BONIFICACIÓN' };
+const TIPOS_ABONO = new Set(['ABONO ANTERIOR', 'ABONO', 'ABONO POSTERIOR']);
 function tipoMovimiento(a, d, dia, idsEnResumen) {
   const imp = Number(a.importe) || 0;
   if (imp < 0) return 'CARGO';
@@ -132,8 +138,16 @@ function filasResumen(secciones, formaPagoDe) {
     const movimientos = (d.historialAbonos ?? []).flatMap(h => (h.abonos ?? []).map(a => ({
       fecha: a.fecha ?? null, dia: _diaMx(a.fecha), tipo: tipoMovimiento(a, d, dia, idsEnResumen),
       importe: _r2(a.importe), movimiento: a.movimiento ?? '', forma: a.forma ?? '', remision: h.remision, saldo: a.saldo ?? null,
-    }))).sort((x, y) => String(x.fecha ?? '').localeCompare(String(y.fecha ?? '')));
+    // Orden (2026-11-12, usuario: "está desordenado" → eligió "pago inicial
+    // primero"): el PAGO INICIAL arriba y después lo demás por fecha.
+    }))).sort((x, y) => (y.tipo === 'PAGO INICIAL') - (x.tipo === 'PAGO INICIAL')
+      || String(x.fecha ?? '').localeCompare(String(y.fecha ?? '')));
     const abonos = movimientos.filter(m => m.tipo === 'ABONO ANTERIOR');
+    // Importe total de la venta = lo que debía antes del primer movimiento
+    // (saldo después + importe), sumado por remisión. Sin historial: no se sabe.
+    const totales = (d.historialAbonos ?? []).map(h => h.abonos?.[0]).filter(Boolean)
+      .map(a => (Number(a.saldo) || 0) + (Number(a.importe) || 0));
+    const totalVenta = totales.length ? _r2(totales.reduce((x, y) => x + y, 0)) : null;
     const abonosAnteriores = abonos.reduce((s, m) => s + m.importe, 0);
     const estatus = estatusDe(d);
     const { partes } = formaPagoDe(d);
@@ -151,6 +165,7 @@ function filasResumen(secciones, formaPagoDe) {
       movimientos: i === 0 ? movimientos : [],
       estatus: estatus.estatus,
       saldo: i === 0 ? estatus.saldo : null,
+      totalVenta: i === 0 ? totalVenta : null,
       pagadaEl: estatus.pagadaEl,
       fecha: dia,
       idNumo: d.idNumo ?? '',
@@ -162,9 +177,15 @@ function filasResumen(secciones, formaPagoDe) {
 
 // Color del TIPO: lo que suma en verde/azul; devoluciones y bonificaciones en ámbar.
 const COLOR_TIPO = {
-  'ABONO ANTERIOR': 'FF15803D', 'PAGO INICIAL': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
+  ABONO: 'FF15803D', 'PAGO INICIAL': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
   AJUSTE: 'FFB45309', CARGO: 'FFB91C1C',
 };
+// En la hoja los tres tipos de abono dicen solo "ABONO" (2026-11-12, usuario:
+// "solo maneja lo de abonos"); por dentro se distinguen para saber cuál suma
+// en ABONOS ANTERIORES.
+const tipoEnHoja = t => (TIPOS_ABONO.has(t) ? 'ABONO' : t);
+// Gris / blanco intercalado por venta (2026-11-12, pedido del usuario).
+const GRIS_VENTA = 'FFE5E7EB';
 
 const _textoDia = dia => { const [y, m, d] = dia.split('-').map(Number); return `${d} ${MESES[m - 1]} ${y}`; };
 
@@ -176,7 +197,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   const filas = filasResumen(secciones, formaPagoDe);
   if (!filas.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22, 10, 12, 12, 14, 11, 11, 16, 14, 22, 20, 16].map(width => ({ width }));
+  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22, 10, 12, 15, 12, 14, 11, 11, 16, 14, 22, 20, 16].map(width => ({ width }));
 
   const { fechaInicio, fechaFin, sucursal } = meta;
   ws.addRow(['RELACIÓN DE CHEQUES Y DOCUMENTOS']).font = { bold: true, size: 13 };
@@ -185,7 +206,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   ws.addRow([]);
   const enc = ws.addRow(['Base', 'Forma de Pago', 'Serie', 'Folio', 'Factura', 'NOMBRE DEL CLIENTE', 'IMPORTE COBRADO', 'ABONOS ANTERIORES',
     'FACTURADO', 'BN', 'Observaciones', 'Valida Descuento Extra', 'Caja', 'Fecha', 'ID NUMO', 'Banco',
-    'No. ABONOS', 'ÚLTIMO ABONO', 'ESTATUS', 'SALDO PENDIENTE', 'PAGADA EL',
+    'No. ABONOS', 'ÚLTIMO ABONO', 'IMPORTE TOTAL VENTA', 'ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL',
     'FECHA', 'TIPO', 'IMPORTE', 'MOVIMIENTO', 'FORMA', 'SALDO DESPUÉS DE ESTE MOVIMIENTO']);
   enc.eachCell(c => { c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = _relleno(MORADO); c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
   ws.views = [{ state: 'frozen', ySplit: enc.number }];
@@ -194,34 +215,42 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   const _dia = v => (v ? new Date(`${v}T12:00:00Z`) : null);
   // Renglones seguidos, sin vacío entre almacenes, para poder usar los filtros
   // (2026-11-12, pedido del usuario). Una venta con N movimientos en Kore
-  // ocupa N sub-renglones: el historial en V–AA, uno por sub-renglón; A–U combinadas.
+  // ocupa N sub-renglones: el historial en W–AB, uno por sub-renglón; A–V combinadas.
   // En las combinadas el texto se repite por debajo (Excel no lo enseña, pero
   // el filtro sí lo ve: filtrar por Serie / Cliente no esconde los abonos);
   // los importes van solo en el primer sub-renglón para no sumar doble.
-  const SOLO_PRIMERO = new Set([7, 8, 9, 10, 17, 20]); // G H I J, No. abonos, saldo
+  const SOLO_PRIMERO = new Set([7, 8, 9, 10, 17, 19, 21]); // G H I J, No. abonos, total venta, saldo
   const combinadas = [];
-  for (const f of filas) {
+  for (const [iVenta, f] of filas.entries()) {
     const altura = Math.max(f.movimientos.length, 1);
     const venta = ['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
       _dia(f.fecha), f.idNumo, f.banco,
-      f.abonos.length || null, f.abonos.length ? _dia(f.abonos[f.abonos.length - 1].dia) : null,
-      f.estatus, f.saldo, _dia(f.pagadaEl)];
+      // No. ABONOS / ÚLTIMO ABONO (2026-11-12, usuario: "¿por qué sale vacía?"):
+      // TODOS los abonos de dinero de la remisión (anteriores, en otro renglón
+      // y posteriores; no el pago inicial ni devoluciones / bonificaciones), no
+      // solo los que suman en ABONOS ANTERIORES. 0 si tiene historial y ninguno.
+      ...(() => {
+        const todos = f.movimientos.filter(m => TIPOS_ABONO.has(m.tipo));
+        return [f.movimientos.length ? todos.length : null, todos.length ? _dia(todos[todos.length - 1].dia) : null];
+      })(),
+      f.totalVenta, f.estatus, f.saldo, _dia(f.pagadaEl)];
     let n = null;
     for (let k = 0; k < altura; k++) {
       const a = f.movimientos[k];
       const valores = venta.map((v, c) => (k > 0 && SOLO_PRIMERO.has(c + 1) ? null : v));
-      const mov = a ? [_dia(a.dia), a.tipo, a.importe, f.movimientos.some(x => x.remision !== a.remision) ? `${a.movimiento} · REM ${a.remision}` : a.movimiento, a.forma, a.saldo] : [];
+      const mov = a ? [_dia(a.dia), tipoEnHoja(a.tipo), a.importe, f.movimientos.some(x => x.remision !== a.remision) ? `${a.movimiento} · REM ${a.remision}` : a.movimiento, a.forma, a.saldo] : [];
       const row = ws.addRow([...valores, ...mov]);
       if (k === 0) n = row.number;
-      for (const c of [7, 8, 9, 10, 20, 24, 27]) row.getCell(c).numFmt = DINERO;
-      if (a) row.getCell(23).font = { bold: a.tipo === 'ABONO ANTERIOR' || a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[a.tipo] ?? 'FF374151' } };
-      for (const c of [14, 18, 21, 22]) row.getCell(c).numFmt = 'd/m/yy';
-      row.getCell(19).font = { bold: true, color: { argb: f.estatus === 'PAGADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
+      for (const c of [7, 8, 9, 10, 19, 21, 25, 28]) row.getCell(c).numFmt = DINERO;
+      if (a) row.getCell(24).font = { bold: a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[tipoEnHoja(a.tipo)] ?? 'FF374151' } };
+      if (iVenta % 2 === 0) for (let c = 1; c <= 28; c++) row.getCell(c).fill = _relleno(GRIS_VENTA);
+      for (const c of [14, 18, 22, 23]) row.getCell(c).numFmt = 'd/m/yy';
+      row.getCell(20).font = { bold: true, color: { argb: f.estatus === 'SALDADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
     }
     const bn = f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0;
     ws.getCell(n, 10).value = { formula: `IF(B${n}="01",(G${n}+H${n})*${BN_PORCENTAJE},0)`, result: bn };
     ws.getCell(n, 9).value = { formula: `G${n}+H${n}-J${n}`, result: _r2(f.importe + f.abonosAnteriores - bn) };
-    for (let c = 1; c <= 21; c++) {
+    for (let c = 1; c <= 22; c++) {
       ws.getCell(n, c).alignment = { vertical: 'middle', wrapText: c === 4 };
       if (altura > 1) combinadas.push(`${ws.getCell(n, c).address}:${ws.getCell(n + altura - 1, c).address}`);
     }
@@ -230,7 +259,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   // borraría el texto de abajo y el filtro escondería los abonos.
   if (combinadas.length) (workbook._combinadasOcultas ??= []).push({ ws, rangos: combinadas });
   const ultima = ws.lastRow.number;
-  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 27 } };
+  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 28 } };
   const rango = col => `${col}${primera}:${col}${ultima}`;
   const suma = (col, filtro) => filas.filter(filtro ?? (() => true)).reduce((s, f) => s + (Number(f[col]) || 0), 0);
   const bnDe = f => (f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0);
@@ -246,9 +275,10 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   tot.getCell(8).value = { formula: `SUBTOTAL(9,${rango('H')})`, result: totH };
   tot.getCell(9).value = { formula: `SUBTOTAL(9,${rango('I')})`, result: totI };
   tot.getCell(10).value = { formula: `SUBTOTAL(9,${rango('J')})`, result: totBn };
-  tot.getCell(20).value = { formula: `SUBTOTAL(9,${rango('T')})`, result: _r2(filas.reduce((s, f) => s + (Number(f.saldo) || 0), 0)) };
+  tot.getCell(19).value = { formula: `SUBTOTAL(9,${rango('S')})`, result: _r2(filas.reduce((s, f) => s + (Number(f.totalVenta) || 0), 0)) };
+  tot.getCell(21).value = { formula: `SUBTOTAL(9,${rango('U')})`, result: _r2(filas.reduce((s, f) => s + (Number(f.saldo) || 0), 0)) };
   tot.font = { bold: true };
-  for (const c of [7, 8, 9, 10, 20]) tot.getCell(c).numFmt = DINERO;
+  for (const c of [7, 8, 9, 10, 19, 21]) tot.getCell(c).numFmt = DINERO;
   ws.addRow([]);
   ws.addRow([]);
 

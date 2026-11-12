@@ -952,19 +952,19 @@ describe('Consistencia día↔semana (garantía central del diseño del ledger, 
     expect(ledger.total).toEqual({ count: 1, saldo: 1000 });
   });
 
-  // Tercer ajuste real 2026-11-12, mismo día, decisión explícita del usuario: un depósito
-  // no_identificado con vinculación PARCIAL (saldoErp ya tiene algún valor) deja de ser
-  // "pendiente sin revisar" para Cortes — eso lo cubre el Dashboard "Estatus" restando lo ya
-  // cubierto. Cortes en vivo solo cuenta lo que NADIE tocó todavía (saldoErp vacío).
-  test('periodoFin EN VIVO: no_identificado CON saldoErp parcial ya no es pendiente para Cortes', async () => {
+  // Cuarto ajuste real 2026-11-12, mismo día, REVIERTE PARCIALMENTE el tercero: el usuario pidió
+  // que el CONTEO vuelva a igualar al Dashboard "Estatus" (cualquier no_identificado, con o sin
+  // saldoErp) — lo que cambia ahora es el MONTO: se netea igual que
+  // bank.service.js#saldoRestanteCxC (resta lo ya cubierto), en vez de excluirlo del todo.
+  test('periodoFin EN VIVO: no_identificado CON saldoErp parcial SÍ es pendiente, pero el monto se netea', async () => {
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
       { deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'no_identificado', saldoErp: 300 },
     ]) }) });
 
     const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
 
-    // Vinculación parcial (saldoErp:300 de 1000) — ya no es "sin revisar", sale del pendiente de Cortes.
-    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
+    // Cuenta (igual que el Dashboard), pero el saldo es el residuo neteado (1000-300=700), no el depósito completo.
+    expect(ledger.total).toEqual({ count: 1, saldo: 700 });
   });
 
   test('periodoFin EN VIVO: no_identificado CON saldoErp vacío sigue siendo el pendiente real', async () => {

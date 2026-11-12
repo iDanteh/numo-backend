@@ -1005,19 +1005,19 @@ function _primeraIdentificacionEfectiva(mov) {
 // como 'ahora' hace un instante" de "esto es un cierre genuinamente pasado".
 const TOLERANCIA_AHORA_MS = 60_000;
 
+function _esPeriodoEnVivo(fin, ahora) {
+  return ahora.getTime() - fin.getTime() < TOLERANCIA_AHORA_MS;
+}
+
+// 2026-11-12 (segunda decisión del usuario, misma sesión): REVIERTE parcialmente el criterio de
+// arriba — Cortes vuelve a contar como pendiente CUALQUIER `status:'no_identificado'` (igual que
+// el Dashboard "Estatus"), con o sin `saldoErp` parcial. Lo que SÍ sigue cambiando es cómo se
+// neteó el monto — ver `_calcularLedgerBacklog` más abajo (`totalSaldoNetoEnVivo`), que resta lo
+// ya cubierto por una CxC parcial, igual que `bank.service.js#saldoRestanteCxC` — pero eso es un
+// cálculo aparte del `total.saldo`, NO de este booleano `identificado` (que solo decide conteo).
 function _estadoAlCierre(mov, fin, ahora = new Date()) {
-  if (ahora.getTime() - fin.getTime() < TOLERANCIA_AHORA_MS) {
-    // 2026-11-12 (decisión explícita del usuario, misma sesión): un depósito con vinculación
-    // PARCIAL (saldoErp ya tiene algún valor, aunque no cubra el 100% del depósito) ya no es
-    // "pendiente sin revisar" para Cortes — eso lo cubre el Dashboard "Estatus" (que resta lo
-    // ya cubierto, ver bank.service.js#saldoRestanteCxC). Cortes solo debe mirar lo que NADIE
-    // tocó todavía. OJO: no alcanza con mirar solo saldoErp — hay ~12,909 movimientos reales
-    // con status:'identificado' y saldoErp:null (identificaciones viejas, ej. por ficha, que
-    // nunca pasaron por el flujo que llena ese campo) — status sigue siendo la condición
-    // primaria, saldoErp solo afina el caso no_identificado.
-    const identificado = mov.status === 'identificado' ||
-      (mov.status === 'no_identificado' && mov.saldoErp != null);
-    return { identificado, posibleCambio: false };
+  if (_esPeriodoEnVivo(fin, ahora)) {
+    return { identificado: mov.status === 'identificado', posibleCambio: false };
   }
 
   const pid = _primeraIdentificacionEfectiva(mov);
@@ -1153,9 +1153,18 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
   let nuevosCount = 0, nuevosSaldo = 0;
   let idDeInicialesCount = 0, idDeInicialesSaldo = 0;
   let idDeNuevosCount = 0, idDeNuevosSaldo = 0;
+  // 2026-11-12: acumulador aparte para el total EN VIVO, neteado igual que
+  // bank.service.js#saldoRestanteCxC (resta lo ya cubierto por una CxC parcial). Vive aislado de
+  // inicialesSaldo/nuevosSaldo/identificadosSaldo a propósito — esos 3 siguen con el depósito
+  // completo sin tocar, porque de ellos depende la garantía `total(A) == iniciales(B)` entre
+  // periodos consecutivos (histórica, no debe depender de un saldoErp que cambia con el tiempo).
+  // Para un corte histórico (no en vivo) este acumulador se ignora — `total.saldo` sigue siendo
+  // la resta de los 3 de siempre, sin neteo (no hay forma confiable de saber el saldoErp pasado).
+  let totalSaldoNetoEnVivo = 0;
 
   for (const mov of candidatos) {
     const importe = mov.deposito ?? 0;
+    const importeNeto = mov.saldoErp != null ? Math.max(0, importe - mov.saldoErp) : importe;
 
     if (mov.createdAt >= periodoInicio) {
       // No existía antes de periodoInicio — no puede estar identificado a esa fecha, ahorra la
@@ -1163,6 +1172,7 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
       const identificadoAlFin = _estadoAlCierre(mov, periodoFin, ahora).identificado;
       nuevosCount++; nuevosSaldo += importe;
       if (identificadoAlFin) { idDeNuevosCount++; idDeNuevosSaldo += importe; }
+      else totalSaldoNetoEnVivo += importeNeto;
       continue;
     }
 
@@ -1172,15 +1182,18 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     if (identificadoAlInicio) {
       if (identificadoAlFin) continue; // resuelto antes de empezar y sigue (o se re-)resuelto al cierre: no es backlog de este periodo
       nuevosCount++; nuevosSaldo += importe; // reaparecido dentro del periodo — ver nota REAPARECIDOS arriba
+      totalSaldoNetoEnVivo += importeNeto;
       continue;
     }
 
     inicialesCount++; inicialesSaldo += importe;
     if (identificadoAlFin) { idDeInicialesCount++; idDeInicialesSaldo += importe; }
+    else totalSaldoNetoEnVivo += importeNeto;
   }
 
   const identificadosCount = idDeInicialesCount + idDeNuevosCount;
   const identificadosSaldo = idDeInicialesSaldo + idDeNuevosSaldo;
+  const totalSaldoHistorico = inicialesSaldo + nuevosSaldo - identificadosSaldo;
 
   return {
     iniciales:              { count: inicialesCount, saldo: inicialesSaldo },
@@ -1190,7 +1203,7 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     identificadosDeNuevos:    { count: idDeNuevosCount, saldo: idDeNuevosSaldo },
     total: {
       count: inicialesCount + nuevosCount - identificadosCount,
-      saldo: inicialesSaldo + nuevosSaldo - identificadosSaldo,
+      saldo: _esPeriodoEnVivo(periodoFin, ahora) ? totalSaldoNetoEnVivo : totalSaldoHistorico,
     },
   };
 }

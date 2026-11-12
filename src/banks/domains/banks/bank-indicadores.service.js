@@ -968,24 +968,74 @@ function _primeraIdentificacionEfectiva(mov) {
   return null;
 }
 
-// Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?" — de 1 solo
-// salto (no un replay completo de eventos, ver limitación documentada en BankMovement.model.js
-// #ultimoCambioStatusAt). `_primeraIdentificacionEfectiva()` es forward-only: si existe y es
-// <= fin, el movimiento SE IDENTIFICÓ por primera vez a tiempo. Pero pudo haberse revertido
-// después (desvinculación de CxC) y ANTES del cierre — eso sí lo sabemos con certeza via
-// historialVinculacion (timestamp exacto de 'desvinculado'/'ajustado'). Lo que NO podemos saber
-// con certeza es si hubo un cambio manual (updateStatus/reclasifyMovements) después de `fin`
-// que alteró el estatus actual respecto al de `fin` — eso se expone como `posibleCambio`, nunca
-// se oculta ni se asume silenciosamente que el dato es exacto.
-function _estadoAlCierre(mov, fin) {
+// Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?".
+// `_primeraIdentificacionEfectiva()` es forward-only: si existe y es <= fin, el movimiento SE
+// IDENTIFICÓ por primera vez a tiempo. Pero el vínculo pudo haberse revertido (desvinculación de
+// CxC) y ANTES del cierre — eso sí lo sabemos con certeza via historialVinculacion (timestamp
+// exacto de 'desvinculado'/'ajustado'/'vinculado').
+//
+// Bug real encontrado 2026-11-12, confirmado con 48 movimientos reales de producción
+// ($1,072,364.69): la versión anterior de esta función hacía "¿hubo ALGÚN desvinculado/ajustado
+// después de la primera identificación?" (1 solo salto) — eso daba FALSO POSITIVO cuando el
+// movimiento se desvinculaba y se volvía a vincular DESPUÉS (ej. Kore revierte una CxC y el
+// usuario la re-vincula, o Kore la re-aplica): quedaba marcado como "revertido" para siempre,
+// aunque ya estuviera de nuevo 100% cubierto. Fix intermedio (replay de un solo booleano) todavía
+// daba falso positivo con 2+ CxC vinculadas simultáneas (desvincular UNA apagaba el booleano
+// aunque la otra siguiera cubriendo el depósito) y falso negativo para `status:'no_identificado'`
+// puesto por una vía sin rastro en historialVinculacion (ej. reclasificación masiva) — confirmado
+// con un cruce completo contra producción (32 falsos positivos / 25 falsos negativos).
+//
+// Fix real, mismo día: para un `fin` que representa AHORA MISMO (no un corte ya cerrado), no
+// hace falta reconstruir NADA — `status` ya es la verdad en tiempo real, porque cualquier
+// mutación de vínculo (vincular/desvincular/ajustar) lo recalcula y guarda en el mismo request
+// (ver erp-reversion.service.js). La reconstrucción vía historialVinculacion solo tiene sentido
+// — y solo se usa de acá en más — para un `fin` genuinamente pasado, donde no se puede confiar
+// en el `status` actual porque pudo cambiar después de `fin`. La limitación del booleano único
+// para multi-CxC queda, a propósito, sin resolver para el caso histórico (fuera de alcance de
+// hoy — los dashboards que importan ahora mismo usan el caso "ahora").
+//
+// Lo que NO podemos saber con certeza, en el caso histórico, es si hubo un cambio manual
+// (updateStatus/reclasifyMovements) después de `fin` que alteró el estatus actual respecto al de
+// `fin` — eso se expone como `posibleCambio`, nunca se oculta ni se asume silenciosamente que el
+// dato es exacto.
+// Tolerancia para decidir "¿fin es ahora mismo?": `fin` siempre se captura (en el enumerador que
+// arma los periodos) ANTES de que `_calcularLedgerBacklog` capture `ahora` unas líneas más abajo
+// en la misma request — nunca van a ser iguales ni `fin > ahora`. Un corte ya cerrado es, como
+// mínimo, horas/días más viejo que `ahora`; 60s de margen separa sin ambigüedad "esto se generó
+// como 'ahora' hace un instante" de "esto es un cierre genuinamente pasado".
+const TOLERANCIA_AHORA_MS = 60_000;
+
+function _estadoAlCierre(mov, fin, ahora = new Date()) {
+  if (ahora.getTime() - fin.getTime() < TOLERANCIA_AHORA_MS) {
+    // 2026-11-12 (decisión explícita del usuario, misma sesión): un depósito con vinculación
+    // PARCIAL (saldoErp ya tiene algún valor, aunque no cubra el 100% del depósito) ya no es
+    // "pendiente sin revisar" para Cortes — eso lo cubre el Dashboard "Estatus" (que resta lo
+    // ya cubierto, ver bank.service.js#saldoRestanteCxC). Cortes solo debe mirar lo que NADIE
+    // tocó todavía. OJO: no alcanza con mirar solo saldoErp — hay ~12,909 movimientos reales
+    // con status:'identificado' y saldoErp:null (identificaciones viejas, ej. por ficha, que
+    // nunca pasaron por el flujo que llena ese campo) — status sigue siendo la condición
+    // primaria, saldoErp solo afina el caso no_identificado.
+    const identificado = mov.status === 'identificado' ||
+      (mov.status === 'no_identificado' && mov.saldoErp != null);
+    return { identificado, posibleCambio: false };
+  }
+
   const pid = _primeraIdentificacionEfectiva(mov);
   const identificadoBase = !!(pid && pid <= fin);
-  const revertidoAntesDeCierre = identificadoBase && (mov.historialVinculacion || []).some(h =>
-    (h.accion === 'desvinculado' || h.accion === 'ajustado') && h.at > pid && h.at <= fin
-  );
-  const identificado  = identificadoBase && !revertidoAntesDeCierre;
   const posibleCambio = !!(mov.ultimoCambioStatusAt && mov.ultimoCambioStatusAt > fin);
-  return { identificado, posibleCambio };
+
+  if (!identificadoBase) return { identificado: false, posibleCambio };
+
+  let vinculadoNeto = true;
+  for (const h of (mov.historialVinculacion || [])) {
+    if (h.at <= pid) continue;
+    if (h.at > fin) break;
+    if (h.accion === 'vinculado') vinculadoNeto = true;
+    else if (h.accion === 'desvinculado') vinculadoNeto = false;
+    // 'ajustado' no cambia vinculadoNeto — el link sigue vigente, solo corrige el monto.
+  }
+
+  return { identificado: vinculadoNeto, posibleCambio };
 }
 
 // Periodo de corte por rol (2026-10-05): antes hardcodeado en el frontend
@@ -1084,6 +1134,11 @@ function _fechaMexicoStr(fechaReal) {
  * @param {Date} [opts.mesOrigenFin]
  */
 async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, mesOrigenInicio = null, mesOrigenFin = null }) {
+  // Capturado UNA sola vez y pasado a cada llamada de _estadoAlCierre: así "¿fin es ahora mismo?"
+  // se evalúa con el mismo instante para todo este cálculo (periodoInicio y periodoFin de TODOS
+  // los movimientos), en vez de llamar new Date() de nuevo en cada invocación (fix 2026-11-12).
+  const ahora = new Date();
+
   const createdAtMatch = { $lte: periodoFin };
   if (mesOrigenInicio) createdAtMatch.$gte = mesOrigenInicio;
   if (mesOrigenFin) createdAtMatch.$lt = mesOrigenFin;
@@ -1092,7 +1147,7 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     ...baseMatch,
     createdAt: createdAtMatch,
     status: { $in: ['no_identificado', 'identificado'] },
-  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion identificadoPor fichaAt').lean();
+  }).select('deposito createdAt status saldoErp primeraIdentificacionAt historialVinculacion identificadoPor fichaAt').lean();
 
   let inicialesCount = 0, inicialesSaldo = 0;
   let nuevosCount = 0, nuevosSaldo = 0;
@@ -1105,14 +1160,14 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     if (mov.createdAt >= periodoInicio) {
       // No existía antes de periodoInicio — no puede estar identificado a esa fecha, ahorra la
       // llamada a _estadoAlCierre(mov, periodoInicio).
-      const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
+      const identificadoAlFin = _estadoAlCierre(mov, periodoFin, ahora).identificado;
       nuevosCount++; nuevosSaldo += importe;
       if (identificadoAlFin) { idDeNuevosCount++; idDeNuevosSaldo += importe; }
       continue;
     }
 
-    const identificadoAlInicio = _estadoAlCierre(mov, periodoInicio).identificado;
-    const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
+    const identificadoAlInicio = _estadoAlCierre(mov, periodoInicio, ahora).identificado;
+    const identificadoAlFin = _estadoAlCierre(mov, periodoFin, ahora).identificado;
 
     if (identificadoAlInicio) {
       if (identificadoAlFin) continue; // resuelto antes de empezar y sigue (o se re-)resuelto al cierre: no es backlog de este periodo

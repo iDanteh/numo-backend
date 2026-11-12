@@ -28,6 +28,7 @@
  */
 
 const { tablasMostrador, agregarHojaDepositosEfectivo } = require('../cfdi-mapping/mostrador-hoja');
+const { agregarHojaResumen } = require('./reportes-por-facturar.resumen');
 
 const SECCIONES = {
   mostrador:  { titulo: 'MOSTRADOR',              hoja: 'MOSTRADOR' },
@@ -36,6 +37,8 @@ const SECCIONES = {
   ficha:      { titulo: 'X FAC CON FICHA DE DEP', hoja: 'X FAC CON FICHA DE DEP' },
   efectivo:   { titulo: 'DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA', hoja: 'DEPÓSITOS EN EFECTIVO' },
   otraCaja:   { titulo: 'COBRADAS EN OTRA CAJA',  hoja: 'COBRADAS EN' },
+  // Formato "RESUMEN POR FACTURAR.xls" del usuario, hoja aparte (2026-11-12).
+  resumen:    { titulo: 'RESUMEN POR FACTURAR',   hoja: 'RESUMEN POR FACTURAR' },
 };
 
 const NO_IDENTIFICADO = 'CLIENTE NO IDENTIFICADO';
@@ -437,7 +440,8 @@ function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
  * Excel de una sección (o de todas si `seccion` no viene).
  * @returns {boolean} false si no hubo nada (el llamador pone una hoja vacía).
  */
-function agregarHojasSeccion(workbook, secciones, seccion) {
+// `meta` ({ fechaInicio, fechaFin, sucursal }): encabezado de la hoja RESUMEN.
+function agregarHojasSeccion(workbook, secciones, seccion, meta = {}) {
   const lista = seccion ? [seccion] : Object.keys(SECCIONES);
   let hojas = 0;
   for (const s of lista) {
@@ -457,6 +461,7 @@ function agregarHojasSeccion(workbook, secciones, seccion) {
     if (s === 'otraCaja') {
       for (const e of secciones.otraCaja ?? []) if (agregarHojaOtraCaja(workbook, e)) hojas++;
     }
+    if (s === 'resumen' && agregarHojaResumen(workbook, secciones, formaPagoDe, meta)) hojas++;
   }
   return hojas > 0;
 }

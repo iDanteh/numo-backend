@@ -41,19 +41,19 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   const ws = wb.getWorksheet('RESUMEN POR FACTURAR');
   expect(ws.getRow(2).getCell(6).value).toBe('POR FACTURAR DEL DÍA 10 NOVIEMBRE 2026');
   const fila = n => ws.getRow(n);
-  // Encabezado en 4; renglones 5–7 (A0), 8 vacío, 9 (I0).
+  // Encabezado en 4; renglones 5–7 (A0) y 8 (I0) seguidos, sin vacío (filtros).
   expect(fila(4).getCell(10).value).toBe('BN');
   expect(fila(5).getCell(10).value.formula).toBe('IF(B5="01",(G5+H5)*0.2,0)');
   expect(fila(5).getCell(10).value.result || 0).toBe(0); // 01 DEP: sin BN
   expect(fila(7).getCell(10).value.result).toBe(200);
   expect(fila(7).getCell(9).value).toEqual({ formula: 'G7+H7-J7', result: 800 });
-  expect(fila(8).getCell(1).value).toBeNull();
-  expect(fila(9).getCell(10).value.result).toBe(130); // (400 + 250) × 20 %
-  expect(fila(9).getCell(9).value.result).toBe(520);
-  const tot = fila(11);
+  expect(fila(8).getCell(10).value.result).toBe(130); // (400 + 250) × 20 %
+  expect(fila(8).getCell(9).value.result).toBe(520);
+  const tot = fila(10);
   expect(tot.getCell(6).value).toBe('TOTALES');
-  expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G9)', result: 1900 });
+  expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G8)', result: 1900 });
   expect(tot.getCell(10).value.result).toBe(330);
+  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 8, column: 16 } });
 });
 
 test('el Excel completo incluye la hoja RESUMEN al final', async () => {

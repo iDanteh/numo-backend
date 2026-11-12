@@ -174,9 +174,15 @@ function filasResumen(secciones, formaPagoDe) {
 
 // Color del TIPO: lo que suma en verde/azul; devoluciones y bonificaciones en ámbar.
 const COLOR_TIPO = {
-  'ABONO ANTERIOR': 'FF15803D', 'PAGO INICIAL': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
+  ABONO: 'FF15803D', 'PAGO INICIAL': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
   AJUSTE: 'FFB45309', CARGO: 'FFB91C1C',
 };
+// En la hoja los tres tipos de abono dicen solo "ABONO" (2026-11-12, usuario:
+// "solo maneja lo de abonos"); por dentro se distinguen para saber cuál suma
+// en ABONOS ANTERIORES.
+const tipoEnHoja = t => (TIPOS_ABONO.has(t) ? 'ABONO' : t);
+// Gris / blanco intercalado por venta (2026-11-12, pedido del usuario).
+const GRIS_VENTA = 'FFE5E7EB';
 
 const _textoDia = dia => { const [y, m, d] = dia.split('-').map(Number); return `${d} ${MESES[m - 1]} ${y}`; };
 
@@ -212,7 +218,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   // los importes van solo en el primer sub-renglón para no sumar doble.
   const SOLO_PRIMERO = new Set([7, 8, 9, 10, 17, 19, 21]); // G H I J, No. abonos, total venta, saldo
   const combinadas = [];
-  for (const f of filas) {
+  for (const [iVenta, f] of filas.entries()) {
     const altura = Math.max(f.movimientos.length, 1);
     const venta = ['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
       _dia(f.fecha), f.idNumo, f.banco,
@@ -229,11 +235,12 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
     for (let k = 0; k < altura; k++) {
       const a = f.movimientos[k];
       const valores = venta.map((v, c) => (k > 0 && SOLO_PRIMERO.has(c + 1) ? null : v));
-      const mov = a ? [_dia(a.dia), a.tipo, a.importe, f.movimientos.some(x => x.remision !== a.remision) ? `${a.movimiento} · REM ${a.remision}` : a.movimiento, a.forma, a.saldo] : [];
+      const mov = a ? [_dia(a.dia), tipoEnHoja(a.tipo), a.importe, f.movimientos.some(x => x.remision !== a.remision) ? `${a.movimiento} · REM ${a.remision}` : a.movimiento, a.forma, a.saldo] : [];
       const row = ws.addRow([...valores, ...mov]);
       if (k === 0) n = row.number;
       for (const c of [7, 8, 9, 10, 19, 21, 25, 28]) row.getCell(c).numFmt = DINERO;
-      if (a) row.getCell(24).font = { bold: a.tipo === 'ABONO ANTERIOR' || a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[a.tipo] ?? 'FF374151' } };
+      if (a) row.getCell(24).font = { bold: a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[tipoEnHoja(a.tipo)] ?? 'FF374151' } };
+      if (iVenta % 2 === 0) for (let c = 1; c <= 28; c++) row.getCell(c).fill = _relleno(GRIS_VENTA);
       for (const c of [14, 18, 22, 23]) row.getCell(c).numFmt = 'd/m/yy';
       row.getCell(20).font = { bold: true, color: { argb: f.estatus === 'PAGADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
     }

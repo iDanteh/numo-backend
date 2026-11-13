@@ -32,6 +32,8 @@ const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
 const { agregarHistorialAbonos } = require('./reportes-por-facturar.abonos');
+const { obtenerDesglosesCobroAlmacenPorCentro } = require('../erp/erp-sync.service');
+const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -183,6 +185,72 @@ async function _validar({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   return { fechaFin, series, sucursal };
 }
 
+const ESTATUS_POR_FACTURAR_K = 'POR FACTURAR';
+const _serieK = v => String(v ?? '').trim().toUpperCase();
+
+/**
+ * Remisiones PPD/POR FACTURAR de Kore con cobros en el rango que NO tienen
+ * depósito identificado en Bancos → "PENDIENTE GENERAR FACTURA" con idNumo S/R.
+ * (2026-11-13, pedido del usuario: "EL 7 ES DECIR HOY DEBE MOSTRARLOS COMO
+ *  PENDIENTES DE FACTURAR" / "los que no tenian deposito identificado salian como S/R")
+ */
+async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesBancos }) {
+  const fechaDesde = new Date(`${fechaInicio}T00:00:00.000-06:00`).toISOString();
+  const fechaHasta = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
+
+  const candidatasPorClave = new Map();
+  for (const serie of series) {
+    const cuentas = await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde, fechaHasta }).catch(() => []);
+    for (const c of cuentas ?? []) {
+      const s = _serieK(c.serieVenta);
+      const f = String(c.folioVenta ?? '').trim();
+      if (!s || !f) continue;
+      if (c.serieFactura) continue; // ya facturada
+      const rem = `${s}-${f}`;
+      if (remisionesBancos.has(rem)) continue; // ya aparece vía Bancos
+      const k = `${s}|${f}`;
+      if (!candidatasPorClave.has(k)) candidatasPorClave.set(k, c);
+    }
+  }
+  if (!candidatasPorClave.size) return [];
+
+  const candidatas = [...candidatasPorClave.values()];
+  const { info } = await infoRemisiones({
+    rfc,
+    remisiones: candidatas.map(c => ({
+      serie: _serieK(c.serieVenta),
+      folio: String(c.folioVenta ?? '').trim(),
+      fechaCreacion: c.fechaCreacion,
+    })),
+  });
+
+  const depositos = [];
+  for (const c of candidatas) {
+    const k = `${_serieK(c.serieVenta)}|${String(c.folioVenta ?? '').trim()}`;
+    const koreInfo = info.get(k);
+    if (!koreInfo || koreInfo.tipoPago !== 'PPD' || koreInfo.nombreTipoMovimiento !== ESTATUS_POR_FACTURAR_K) continue;
+    const importe = _r2((c.cobros ?? []).reduce((s, cobro) => s + Math.abs(Number(cobro.monto) || 0), 0));
+    if (!importe) continue;
+    const serie = _serieK(c.serieVenta);
+    const folio = String(c.folioVenta ?? '').trim();
+    depositos.push({
+      fecha:       c.fechaCreacion ?? null,
+      descripcion: `REM ${serie}-${folio}`,
+      importe,
+      aplicado:    importe,
+      banco:       'S/R',
+      remisiones:  [`${serie}-${folio}`],
+      cliente:     koreInfo.nombre ?? '',
+      idNumo:      'S/R',
+      estatus:     ESTATUS_POR_FACTURAR_K,
+      ppdPorFacturar: true,
+      saldo:       0,
+      deKore:      true,
+    });
+  }
+  return depositos;
+}
+
 // Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
 // `onAvance(texto)`: en qué paso va (se ve en el historial mientras calcula).
 async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance = async () => {}) {
@@ -211,6 +279,16 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }
+  // S/R: remisiones PPD por facturar del rango que NO tienen depósito en Bancos (2026-11-13).
+  const remisionesBancos = new Set([
+    ...pendientes.depositos.flatMap(d => d.remisiones ?? []),
+    ...(pendientes.depositosConSaldo ?? []).flatMap(d => d.remisiones ?? []),
+  ]);
+  await onAvance('Remisiones sin depósito en Bancos — consultando Kore…');
+  const pendientesKore = await _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesBancos }).catch(err => {
+    advertencias.push(`No se pudieron consultar cobros de Kore para remisiones sin depósito (${err?.message}) — pueden faltar renglones S/R; vuelve a actualizarlo más tarde.`);
+    return [];
+  });
 
   const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
 
@@ -232,7 +310,7 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   const datos = {
     movimientosMostrador,
     cobrosCajaGlobales: cobrosCaja.porFactura,
-    depositosPendientesFactura: pendientes.depositos,
+    depositosPendientesFactura: [...pendientes.depositos, ...pendientesKore],
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
   };

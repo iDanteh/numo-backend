@@ -904,6 +904,17 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS consulta_codigo_mes_periodo  VARCHAR(7),
       ADD COLUMN IF NOT EXISTS consulta_codigo_mes_contador INTEGER NOT NULL DEFAULT 0
   `).catch(e => console.warn('[syncModels] ADD COLUMN consulta_codigo_mes_periodo/consulta_codigo_mes_contador (loyalty_cards):', e.message));
+
+  // Código de autorización de canje de puntos en venta (2026-11-13, webhook Kore) — columnas
+  // PROPIAS, separadas de recuperacion_codigo_hash/consulta_sesion_* (ver LoyaltyCard.js y
+  // loyalty-kore-canje.service.js). Mismo patrón idempotente que los bloques anteriores.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS canje_codigo_hash        VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS canje_codigo_expira_en   TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS canje_intentos_fallidos  INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS canje_bloqueada_hasta    TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN canje_codigo_* (loyalty_cards):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreNivel, LoyaltyKoreVentaFallida, syncModels };

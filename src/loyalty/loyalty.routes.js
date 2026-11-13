@@ -232,6 +232,19 @@ router.put('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.L
   res.json({ max: await configService.guardarConsultaCodigoMaxMes(req.body?.max, req.user) });
 }));
 
+// Vigencia del código de autorización de canje (2026-11-13) — minutos que dura vigente el código
+// de un solo uso que Numo manda al cliente para autorizar un canje de puntos en una venta de Kore
+// (ver loyalty-kore-canje.service.js). Mismo criterio de permisos que arriba. A diferencia de
+// CONGELAMIENTO/CONSULTA_CODIGO_MAX_MES, 0/vacío NO es válido acá (siempre hace falta una
+// vigencia real) — default 5 si nunca se configuró.
+router.get('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ minutos: await configService.obtenerCanjeCodigoVigenciaMin() });
+}));
+
+router.put('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ minutos: await configService.guardarCanjeCodigoVigenciaMin(req.body?.minutos, req.user) });
+}));
+
 // Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:
 // LOYALTY_READ para leer, LOYALTY_CONFIG para editar. Fusionado acá (en vez del config:manage
 // genérico) para que toda la configuración de Lealtad viva en una sola pantalla.

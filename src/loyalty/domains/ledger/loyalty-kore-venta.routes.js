@@ -21,6 +21,12 @@
  * `GET /ventas-canceladas-con-deposito` son para el equipo de Numo (sesión
  * staff normal, mismo permiso que el resto de Configuración de Lealtad) — sin
  * pantalla de Angular todavía, eso es un paso aparte.
+ *
+ * `POST /canje/solicitar-codigo` y `POST /canje/validar-codigo` (2026-11-13, pedido explícito del
+ * usuario) — código de autorización de un solo uso para que el cliente autorice canjear sus
+ * puntos en una venta. Mismo auth `verifyKoreApiKey` — ver `loyalty-kore-canje.service.js` para el
+ * detalle completo y la aclaración del cambio de responsabilidad (antes era de Kore, ahora de
+ * Numo). Se llaman ANTES de `POST /venta` — ese endpoint no cambia en nada.
  */
 const express = require('express');
 const { verifyKoreApiKey } = require('../../../shared/middleware/kore-api-key-auth');
@@ -30,6 +36,7 @@ const { PERMISSIONS } = require('../../../shared/config/rbac');
 const ventaService = require('./loyalty-kore-venta.service');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
+const canjeCodigoService = require('./loyalty-kore-canje.service');
 
 const router = express.Router();
 
@@ -68,6 +75,14 @@ router.patch('/ventas-fallidas/:id/resolver', authenticate, permit(PERMISSIONS.L
 
 router.get('/ventas-canceladas-con-deposito', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await ventaCanceladaService.listarVentasCanceladasConDeposito());
+}));
+
+router.post('/canje/solicitar-codigo', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  res.json(await canjeCodigoService.solicitarCodigoCanje(req.body?.telefono));
+}));
+
+router.post('/canje/validar-codigo', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  res.json(await canjeCodigoService.validarCodigoCanje(req.body?.telefono, req.body?.codigo));
 }));
 
 module.exports = router;

@@ -9,7 +9,10 @@
  * también, no este archivo).
  */
 
-const { generarNip, hashNip, compararNip, DUMMY_HASH } = require('./nip.util');
+const {
+  generarNip, hashNip, compararNip, DUMMY_HASH,
+  generarCodigoRecuperacion, CODIGOS_DEBILES,
+} = require('./nip.util');
 
 describe('generarNip', () => {
   test('siempre devuelve 4 dígitos (con ceros a la izquierda si aplica)', () => {
@@ -26,6 +29,20 @@ describe('generarNip', () => {
     ]);
     for (let i = 0; i < 500; i++) {
       expect(listaDebil.has(generarNip())).toBe(false);
+    }
+  });
+});
+
+describe('generarCodigoRecuperacion', () => {
+  test('siempre devuelve 6 dígitos (con ceros a la izquierda si aplica)', () => {
+    for (let i = 0; i < 200; i++) {
+      expect(generarCodigoRecuperacion()).toMatch(/^\d{6}$/);
+    }
+  });
+
+  test('nunca genera un código de CODIGOS_DEBILES (2026-11-13, hardening)', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(CODIGOS_DEBILES.has(generarCodigoRecuperacion())).toBe(false);
     }
   });
 });

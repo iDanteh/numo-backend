@@ -24,6 +24,7 @@ const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
 const congelamientoService = require('./jobs/congelamiento-puntos.service');
+const securityEventService = require('./domains/security/loyalty-security-event.service');
 
 const router = express.Router();
 
@@ -243,6 +244,18 @@ router.get('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOY
 
 router.put('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json({ minutos: await configService.guardarCanjeCodigoVigenciaMin(req.body?.minutos, req.user) });
+}));
+
+// Auditoría de eventos OTP (2026-11-13, pedido explícito del usuario) — quién pidió/validó un
+// código, cuándo y con qué resultado, para la consulta pública Y el canje con Kore (mismo tabla,
+// `tipo` distingue el flujo). Permiso dedicado LOYALTY_AUDITORIA (pedido explícito del usuario,
+// reemplaza el LOYALTY_CONFIG original de esta misma sesión): expone teléfonos completos y
+// patrones de intentos fallidos, más sensible que el resto de la configuración de Lealtad. NUNCA
+// expone el código en sí — ver docstring de loyalty-security-event.service.js, decisión confirmada
+// con el usuario de no revertir "nunca se persiste el código".
+router.get('/auditoria/eventos-seguridad', authenticate, permit(PERMISSIONS.LOYALTY_AUDITORIA), asyncHandler(async (req, res) => {
+  const { telefono, tipo, resultado, desde, hasta, limit, offset } = req.query ?? {};
+  res.json(await securityEventService.listarEventosSeguridad({ telefono, tipo, resultado, desde, hasta, limit, offset }));
 }));
 
 // Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:

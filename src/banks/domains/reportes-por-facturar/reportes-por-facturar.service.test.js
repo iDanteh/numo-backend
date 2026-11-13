@@ -212,7 +212,7 @@ describe('secciones y Excel por pestaña', () => {
     cargar();
     const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };
     const todo = await leer();
-    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO', 'RESUMEN POR FACTURAR']);
+    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO']);
     expect(todo.getWorksheet('MOSTRADOR I0').getColumn(2).values).toEqual(expect.arrayContaining(['PENDIENTE GENERAR FACTURA']));
     expect((await leer('mostrador')).worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0']);
     const ws = todo.getWorksheet('MOSTRADOR A0 - CEDIS');

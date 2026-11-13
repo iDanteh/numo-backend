@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const opaCobranzaSvc       = require('./opa-cobranza.service');
-const { detectarMovimientosMostrador, detectarDepositosPendientesFactura } = require('./mostrador.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, esEstatusPorFacturar } = require('./mostrador.service');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -1604,7 +1604,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           ) ?? null;
           esPpdPorFacturar = !!(cuentaPpdInfo
             && cuentaPpdInfo.tipoPago === 'PPD'
-            && cuentaPpdInfo.nombreTipoMovimiento === 'POR FACTURAR');
+            // Desde el 12-nov Kore manda "CONSIGNACION" en vez de "POR FACTURAR"
+            // (2026-11-13, confirmado con el usuario) — se aceptan los dos.
+            && esEstatusPorFacturar(cuentaPpdInfo.nombreTipoMovimiento));
         } catch (err) {
           const { logger } = require('../../../shared/utils/logger');
           logger.warn(`[PolizaGen] Consulta PPD-por-facturar (${cuenta.serieVenta}-${cuenta.folioVenta}) falló, se ignora: ${err.message}`);

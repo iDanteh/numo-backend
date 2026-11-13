@@ -36,14 +36,13 @@ const CFDI         = require('../../../visor/models/CFDI');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
-const { _identificadoEl } = require('../cfdi-mapping/mostrador.service');
+const { _identificadoEl, esEstatusPorFacturar } = require('../cfdi-mapping/mostrador.service');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 const Foto = require('./EstadisticaPorFacturarFoto.model');
 const { logger } = require('../../../shared/utils/logger');
 
 const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 const LOTE_DESGLOSES = 50;
 // Desde cuándo se arrastran los pendientes (igual que el reporte "Por facturar").
@@ -155,7 +154,7 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
     necesitaSaldo: k => !desglose.get(k)?.serieFactura,
   });
 
-  const esPorFacturar = k => { const c = cuentaKore.get(k); return c?.tipoPago === 'PPD' && c?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR; };
+  const esPorFacturar = k => { const c = cuentaKore.get(k); return c?.tipoPago === 'PPD' && esEstatusPorFacturar(c?.nombreTipoMovimiento); };
   const facturaDe = k => {
     const d = desglose.get(k);
     if (d?.serieFactura) return `${String(d.serieFactura).trim().toUpperCase()}-${String(d.folioFactura ?? '').trim()}`;

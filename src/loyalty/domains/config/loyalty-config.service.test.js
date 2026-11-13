@@ -209,6 +209,43 @@ describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite men
   );
 });
 
+describe('obtenerCanjeCodigoVigenciaMin / guardarCanjeCodigoVigenciaMin (código de autorización de canje, 2026-11-13)', () => {
+  test('obtenerCanjeCodigoVigenciaMin devuelve el default (5) cuando getValue tira (a diferencia de D11, acá sí hace falta un default usable)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(5);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CANJE_CODIGO_VIGENCIA_MIN');
+  });
+
+  test('obtenerCanjeCodigoVigenciaMin devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('10');
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(10);
+  });
+
+  test('obtenerCanjeCodigoVigenciaMin devuelve el default si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(5);
+  });
+
+  test('guardarCanjeCodigoVigenciaMin(10) llama a setValue con tipo:"numero" y devuelve 10', async () => {
+    const resultado = await configService.guardarCanjeCodigoVigenciaMin(10, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CANJE_CODIGO_VIGENCIA_MIN', '10',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(10);
+  });
+
+  test.each([[0, 'cero'], [-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico'], [null, 'null'], [undefined, 'undefined']])(
+    'guardarCanjeCodigoVigenciaMin(%p) inválido (%s) → 400, no llama a setValue (no admite deshabilitar, a diferencia de CONGELAMIENTO_MESES)',
+    async (valor) => {
+      await expect(
+        configService.guardarCanjeCodigoVigenciaMin(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
   test('obtenerFotoFolderId lee lealtad.FOTO_CLIENTE_FOLDER_ID y recorta espacios', async () => {
     globalConfigService.getValue.mockResolvedValue('  abc123  ');

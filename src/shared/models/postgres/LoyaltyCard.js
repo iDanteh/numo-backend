@@ -302,6 +302,33 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     defaultValue: 0,
     comment:      'Ciclos de código exitosos en el período consultaCodigoMesPeriodo. Se reinicia solo (lectura perezosa) cuando el mes actual ya no coincide con el período guardado.',
   },
+  // ── Código de autorización de canje de puntos en venta (2026-11-13, webhook Kore) ──────────
+  // Columnas PROPIAS, separadas de recuperacionCodigoHash/consultaSesionTokenHash — un cliente
+  // puede tener una consulta pública en curso (desde su casa) al mismo tiempo que un cajero le
+  // dispara un canje en caja, sin que un flujo pise al otro. A diferencia de la consulta pública
+  // (que abre una sesión de varios usos), este código es de UN SOLO USO, consumido de inmediato
+  // al validarse con éxito — ver loyalty-kore-canje.service.js.
+  canjeCodigoHash: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Hash bcrypt del código de autorización de canje (6 dígitos). El texto plano nunca se persiste. Null cuando no hay canje en curso.',
+  },
+  canjeCodigoExpiraEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Vencimiento del código de canje — minutos configurables, ver loyalty-config.service.js#obtenerCanjeCodigoVigenciaMin (default 5).',
+  },
+  canjeIntentosFallidos: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Contador de intentos fallidos consecutivos del código de canje. Independiente del contador de recuperación/NIP.',
+  },
+  canjeBloqueadaHasta: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Bloqueo temporal tras 5 intentos fallidos del código de canje: 15 min desde el 5to fallo.',
+  },
 }, {
   tableName:   'loyalty_cards',
   underscored: true,
@@ -317,7 +344,7 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     // negocio, no PII sensible.
     attributes: {
       exclude: [
-        'nipHash', 'recuperacionCodigoHash', 'consultaSesionTokenHash',
+        'nipHash', 'recuperacionCodigoHash', 'consultaSesionTokenHash', 'canjeCodigoHash',
         'apodo', 'sexo', 'fechaNacimiento', 'calle', 'numExterior', 'numInterior',
         'colonia', 'municipio', 'estado', 'cp', 'comentarios',
       ],
@@ -332,6 +359,9 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     },
     withConsultaSesionTokenHash: {
       attributes: { include: ['consultaSesionTokenHash'] },
+    },
+    withCanjeCodigoHash: {
+      attributes: { include: ['canjeCodigoHash'] },
     },
     // Uso interno del propio dominio loyalty (ej. backfill de enriquecimiento en
     // loyalty-import-apply.service.js) — nunca para servir una respuesta HTTP directa.

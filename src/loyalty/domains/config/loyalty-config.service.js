@@ -184,6 +184,44 @@ async function guardarConsultaCodigoMaxMes(max, user) {
 }
 
 /**
+ * CANJE_CODIGO_VIGENCIA_MIN (2026-11-13, pedido explícito del usuario) — cuántos minutos dura
+ * vigente el código de un solo uso que Numo genera y manda al cliente para autorizar un canje de
+ * puntos en una venta de Kore (ver `loyalty-kore-canje.service.js`). Mismo mecanismo que
+ * CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES (`GlobalConfig` sección `lealtad`, `tipo:'numero'`),
+ * pero a diferencia de esos dos, acá NO hay un significado especial en 0 — la vigencia siempre
+ * tiene que ser un número positivo real (nunca "deshabilitado"), con **default 5** si todavía no
+ * se configuró nada (pedido explícito del usuario, no D11: acá sí hace falta un default usable
+ * desde el primer canje, no se puede dejar sin vigencia).
+ */
+function _validarCanjeCodigoVigenciaMin(valor) {
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new BadRequestError('La vigencia del código de canje debe ser un número entero mayor a 0 (minutos).');
+  }
+  return n;
+}
+
+const CANJE_CODIGO_VIGENCIA_MIN_DEFAULT = 5;
+
+/** Minutos de vigencia vigentes — default 5 si nunca se configuró explícitamente. */
+async function obtenerCanjeCodigoVigenciaMin() {
+  const valor = await globalConfigService.getValue(SECTION, 'CANJE_CODIGO_VIGENCIA_MIN').catch(() => null);
+  if (valor === null) return CANJE_CODIGO_VIGENCIA_MIN_DEFAULT;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n > 0) ? n : CANJE_CODIGO_VIGENCIA_MIN_DEFAULT;
+}
+
+/** Guarda la vigencia (minutos). No admite 0/vacío — mismo criterio de _validarCanjeCodigoVigenciaMin. */
+async function guardarCanjeCodigoVigenciaMin(minutos, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarCanjeCodigoVigenciaMin(minutos);
+  await globalConfigService.setValue(SECTION, 'CANJE_CODIGO_VIGENCIA_MIN', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n;
+}
+
+/**
  * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
  * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
  * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
@@ -750,6 +788,8 @@ module.exports = {
   guardarCongelamientoMeses,
   obtenerConsultaCodigoMaxMes,
   guardarConsultaCodigoMaxMes,
+  obtenerCanjeCodigoVigenciaMin,
+  guardarCanjeCodigoVigenciaMin,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

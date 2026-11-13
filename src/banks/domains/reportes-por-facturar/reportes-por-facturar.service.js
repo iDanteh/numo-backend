@@ -25,7 +25,7 @@ const CFDI         = require('../../../visor/models/CFDI');
 const BankMovement = require('../banks/BankMovement.model');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generator.service');
-const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas } = require('../cfdi-mapping/mostrador.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, esEstatusPorFacturar } = require('../cfdi-mapping/mostrador.service');
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
@@ -228,7 +228,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
   for (const c of candidatas) {
     const k = `${_serieK(c.serieVenta)}|${String(c.folioVenta ?? '').trim()}`;
     const koreInfo = info.get(k);
-    if (!koreInfo || koreInfo.tipoPago !== 'PPD' || koreInfo.nombreTipoMovimiento !== ESTATUS_POR_FACTURAR_K) continue;
+    if (!koreInfo || koreInfo.tipoPago !== 'PPD' || !esEstatusPorFacturar(koreInfo.nombreTipoMovimiento)) continue;
     const importe = _r2((c.cobros ?? []).reduce((s, cobro) => s + Math.abs(Number(cobro.monto) || 0), 0));
     if (!importe) continue;
     const serie = _serieK(c.serieVenta);

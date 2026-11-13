@@ -127,3 +127,23 @@ test('el Excel completo incluye la hoja RESUMEN al final', async () => {
   agregarHojasSeccion(wb, armarSecciones(datos), undefined, {});
   expect(wb.worksheets.map(w => w.name).at(-1)).toBe('RESUMEN POR FACTURAR');
 });
+
+// 2026-11-13: pago MIXTO de Kore partido en depósito de banco + efectivo S/R de la
+// misma remisión (con saldo → X FAC CON FICHA): el saldo y el importe total de la
+// venta solo en el primer renglón, para no sumarse dos veces.
+test('misma remisión en dos renglones (banco + efectivo S/R): saldo e importe total una sola vez', () => {
+  const historialAbonos = [{ remision: 'A0-261100144', saldo: 12499.6, abonos: [
+    { fecha: '2026-11-12T17:00:00Z', movimiento: 'ABO-1', forma: 'TRANSFERENCIA', importe: 8000, saldo: 14499.6, idNumo: '057900' },
+    { fecha: '2026-11-12T17:05:00Z', movimiento: 'ABO-2', forma: 'EFECTIVO', importe: 2000, saldo: 12499.6 },
+  ] }];
+  const comun = { remisiones: ['A0-261100144'], cliente: 'ROSA', fecha: '2026-11-12T00:00:00Z', ppdPorFacturar: true, deKore: true, historialAbonos };
+  const filas = filasResumen(armarSecciones({ movimientosMostrador: [], cobrosCajaGlobales: [], depositosPendientesFactura: [], depositosPendientesPago: [
+    { ...comun, importe: 8000, idNumo: '057900', banco: 'BBVA', formasPago: { transferencia: 8000 }, saldo: 12499.6 },
+    { ...comun, importe: 2000, idNumo: 'S/R', banco: 'S/R', formasPago: { efectivo: 2000 }, saldo: null },
+  ] }), formaPagoDe).filter(f => f.cliente === 'ROSA');
+  expect(filas.map(f => [f.idNumo, f.importe, f.estatus, f.saldo, f.totalVenta])).toEqual(expect.arrayContaining([
+    ['057900', 8000, 'ABONADA', 12499.6, 22499.6],
+    ['S/R', 2000, 'ABONADA', null, null],
+  ]));
+  expect(filas.reduce((s, f) => s + (f.saldo || 0), 0)).toBe(12499.6);
+});

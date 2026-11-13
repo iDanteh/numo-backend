@@ -233,13 +233,81 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
     if (!importe) continue;
     const serie = _serieK(c.serieVenta);
     const folio = String(c.folioVenta ?? '').trim();
+    const fp = formasPagoDeCuentas([c]);
+    // Monto de formas distintas al efectivo (transferencia, tarjeta, cheque, depósito).
+    const noEfectivo = _r2((fp?.transferencia || 0) + (fp?.tarjeta || 0) + (fp?.cheque || 0) + (fp?.depositoEfectivo || 0));
+    const soloEfectivo = _r2(importe - noEfectivo);
+
+    // Si hay un pago no-efectivo, buscar el depósito en Bancos por importe ±$5
+    // dentro de ±15 días del cobro. Si hay exactamente uno → separar en dos
+    // renglones (banco con ID NUMO + efectivo S/R).
+    if (noEfectivo > 0) {
+      const fechaCobro = c.fechaCreacion ? new Date(c.fechaCreacion) : new Date();
+      const bancosMatch = await BankMovement.find({
+        isActive: { $ne: false },
+        deposito: { $gte: noEfectivo - 5, $lte: noEfectivo + 5 },
+        fecha: {
+          $gte: new Date(fechaCobro.getTime() - 15 * 86400000),
+          $lte: new Date(fechaCobro.getTime() + 15 * 86400000),
+        },
+        $or: [{ erpLinks: { $exists: false } }, { erpLinks: { $size: 0 } }, { 'erpLinks.folioExterno': folio }],
+      }).select('fecha concepto deposito banco folio').lean();
+
+      if (bancosMatch.length === 1) {
+        const b = bancosMatch[0];
+        const fpBanco = {};
+        if (fp?.transferencia)    fpBanco.transferencia    = fp.transferencia;
+        if (fp?.tarjeta)          fpBanco.tarjeta          = fp.tarjeta;
+        if (fp?.cheque)           fpBanco.cheque           = fp.cheque;
+        if (fp?.depositoEfectivo) fpBanco.depositoEfectivo = fp.depositoEfectivo;
+        depositos.push({
+          fecha:       b.fecha ?? null,
+          descripcion: b.concepto ?? `TRANSFERENCIA REM ${serie}-${folio}`,
+          importe:     noEfectivo,
+          aplicado:    noEfectivo,
+          banco:       b.banco ?? 'BANCO',
+          formasPago:  fpBanco,
+          remisiones:  [`${serie}-${folio}`],
+          cliente:     koreInfo.nombre ?? '',
+          idNumo:      b.folio ?? 'S/R',
+          estatus:     ESTATUS_POR_FACTURAR_K,
+          ppdPorFacturar: true,
+          saldo:       0,
+          deKore:      true,
+        });
+        if (soloEfectivo > 0.005) {
+          const fpEfectivo = {};
+          if (fp?.efectivo) fpEfectivo.efectivo = fp.efectivo;
+          if (fp?.abonos)   fpEfectivo.abonos   = fp.abonos;
+          if (fp?.otras)    fpEfectivo.otras     = fp.otras;
+          depositos.push({
+            fecha:       c.fechaCreacion ?? null,
+            descripcion: `REM ${serie}-${folio}`,
+            importe:     soloEfectivo,
+            aplicado:    soloEfectivo,
+            banco:       'S/R',
+            formasPago:  fpEfectivo,
+            remisiones:  [`${serie}-${folio}`],
+            cliente:     koreInfo.nombre ?? '',
+            idNumo:      'S/R',
+            estatus:     ESTATUS_POR_FACTURAR_K,
+            ppdPorFacturar: true,
+            saldo:       0,
+            deKore:      true,
+          });
+        }
+        continue;
+      }
+    }
+
+    // Sin depósito identificado → un renglón S/R con la forma de pago real.
     depositos.push({
       fecha:       c.fechaCreacion ?? null,
       descripcion: `REM ${serie}-${folio}`,
       importe,
       aplicado:    importe,
       banco:       'S/R',
-      formasPago:  formasPagoDeCuentas([c]) ?? undefined,
+      formasPago:  fp ?? undefined,
       remisiones:  [`${serie}-${folio}`],
       cliente:     koreInfo.nombre ?? '',
       idNumo:      'S/R',

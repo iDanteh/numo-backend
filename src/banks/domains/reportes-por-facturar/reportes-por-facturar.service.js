@@ -25,7 +25,7 @@ const CFDI         = require('../../../visor/models/CFDI');
 const BankMovement = require('../banks/BankMovement.model');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generator.service');
-const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('../cfdi-mapping/mostrador.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas } = require('../cfdi-mapping/mostrador.service');
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
@@ -239,6 +239,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
       importe,
       aplicado:    importe,
       banco:       'S/R',
+      formasPago:  formasPagoDeCuentas([c]) ?? undefined,
       remisiones:  [`${serie}-${folio}`],
       cliente:     koreInfo.nombre ?? '',
       idNumo:      'S/R',

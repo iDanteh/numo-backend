@@ -138,6 +138,7 @@ async function correrMatchKore({ onProgress } = {}) {
           matcheadosDetalle.push({
             telefono: card.telefono,
             nombre: card.nombre,
+            nivel: card.nivel,
             tarjetaLegada: card.tarjetaLegada,
             koreClienteId: cliente.id,
             koreMonedero: cliente.monedero,
@@ -164,7 +165,8 @@ async function correrMatchKore({ onProgress } = {}) {
   // ejemplos" del frontend), esta alimenta la 2da pestaña del Excel automático (pedido explícito
   // 2026-10-23: rastreo manual de los clientes que quedaron sin monedero Kore).
   const sinMatchEnKoreDetalle = tarjetasSinMatchEnKore.map((card) => ({
-    cardId: card.id, telefono: card.telefono, nombre: card.nombre, tarjetaLegada: card.tarjetaLegada,
+    cardId: card.id, telefono: card.telefono, nombre: card.nombre, nivel: card.nivel,
+    tarjetaLegada: card.tarjetaLegada,
   }));
 
   logger.info(

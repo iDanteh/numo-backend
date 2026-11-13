@@ -55,7 +55,11 @@ const LoyaltyPendingEnrollment = sequelize.define('LoyaltyPendingEnrollment', {
     type:         DataTypes.STRING(10),
     allowNull:    false,
     defaultValue: 'Bronce',
-    validate:     { isIn: [['Bronce', 'Plata', 'Oro']] },
+    // 2026-11-12: 'Azul' agregado (ver loyalty-import.service.js) — este isIn es una validación
+    // fija a nivel de modelo, independiente del catálogo dinámico LoyaltyKoreNivel que usa
+    // loyalty-card.service.js#nivelEsValido(). Si se agrega otro nivel nuevo a futuro, actualizar
+    // ACÁ también (no se resuelve solo con el catálogo).
+    validate:     { isIn: [['Bronce', 'Plata', 'Oro', 'Azul']] },
     comment:      'Nivel con el que se creará la tarjeta al completar el registro (mismo criterio que LoyaltyCard.nivel).',
   },
   motivo: {

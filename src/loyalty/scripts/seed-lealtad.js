@@ -119,23 +119,34 @@ const NIVELES_BOOTSTRAP = [
   { nombre: 'Bronce', claveGlobalConfig: 'PORCENTAJE_BRONCE', esInicial: true },
   { nombre: 'Plata', claveGlobalConfig: 'PORCENTAJE_PLATA', esInicial: false },
   { nombre: 'Oro', claveGlobalConfig: 'PORCENTAJE_ORO', esInicial: false },
+  // 2026-11-12: "Azul" es una categoría nueva propia de Numo (clientes del import CSV con
+  // Categoria "Profesionales"/"Público en general" — ver loyalty-import.service.js), no
+  // gestionada por Kore ni configurada antes en Configuraciones Globales — no hay valor viejo
+  // que backfillear acá, el 1% es un dato de negocio fijo confirmado explícitamente por el
+  // usuario (a diferencia de Bronce/Plata/Oro, que sí pueden quedar `porcentaje:null` si nunca
+  // se configuraron).
+  { nombre: 'Azul', claveGlobalConfig: null, porcentajeFijo: 1, esInicial: false },
 ];
 
 async function _asegurarNivelesBootstrap() {
-  for (const { nombre, claveGlobalConfig, esInicial } of NIVELES_BOOTSTRAP) {
+  for (const { nombre, claveGlobalConfig, porcentajeFijo, esInicial } of NIVELES_BOOTSTRAP) {
     // eslint-disable-next-line no-await-in-loop
     const existente = await LoyaltyKoreNivel.findOne({ where: { nombre } });
     if (existente) {
       console.log(`[seed-lealtad] Nivel '${nombre}' ya existe (id=${existente.id}, koreId=${existente.koreId ?? 'transicional'}) — no se pisa.`);
       continue; // eslint-disable-line no-continue
     }
-    // eslint-disable-next-line no-await-in-loop
-    const porcentajeViejo = await svc.getValue('lealtad', claveGlobalConfig).catch(() => null);
+    let porcentaje = porcentajeFijo ?? null;
+    if (porcentaje == null && claveGlobalConfig) {
+      // eslint-disable-next-line no-await-in-loop
+      const porcentajeViejo = await svc.getValue('lealtad', claveGlobalConfig).catch(() => null);
+      porcentaje = porcentajeViejo != null ? Number(porcentajeViejo) : null;
+    }
     // eslint-disable-next-line no-await-in-loop
     const fila = await LoyaltyKoreNivel.create({
       koreId: null,
       nombre,
-      porcentaje: porcentajeViejo != null ? Number(porcentajeViejo) : null,
+      porcentaje,
       esInicial,
       activo: true,
     });

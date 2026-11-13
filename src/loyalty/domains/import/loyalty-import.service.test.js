@@ -134,9 +134,9 @@ describe('construirConcentrado', () => {
     expect(resultado.filas.every((f) => f.advertencias.includes('tarjeta_duplicada_en_clientes'))).toBe(true);
   });
 
-  test('Categoria no reconocida (ej. "Profesionales"): nivelSugerido Bronce por default, NO bloquea (es info, no advertencia)', () => {
+  test('Categoria no reconocida (ej. "Sin categoria"): nivelSugerido Bronce por default, NO bloquea (es info, no advertencia)', () => {
     const resultado = construirConcentrado({
-      clientesRows: [cliente({ categoriaOriginal: 'Profesionales' })],
+      clientesRows: [cliente({ categoriaOriginal: 'Sin categoria' })],
     });
 
     const [fila] = resultado.filas;
@@ -144,6 +144,20 @@ describe('construirConcentrado', () => {
     expect(fila.info).toContain('nivel_asignado_por_default');
     expect(fila.advertencias).not.toContain('nivel_asignado_por_default');
     expect(resultado.resumen.totalNivelPorDefault).toBe(1);
+  });
+
+  test.each([
+    ['Profesionales', 'Azul'], ['PROFESIONALES', 'Azul'], [' profesionales ', 'Azul'],
+    ['Público en general', 'Azul'], ['Publico en general', 'Azul'], ['PÚBLICO EN GENERAL', 'Azul'],
+  ])('Categoria "%s" se asigna EXPLÍCITAMENTE a nivelSugerido "%s", sin asignación por default', (categoriaOriginal, nivelEsperado) => {
+    const resultado = construirConcentrado({
+      clientesRows: [cliente({ categoriaOriginal })],
+    });
+
+    const [fila] = resultado.filas;
+    expect(fila.nivelSugerido).toBe(nivelEsperado);
+    expect(fila.info).not.toContain('nivel_asignado_por_default');
+    expect(resultado.resumen.totalNivelPorDefault).toBe(0);
   });
 
   test('Nombre+Apellidos vacíos pero con contacto: nombre provisional "Cliente <contacto>", NO bloquea (es info, no advertencia)', () => {

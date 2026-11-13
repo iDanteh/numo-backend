@@ -257,12 +257,18 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
     // Monto de formas distintas al efectivo (transferencia, tarjeta, cheque, depósito).
     const noEfectivo = _r2((fp?.transferencia || 0) + (fp?.tarjeta || 0) + (fp?.cheque || 0) + (fp?.depositoEfectivo || 0));
     const soloEfectivo = _r2(importe - noEfectivo);
+    // Día del cobro (2026-11-13): el último cobro de Kore dentro del rango, no la
+    // creación de la remisión (MARINA LOPEZ A0-261004828, creada el 28-oct y
+    // pagada el 12-nov, salía el 28-oct y su pago no contaba como PAGO INICIAL;
+    // y el depósito de un pago MIXTO se buscaba ±15 días de la creación).
+    const fechasCobro = (c.cobros ?? []).map(x => new Date(x.fecha)).filter(x => !isNaN(x));
+    const fechaCobro = fechasCobro.length ? new Date(Math.max(...fechasCobro))
+      : c.fechaCreacion ? new Date(c.fechaCreacion) : new Date();
 
     // Si hay un pago no-efectivo, buscar el depósito en Bancos por importe ±$5
     // dentro de ±15 días del cobro. Si hay exactamente uno → separar en dos
     // renglones (banco con ID NUMO + efectivo S/R).
     if (noEfectivo > 0) {
-      const fechaCobro = c.fechaCreacion ? new Date(c.fechaCreacion) : new Date();
       const bancosMatch = await BankMovement.find({
         isActive: { $ne: false },
         deposito: { $gte: noEfectivo - 5, $lte: noEfectivo + 5 },
@@ -293,7 +299,9 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
           estatus:     ESTATUS_POR_FACTURAR_K,
           ppdPorFacturar: true,
           saldo:       saldoFila(),
-          deKore:      true,
+          // Fecha del estado de cuenta (medianoche UTC), no un instante de Kore:
+          // con deKore se leía como hora de México y salía un día antes (2026-11-13).
+          deKore:      false,
         });
         if (soloEfectivo > 0.005) {
           const fpEfectivo = {};
@@ -301,7 +309,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
           if (fp?.abonos)   fpEfectivo.abonos   = fp.abonos;
           if (fp?.otras)    fpEfectivo.otras     = fp.otras;
           destino.push({
-            fecha:       c.fechaCreacion ?? null,
+            fecha:       fechaCobro,
             descripcion: `REM ${serie}-${folio}`,
             importe:     soloEfectivo,
             aplicado:    soloEfectivo,
@@ -322,7 +330,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
 
     // Sin depósito identificado → un renglón S/R con la forma de pago real.
     destino.push({
-      fecha:       c.fechaCreacion ?? null,
+      fecha:       fechaCobro,
       descripcion: `REM ${serie}-${folio}`,
       importe,
       aplicado:    importe,

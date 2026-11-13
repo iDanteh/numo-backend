@@ -275,7 +275,7 @@ test('refacturada: encabezado con las otras facturas de sus mismas remisiones', 
 // saldadas y aparte las que aún deben abonos"): las remisiones S/R de Kore
 // (sin depósito en Bancos) se reparten por saldo, igual que las de Bancos.
 test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo de Kore → CON PENDIENTES DE PAGO', async () => {
-  const cuenta = (folio, monto) => ({ serieVenta: 'A0', folioVenta: folio, fechaCreacion: '2026-11-12T16:00:00Z', cobros: [{ monto, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto }] }] });
+  const cuenta = (folio, monto) => ({ serieVenta: 'A0', folioVenta: folio, fechaCreacion: '2026-10-28T16:00:00Z', cobros: [{ monto, fecha: '2026-11-12T17:00:00Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto }] }] });
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ centro }) => (centro === 'A0' ? [cuenta('1', 500), cuenta('2', 200), cuenta('3', 80), cuenta('4', 90)] : []));
   koreRem.infoRemisiones.mockResolvedValue({ sinRespuesta: 1, consultadas: 4, info: new Map([
     ['A0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', nombre: 'SALDADA', saldoActual: 0 }],
@@ -290,6 +290,8 @@ test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo 
   expect([necesitaSaldo('A0|1', { liquidadaEl: new Date() }), necesitaSaldo('A0|2', {})]).toEqual([false, true]);
   const sr = arr => arr.filter(d => d.idNumo === 'S/R').map(d => [d.cliente, d.importe, d.saldo]);
   expect(sr(datos.depositosPendientesFactura)).toEqual([['SALDADA', 500, 0]]);
+  // Fecha = la del cobro (12-nov), no la de creación de la remisión (28-oct).
+  expect(new Date(datos.depositosPendientesFactura.find(d => d.idNumo === 'S/R').fecha).toISOString()).toBe('2026-11-12T17:00:00.000Z');
   expect(sr(datos.depositosPendientesPago)).toEqual([['DEBE', 200, 300], ['SIN SALDO', 80, null]]);
   // Los de Bancos siguen en su lugar.
   expect(datos.depositosPendientesFactura.map(d => d.idNumo)).toContain('053966');

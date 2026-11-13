@@ -30,6 +30,12 @@ const { infoRemisiones } = require('../erp/kore-remisiones.service');
 
 const TIPO_ORIGEN_VENTA_SIN_COBRO = 'Venta Sin Cobro';
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
+// Estatus de Kore de una remisión PPD sin factura (2026-11-13): hasta el 11-nov
+// Kore la mandaba como "POR FACTURAR"; desde el 12-nov la manda como
+// "CONSIGNACION" (en kore_remisiones las viejas siguen guardadas con el
+// anterior) — se aceptan las dos (confirmado con el usuario).
+const ESTATUS_KORE_POR_FACTURAR = new Set([ESTATUS_POR_FACTURAR, 'CONSIGNACION']);
+const esEstatusPorFacturar = estatus => ESTATUS_KORE_POR_FACTURAR.has(String(estatus ?? '').trim().toUpperCase());
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
@@ -209,7 +215,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
       d.estatus = unicos(infos.map(i => i.nombreTipoMovimiento)).join(' / ');
       // PPD "POR FACTURAR" en Kore (mismo criterio que `esPpdPorFacturar` del
       // generador); si Kore no regresó la cuenta, tipoPago cae al del link.
-      d.ppdPorFacturar = infos.some(i => (i.tipoPago ?? i.tipoPagoLink) === 'PPD' && i.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
+      d.ppdPorFacturar = infos.some(i => (i.tipoPago ?? i.tipoPagoLink) === 'PPD' && esEstatusPorFacturar(i.nombreTipoMovimiento));
       // Kore no regresó NINGUNA de sus remisiones: no se sabe → null (no se
       // esconde; el reporte avisa). Antes quedaba false y desaparecía.
       if (!d.ppdPorFacturar && infos.every(i => !i.nombreTipoMovimiento) && infos.some(i => (i.tipoPagoLink ?? 'PPD') === 'PPD')) {
@@ -367,7 +373,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
     const c = cuentaKore.get(k);
     return !!(d && !d.serieFactura && c && !c.factura
       && c.tipoPago === 'PPD'
-      && c.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
+      && esEstatusPorFacturar(c.nombreTipoMovimiento));
   };
   const saldoDe = l => { const k = clave(l); const saldo = cuentaKore.get(k)?.saldoActual; return saldo != null ? Number(saldo) || 0 : cerradas.has(k) ? 0 : Number(l.saldoActual) || 0; };
   const pagada = l => Math.abs(saldoDe(l)) < 0.005;
@@ -437,4 +443,4 @@ async function detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin }) {
     .sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
 }
 
-module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, FORMAS_PAGO, _identificadoEl };
+module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, FORMAS_PAGO, _identificadoEl, esEstatusPorFacturar };

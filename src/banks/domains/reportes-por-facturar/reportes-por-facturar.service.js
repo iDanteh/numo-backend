@@ -200,20 +200,18 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
 
   const candidatasPorClave = new Map();
   for (const serie of series) {
-    const cuentas = await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde, fechaHasta }).catch(err => { console.error(`[_pendientesKore] ERROR ${serie}:`, err?.message); return []; });
-    console.log(`[_pendientesKore] ${serie}: ${cuentas?.length ?? 0} cuentas`, cuentas?.slice(0, 3).map(c => ({ serieVenta: c.serieVenta, folioVenta: c.folioVenta, serieFactura: c.serieFactura, cobros: c.cobros?.length })));
+    const cuentas = await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde, fechaHasta }).catch(() => []);
     for (const c of cuentas ?? []) {
       const s = _serieK(c.serieVenta);
       const f = String(c.folioVenta ?? '').trim();
       if (!s || !f) continue;
-      if (c.serieFactura) { console.log(`[_pendientesKore] skip ya facturada: ${s}-${f} → ${c.serieFactura}`); continue; }
+      if (c.serieFactura) continue; // ya facturada
       const rem = `${s}-${f}`;
-      if (remisionesBancos.has(rem)) { console.log(`[_pendientesKore] skip ya en Bancos: ${rem}`); continue; }
+      if (remisionesBancos.has(rem)) continue; // ya aparece vía Bancos
       const k = `${s}|${f}`;
       if (!candidatasPorClave.has(k)) candidatasPorClave.set(k, c);
     }
   }
-  console.log(`[_pendientesKore] candidatas sin filtrar: ${candidatasPorClave.size}`);
   if (!candidatasPorClave.size) return [];
 
   const candidatas = [...candidatasPorClave.values()];
@@ -233,7 +231,6 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
     console.log(`[_pendientesKore] candidata ${k}: tipoPago=${koreInfo?.tipoPago} estatus=${koreInfo?.nombreTipoMovimiento} cobros=${c.cobros?.length}`);
     if (!koreInfo || koreInfo.tipoPago !== 'PPD') continue;
     const importe = _r2((c.cobros ?? []).reduce((s, cobro) => s + Math.abs(Number(cobro.monto) || 0), 0));
-    console.log(`[_pendientesKore] PPD POR FACTURAR ${k}: importe=${importe}`);
     if (!importe) continue;
     const serie = _serieK(c.serieVenta);
     const folio = String(c.folioVenta ?? '').trim();

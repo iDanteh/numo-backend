@@ -16,7 +16,7 @@
  *   + N Fecha · O ID NUMO · P Banco (extra, para no perder de dónde salió)
  *   + Q No. abonos · R Último abono (2026-11-12)
  *   + S IMPORTE TOTAL VENTA (2026-11-12, pedido del usuario: "también debe
- *     venir importe total") · T ESTATUS (ABONADA / SALDADA; antes PAGADA) · U Saldo pendiente
+ *     venir importe total") · T ESTATUS (ABONADA / PAGADA) · U Saldo pendiente
  *     · V Pagada el
  *   + W–AB historial COMPLETO de la remisión en Kore hasta quedar en $0:
  *     fecha, TIPO, importe, movimiento, forma y saldo después de ese
@@ -61,20 +61,20 @@ const _diaFila = d => (!d.fecha ? null : String(d.fecha).length === 10 ? d.fecha
 /**
  * ESTATUS de la venta (2026-11-12, pedido del usuario: "saber si está abonada o
  * pagada por completo"), al momento de calcular / ↻ Actualizar el reporte:
- * con el historial de Kore, SALDADA si todas sus remisiones quedaron en saldo 0
+ * con el historial de Kore, PAGADA si todas sus remisiones quedaron en saldo 0
  * (fecha = la última en saldarse), si no ABONADA con lo que deben. Sin
  * historial: X FAC CON FICHA (todavía deben) → ABONADA; PENDIENTE GENERAR
- * FACTURA (saldo 0 por definición) → SALDADA; lo demás "SIN DATO".
+ * FACTURA (saldo 0 por definición) → PAGADA; lo demás "SIN DATO".
  */
 function estatusDe(d) {
   const hs = d.historialAbonos ?? [];
   if (hs.length) {
     const deben = hs.filter(h => !h.saldadaEl);
-    if (!deben.length) return { estatus: 'SALDADA', saldo: 0, pagadaEl: hs.map(h => _diaMx(h.saldadaEl)).sort().at(-1) };
+    if (!deben.length) return { estatus: 'PAGADA', saldo: 0, pagadaEl: hs.map(h => _diaMx(h.saldadaEl)).sort().at(-1) };
     return { estatus: 'ABONADA', saldo: _r2(deben.reduce((s, h) => s + (Number(h.saldo) || 0), 0)), pagadaEl: null };
   }
   if ((Number(d.saldo) || 0) > 0.005 || d._seccion === 'ficha') return { estatus: 'ABONADA', saldo: d.saldo != null ? _r2(d.saldo) : null, pagadaEl: null };
-  if (d._seccion === 'pendiente') return { estatus: 'SALDADA', saldo: 0, pagadaEl: null };
+  if (d._seccion === 'pendiente') return { estatus: 'PAGADA', saldo: 0, pagadaEl: null };
   return { estatus: 'SIN DATO', saldo: null, pagadaEl: null };
 }
 
@@ -206,7 +206,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   ws.addRow([]);
   const enc = ws.addRow(['Base', 'Forma de Pago', 'Serie', 'Folio', 'Factura', 'NOMBRE DEL CLIENTE', 'IMPORTE COBRADO', 'ABONOS ANTERIORES',
     'FACTURADO', 'BN', 'Observaciones', 'Valida Descuento Extra', 'Caja', 'Fecha', 'ID NUMO', 'Banco',
-    'No. ABONOS', 'ÚLTIMO ABONO', 'IMPORTE TOTAL VENTA', 'ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL',
+    'No. ABONOS', 'ÚLTIMO ABONO', 'IMPORTE TOTAL VENTA', 'ESTATUS', 'SALDO PENDIENTE', 'PAGADA EL',
     'FECHA', 'TIPO', 'IMPORTE', 'MOVIMIENTO', 'FORMA', 'SALDO DESPUÉS DE ESTE MOVIMIENTO']);
   enc.eachCell(c => { c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = _relleno(MORADO); c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
   ws.views = [{ state: 'frozen', ySplit: enc.number }];
@@ -245,7 +245,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
       if (a) row.getCell(24).font = { bold: a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[tipoEnHoja(a.tipo)] ?? 'FF374151' } };
       if (iVenta % 2 === 0) for (let c = 1; c <= 28; c++) row.getCell(c).fill = _relleno(GRIS_VENTA);
       for (const c of [14, 18, 22, 23]) row.getCell(c).numFmt = 'd/m/yy';
-      row.getCell(20).font = { bold: true, color: { argb: f.estatus === 'SALDADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
+      row.getCell(20).font = { bold: true, color: { argb: f.estatus === 'PAGADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
     }
     const bn = f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0;
     ws.getCell(n, 10).value = { formula: `IF(B${n}="01",(G${n}+H${n})*${BN_PORCENTAJE},0)`, result: bn };

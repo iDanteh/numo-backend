@@ -41,10 +41,10 @@ test('un renglón por forma de pago, claves SAT y abonos anteriores', () => {
     ['A0', '01', '261003322', 'POR FACTURAR', 'PEDRO', 1000, 0],
     ['I0', '01', '261000010', 'POR FACTURAR', 'JUANA', 400, 350],
   ]);
-  // Estatus (2026-11-12): PEDRO saldada el 9-nov; JUANA todavía debe $50; ANA sin historial (pendiente → SALDADA).
+  // Estatus (2026-11-12): PEDRO saldada el 9-nov; JUANA todavía debe $50; ANA sin historial (pendiente → PAGADA).
   expect(filas.map(f => [f.cliente, f.estatus, f.saldo, f.pagadaEl])).toEqual([
-    ['ANA', 'SALDADA', 0, null], ['ANA', 'SALDADA', null, null], // saldo solo en el 1er renglón del mixto
-    ['PEDRO', 'SALDADA', 0, '2026-11-09'], ['JUANA', 'ABONADA', 50, null],
+    ['ANA', 'PAGADA', 0, null], ['ANA', 'PAGADA', null, null], // saldo solo en el 1er renglón del mixto
+    ['PEDRO', 'PAGADA', 0, '2026-11-09'], ['JUANA', 'ABONADA', 50, null],
   ]);
 });
 
@@ -76,7 +76,7 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   // IMPORTE TOTAL VENTA (S) = lo que debía antes del primer movimiento: JUANA 750 + 100; PEDRO 0 + 1000; ANA sin historial.
   expect(fila(4).getCell(19).value).toBe('IMPORTE TOTAL VENTA');
   expect([19, 20, 21, 22].map(c => fila(8).getCell(c).value)).toEqual([850, 'ABONADA', 50, null]);
-  expect([19, 20, 21, 22].map(c => fila(7).getCell(c).value)).toEqual([1000, 'SALDADA', 0, new Date('2026-11-09T12:00:00Z')]);
+  expect([19, 20, 21, 22].map(c => fila(7).getCell(c).value)).toEqual([1000, 'PAGADA', 0, new Date('2026-11-09T12:00:00Z')]);
   expect(fila(5).getCell(19).value).toBeNull();
   expect(fila(9).getCell(19).value).toBeNull(); // sub-renglón: no suma doble
   expect(fila(4).getCell(28).value).toBe('SALDO DESPUÉS DE ESTE MOVIMIENTO');

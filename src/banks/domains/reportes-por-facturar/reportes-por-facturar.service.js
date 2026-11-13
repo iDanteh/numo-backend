@@ -231,7 +231,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
     const k = `${_serieK(c.serieVenta)}|${String(c.folioVenta ?? '').trim()}`;
     const koreInfo = info.get(k);
     console.log(`[_pendientesKore] candidata ${k}: tipoPago=${koreInfo?.tipoPago} estatus=${koreInfo?.nombreTipoMovimiento} cobros=${c.cobros?.length}`);
-    if (!koreInfo || koreInfo.tipoPago !== 'PPD' || koreInfo.nombreTipoMovimiento !== ESTATUS_POR_FACTURAR_K) continue;
+    if (!koreInfo || koreInfo.tipoPago !== 'PPD') continue;
     const importe = _r2((c.cobros ?? []).reduce((s, cobro) => s + Math.abs(Number(cobro.monto) || 0), 0));
     console.log(`[_pendientesKore] PPD POR FACTURAR ${k}: importe=${importe}`);
     if (!importe) continue;

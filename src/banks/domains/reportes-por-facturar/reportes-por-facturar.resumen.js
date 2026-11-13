@@ -131,8 +131,17 @@ function filasResumen(secciones, formaPagoDe) {
   const deps = _depositos(secciones);
   const idsEnResumen = new Set(deps.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
   const filas = [];
+  // Saldo pendiente e importe total son de la VENTA (remisión), no del depósito:
+  // si la misma remisión sale en varios renglones (p. ej. un pago MIXTO que se
+  // parte en depósito de banco + efectivo S/R de Kore, o dos depósitos de la
+  // misma remisión) van solo en el primero, para no sumarse dos veces en el
+  // TOTAL (2026-11-13).
+  const ventasVistas = new Set();
   for (const d of deps) {
     const remisiones = d.remisiones ?? [];
+    const claveVenta = [...remisiones].sort().join('|');
+    const primeraDeLaVenta = !claveVenta || !ventasVistas.has(claveVenta);
+    if (claveVenta) ventasVistas.add(claveVenta);
     const serie = _serie(String(remisiones[0] ?? '').split('-')[0]) || _serie(String(d.factura ?? '').split('-')[0]);
     const dia = _diaFila(d);
     const movimientos = (d.historialAbonos ?? []).flatMap(h => (h.abonos ?? []).map(a => ({
@@ -164,8 +173,8 @@ function filasResumen(secciones, formaPagoDe) {
       abonos: i === 0 ? abonos : [],
       movimientos: i === 0 ? movimientos : [],
       estatus: estatus.estatus,
-      saldo: i === 0 ? estatus.saldo : null,
-      totalVenta: i === 0 ? totalVenta : null,
+      saldo: i === 0 && primeraDeLaVenta ? estatus.saldo : null,
+      totalVenta: i === 0 && primeraDeLaVenta ? totalVenta : null,
       pagadaEl: estatus.pagadaEl,
       fecha: dia,
       idNumo: d.idNumo ?? '',

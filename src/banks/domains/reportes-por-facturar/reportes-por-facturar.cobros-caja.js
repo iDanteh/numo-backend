@@ -34,6 +34,7 @@
 const BankMovement = require('../banks/BankMovement.model');
 const { obtenerDesglosesCobroPorFactura } = require('../erp/erp-sync.service');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
+const { esEstatusPorFacturar } = require('../cfdi-mapping/mostrador.service');
 
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
 const TOLERANCIA = 0.05;
@@ -130,7 +131,7 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
     const r = await infoRemisiones({ rfc, remisiones: consultar.map(c => ({ serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion })) });
     sinRespuesta += r.sinRespuesta;
     const infoDe = c => r.info.get(`${_serie(c.serieVenta)}|${String(c.folioVenta).trim()}`);
-    const esPorFacturar = c => infoDe(c)?.tipoPago === 'PPD' && infoDe(c)?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR;
+    const esPorFacturar = c => infoDe(c)?.tipoPago === 'PPD' && esEstatusPorFacturar(infoDe(c)?.nombreTipoMovimiento);
     const porFacturar = candidatos.filter(({ c }) => esPorFacturar(c));
 
     const renglones = [];

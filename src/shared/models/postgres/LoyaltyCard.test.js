@@ -38,11 +38,11 @@ describe('LoyaltyCard — modelo Sequelize (loyalty_cards)', () => {
     expect(attr.allowNull).toBe(false);
   });
 
-  test("nivel: STRING(10) default 'Bronce', isIn [Bronce,Plata,Oro]", () => {
+  test("nivel: STRING(10) default 'Bronce', isIn [Bronce,Plata,Oro,Azul]", () => {
     const attr = LoyaltyCard.getAttributes().nivel;
     expect(attr.allowNull).toBe(false);
     expect(attr.defaultValue).toBe('Bronce');
-    expect(attr.validate.isIn).toEqual([['Bronce', 'Plata', 'Oro']]);
+    expect(attr.validate.isIn).toEqual([['Bronce', 'Plata', 'Oro', 'Azul']]);
   });
 
   test('saldoPuntos: DECIMAL(12,2) NOT NULL default 0', () => {

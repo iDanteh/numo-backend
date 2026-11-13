@@ -29,6 +29,10 @@ jest.mock('./loyalty-venta-fallida.service', () => ({
   listarVentasFallidas: jest.fn(),
   marcarVentaFallidaResuelta: jest.fn(),
 }));
+jest.mock('./loyalty-kore-canje.service', () => ({
+  solicitarCodigoCanje: jest.fn(),
+  validarCodigoCanje: jest.fn(),
+}));
 
 const express = require('express');
 const request = require('supertest');
@@ -36,6 +40,7 @@ const router = require('./loyalty-kore-venta.routes');
 const ventaService = require('./loyalty-kore-venta.service');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
+const canjeCodigoService = require('./loyalty-kore-canje.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 function perms(...list) { return { 'x-test-permissions': JSON.stringify(list) }; }
@@ -120,6 +125,26 @@ describe('PATCH /ventas-fallidas/:id/resolver', () => {
     const res = await request(freshApp()).patch('/ventas-fallidas/1/resolver').set(perms(PERMISSIONS.LOYALTY_CONFIG));
     expect(res.status).toBe(200);
     expect(ventaFallidaService.marcarVentaFallidaResuelta).toHaveBeenCalledWith('1', expect.objectContaining({ dbId: '1' }));
+  });
+});
+
+describe('POST /canje/solicitar-codigo', () => {
+  test('no requiere sesión Numo (solo verifyKoreApiKey, mockeado como no-op) y pasa el teléfono al service', async () => {
+    canjeCodigoService.solicitarCodigoCanje.mockResolvedValue({ mensaje: 'Código enviado' });
+    const res = await request(freshApp()).post('/canje/solicitar-codigo').send({ telefono: '5512345678' });
+    expect(res.status).toBe(200);
+    expect(canjeCodigoService.solicitarCodigoCanje).toHaveBeenCalledWith('5512345678');
+    expect(res.body).toEqual({ mensaje: 'Código enviado' });
+  });
+});
+
+describe('POST /canje/validar-codigo', () => {
+  test('no requiere sesión Numo (solo verifyKoreApiKey, mockeado como no-op) y pasa teléfono/código al service', async () => {
+    canjeCodigoService.validarCodigoCanje.mockResolvedValue({ valido: true });
+    const res = await request(freshApp()).post('/canje/validar-codigo').send({ telefono: '5512345678', codigo: '123456' });
+    expect(res.status).toBe(200);
+    expect(canjeCodigoService.validarCodigoCanje).toHaveBeenCalledWith('5512345678', '123456');
+    expect(res.body).toEqual({ valido: true });
   });
 });
 

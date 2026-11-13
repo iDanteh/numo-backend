@@ -77,6 +77,9 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   sincronizarNivelesKore: jest.fn(),
   actualizarNivelKore: jest.fn(),
 }));
+jest.mock('./domains/security/loyalty-security-event.service', () => ({
+  listarEventosSeguridad: jest.fn(),
+}));
 
 const express = require('express');
 const request = require('supertest');
@@ -86,6 +89,7 @@ const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
 const congelamientoService = require('./jobs/congelamiento-puntos.service');
+const securityEventService = require('./domains/security/loyalty-security-event.service');
 const { PERMISSIONS } = require('../shared/config/rbac');
 
 function perms(...list) {
@@ -151,6 +155,7 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config/niveles-kore',           permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/config/niveles-kore/sync',      permiso: PERMISSIONS.LOYALTY_CONFIG },
     { metodo: 'patch', ruta: '/config/niveles-kore/1',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esInicial: true } },
+    { metodo: 'get',   ruta: '/auditoria/eventos-seguridad',   permiso: PERMISSIONS.LOYALTY_AUDITORIA },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -642,5 +647,34 @@ describe('PATCH /cards/:id/marcar-revisada', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ id: 42, revisionPendiente: false });
     expect(cardService.marcarRevisada).toHaveBeenCalledWith('42', expect.objectContaining({ dbId: '1' }));
+  });
+});
+
+describe('GET /auditoria/eventos-seguridad (2026-11-13, pedido explícito del usuario)', () => {
+  test('exige loyalty:auditoria, no loyalty:config ni loyalty:read', async () => {
+    securityEventService.listarEventosSeguridad.mockResolvedValue({ total: 0, eventos: [] });
+
+    const sinPermiso = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(sinPermiso.status).toBe(403);
+
+    const conConfigNoAlcanza = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(conConfigNoAlcanza.status).toBe(403);
+
+    const res = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_AUDITORIA));
+    expect(res.status).toBe(200);
+  });
+
+  test('pasa los filtros de querystring tal cual al service', async () => {
+    securityEventService.listarEventosSeguridad.mockResolvedValue({ total: 2, eventos: [{ id: 1 }, { id: 2 }] });
+
+    const res = await request(app).get('/auditoria/eventos-seguridad')
+      .query({ telefono: '5512345678', tipo: 'solicitud_codigo_canje', resultado: 'fallo', limit: '10' })
+      .set(perms(PERMISSIONS.LOYALTY_AUDITORIA));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ total: 2, eventos: [{ id: 1 }, { id: 2 }] });
+    expect(securityEventService.listarEventosSeguridad).toHaveBeenCalledWith(expect.objectContaining({
+      telefono: '5512345678', tipo: 'solicitud_codigo_canje', resultado: 'fallo', limit: '10',
+    }));
   });
 });

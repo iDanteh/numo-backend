@@ -33,6 +33,36 @@ jest.mock('./loyalty-kore-canje.service', () => ({
   solicitarCodigoCanje: jest.fn(),
   validarCodigoCanje: jest.fn(),
 }));
+// Mismo criterio que loyalty-public.routes.test.js: `express-rate-limit` sigue siendo REAL (no
+// mockeado), pero el store sí se mockea — un `FakeRedisStore` que implementa el contrato real
+// (increment/decrement/resetKey/init) para que el conteo de 429 del limiter por teléfono
+// (`limiterSolicitarCanje`) sea idéntico al que afirma el describe de abajo. `redis-client` se
+// mockea para no disparar su connect() real (no hay Redis en CI/local para estos tests).
+jest.mock('../../../shared/utils/redis-client', () => ({ sendCommand: jest.fn() }));
+jest.mock('rate-limit-redis', () => {
+  function FakeRedisStore(options) {
+    this.options = options;
+    this.hits = new Map();
+    this.windowMs = 0;
+    this.init = (opts) => { this.windowMs = opts.windowMs; };
+    this.increment = async (key) => {
+      const now = Date.now();
+      let entry = this.hits.get(key);
+      if (!entry || entry.resetTime.getTime() <= now) {
+        entry = { totalHits: 0, resetTime: new Date(now + this.windowMs) };
+      }
+      entry.totalHits += 1;
+      this.hits.set(key, entry);
+      return { totalHits: entry.totalHits, resetTime: entry.resetTime };
+    };
+    this.decrement = async (key) => {
+      const entry = this.hits.get(key);
+      if (entry && entry.totalHits > 0) entry.totalHits -= 1;
+    };
+    this.resetKey = async (key) => { this.hits.delete(key); };
+  }
+  return { RedisStore: jest.fn(FakeRedisStore) };
+});
 
 const express = require('express');
 const request = require('supertest');
@@ -135,6 +165,36 @@ describe('POST /canje/solicitar-codigo', () => {
     expect(res.status).toBe(200);
     expect(canjeCodigoService.solicitarCodigoCanje).toHaveBeenCalledWith('5512345678');
     expect(res.body).toEqual({ mensaje: 'Código enviado' });
+  });
+});
+
+describe('POST /canje/solicitar-codigo — límite por teléfono (2026-11-13, hardening)', () => {
+  test('4ta solicitud para el mismo teléfono dentro de la ventana → 429, sin llegar al service', async () => {
+    canjeCodigoService.solicitarCodigoCanje.mockResolvedValue({ mensaje: 'Código enviado' });
+    const telefono = '5500009999'; // teléfono propio de este describe — no comparte contador con el test de arriba
+    const app = freshApp();
+
+    for (let i = 0; i < 3; i++) {
+      const ok = await request(app).post('/canje/solicitar-codigo').send({ telefono });
+      expect(ok.status).toBe(200);
+    }
+
+    const bloqueado = await request(app).post('/canje/solicitar-codigo').send({ telefono });
+    expect(bloqueado.status).toBe(429);
+    expect(bloqueado.body).toMatchObject({ code: 'RATE_LIMIT_EXCEEDED' });
+    expect(canjeCodigoService.solicitarCodigoCanje).toHaveBeenCalledTimes(3);
+  });
+
+  test('teléfonos distintos tienen presupuestos independientes', async () => {
+    canjeCodigoService.solicitarCodigoCanje.mockResolvedValue({ mensaje: 'Código enviado' });
+    const app = freshApp();
+
+    for (let i = 0; i < 3; i++) {
+      await request(app).post('/canje/solicitar-codigo').send({ telefono: '5500001111' });
+    }
+    const otroTelefono = await request(app).post('/canje/solicitar-codigo').send({ telefono: '5500002222' });
+
+    expect(otroTelefono.status).toBe(200);
   });
 });
 

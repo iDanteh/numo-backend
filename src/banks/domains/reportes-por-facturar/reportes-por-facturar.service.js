@@ -185,7 +185,7 @@ async function _validar({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   return { fechaFin, series, sucursal };
 }
 
-const ESTATUS_POR_FACTURAR_K = 'POR FACTURAR';
+const ESTATUS_POR_FACTURAR_K = 'CONSIGNACION';
 const _serieK = v => String(v ?? '').trim().toUpperCase();
 
 /**

@@ -212,25 +212,44 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
       if (!candidatasPorClave.has(k)) candidatasPorClave.set(k, c);
     }
   }
-  if (!candidatasPorClave.size) return [];
+  if (!candidatasPorClave.size) return { saldadas: [], conSaldo: [], sinRespuesta: 0, sinSaldo: 0 };
 
   const candidatas = [...candidatasPorClave.values()];
-  const { info } = await infoRemisiones({
+  const { info, sinRespuesta } = await infoRemisiones({
     rfc,
     remisiones: candidatas.map(c => ({
       serie: _serieK(c.serieVenta),
       folio: String(c.folioVenta ?? '').trim(),
       fechaCreacion: c.fechaCreacion,
     })),
+    // Saldo fresco de Kore salvo las que ya quedaron liquidadas en la memoria.
+    necesitaSaldo: (k, g) => !g?.liquidadaEl,
   });
 
-  const depositos = [];
+  const saldadas = [];
+  const conSaldo = [];
+  let sinSaldo = 0;
   for (const c of candidatas) {
     const k = `${_serieK(c.serieVenta)}|${String(c.folioVenta ?? '').trim()}`;
     const koreInfo = info.get(k);
     if (!koreInfo || koreInfo.tipoPago !== 'PPD' || !esEstatusPorFacturar(koreInfo.nombreTipoMovimiento)) continue;
     const importe = _r2((c.cobros ?? []).reduce((s, cobro) => s + Math.abs(Number(cobro.monto) || 0), 0));
     if (!importe) continue;
+
+    // Solo las SALDADAS van a PENDIENTE GENERAR FACTURA; las que todavía deben
+    // abonos van aparte, a CON PENDIENTES DE PAGO (2026-11-13, usuario: "en las
+    // pendientes por facturar solo deben mostrarse las saldadas y aparte las que
+    // aún deben abonos"). Mismo criterio que detectarDepositosPendientesFactura.
+    // Sin saldo de Kore (no respondió) no se puede confirmar que esté saldada →
+    // va con las pendientes de pago y se avisa.
+    const saldoRem = koreInfo.saldoActual != null ? _r2(Number(koreInfo.saldoActual) || 0) : null;
+    const saldada = saldoRem != null && Math.abs(saldoRem) < 0.005;
+    if (saldoRem == null) sinSaldo++;
+    const destino = saldada ? saldadas : conSaldo;
+    // El saldo de la remisión va solo en su primer renglón (si se parte en
+    // banco + efectivo no se suma dos veces en el TOTAL).
+    let saldoPendiente = saldada ? 0 : saldoRem;
+    const saldoFila = () => { const s = saldoPendiente; if (!saldada) saldoPendiente = null; return s; };
     const serie = _serieK(c.serieVenta);
     const folio = String(c.folioVenta ?? '').trim();
     const fp = formasPagoDeCuentas([c]);
@@ -260,7 +279,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
         if (fp?.tarjeta)          fpBanco.tarjeta          = fp.tarjeta;
         if (fp?.cheque)           fpBanco.cheque           = fp.cheque;
         if (fp?.depositoEfectivo) fpBanco.depositoEfectivo = fp.depositoEfectivo;
-        depositos.push({
+        destino.push({
           fecha:       b.fecha ?? null,
           descripcion: b.concepto ?? `TRANSFERENCIA REM ${serie}-${folio}`,
           importe:     noEfectivo,
@@ -272,7 +291,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
           idNumo:      b.folio ?? 'S/R',
           estatus:     ESTATUS_POR_FACTURAR_K,
           ppdPorFacturar: true,
-          saldo:       0,
+          saldo:       saldoFila(),
           deKore:      true,
         });
         if (soloEfectivo > 0.005) {
@@ -280,7 +299,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
           if (fp?.efectivo) fpEfectivo.efectivo = fp.efectivo;
           if (fp?.abonos)   fpEfectivo.abonos   = fp.abonos;
           if (fp?.otras)    fpEfectivo.otras     = fp.otras;
-          depositos.push({
+          destino.push({
             fecha:       c.fechaCreacion ?? null,
             descripcion: `REM ${serie}-${folio}`,
             importe:     soloEfectivo,
@@ -292,7 +311,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
             idNumo:      'S/R',
             estatus:     ESTATUS_POR_FACTURAR_K,
             ppdPorFacturar: true,
-            saldo:       0,
+            saldo:       saldoFila(),
             deKore:      true,
           });
         }
@@ -301,7 +320,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
     }
 
     // Sin depósito identificado → un renglón S/R con la forma de pago real.
-    depositos.push({
+    destino.push({
       fecha:       c.fechaCreacion ?? null,
       descripcion: `REM ${serie}-${folio}`,
       importe,
@@ -313,11 +332,11 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
       idNumo:      'S/R',
       estatus:     ESTATUS_POR_FACTURAR_K,
       ppdPorFacturar: true,
-      saldo:       0,
+      saldo:       saldoFila(),
       deKore:      true,
     });
   }
-  return depositos;
+  return { saldadas, conSaldo, sinRespuesta, sinSaldo };
 }
 
 // Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
@@ -356,8 +375,11 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   await onAvance('Remisiones sin depósito en Bancos — consultando Kore…');
   const pendientesKore = await _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesBancos }).catch(err => {
     advertencias.push(`No se pudieron consultar cobros de Kore para remisiones sin depósito (${err?.message}) — pueden faltar renglones S/R; vuelve a actualizarlo más tarde.`);
-    return [];
+    return { saldadas: [], conSaldo: [], sinRespuesta: 0, sinSaldo: 0 };
   });
+  if (pendientesKore.sinSaldo) {
+    advertencias.push(`Kore no respondió el saldo de ${pendientesKore.sinSaldo} remisión(es) sin depósito en Bancos — van en "CON PENDIENTES DE PAGO" porque no se pudo confirmar que estén saldadas; vuelve a actualizarlo más tarde.`);
+  }
 
   const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
 
@@ -379,8 +401,9 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   const datos = {
     movimientosMostrador,
     cobrosCajaGlobales: cobrosCaja.porFactura,
-    depositosPendientesFactura: [...pendientes.depositos, ...pendientesKore],
-    depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
+    // Solo saldadas; las que aún deben abonos van a pendientes de pago (2026-11-13).
+    depositosPendientesFactura: [...pendientes.depositos, ...pendientesKore.saldadas],
+    depositosPendientesPago:    [...(pendientes.depositosConSaldo ?? []), ...pendientesKore.conSaldo],
     depositosEfectivoSinAsociar,
   };
 

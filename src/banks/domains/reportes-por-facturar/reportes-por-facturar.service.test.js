@@ -12,7 +12,10 @@ jest.mock('./reportes-por-facturar.otra-caja', () => ({ cobrosEnOtraCaja: jest.f
 jest.mock('./reportes-por-facturar.abonos', () => ({ agregarHistorialAbonos: jest.fn(async () => ({ sinRespuesta: 0 })) }));
 jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 jest.mock('./reportes-por-facturar.cobros-caja', () => ({ cobrosCajaDeGlobales: jest.fn(async () => ({ porFactura: [], sinRespuesta: 0 })) }));
-jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn(), FORMAS_PAGO: ['efectivo', 'depositoEfectivo', 'transferencia', 'tarjeta', 'cheque', 'abonos', 'otras'] }));
+// _pendientesKore (S/R, 2026-11-13): sin estos mocks llamaba a Kore de verdad y las pruebas se pasaban de tiempo.
+jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(async () => []) }));
+jest.mock('../erp/kore-remisiones.service', () => ({ infoRemisiones: jest.fn(async () => ({ info: new Map(), sinRespuesta: 0, consultadas: 0 })) }));
+jest.mock('../cfdi-mapping/mostrador.service', () => ({ ...jest.requireActual('../cfdi-mapping/mostrador.service'), detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn(), FORMAS_PAGO: ['efectivo', 'depositoEfectivo', 'transferencia', 'tarjeta', 'cheque', 'abonos', 'otras'] }));
 
 const { ReportePorFacturar } = require('../../../shared/models/postgres');
 const CFDI = require('../../../visor/models/CFDI');
@@ -21,6 +24,8 @@ const centros = require('../centros-costo/centros-costo.service');
 const gen = require('../cfdi-mapping/cfdi-poliza-generator.service');
 const mostrador = require('../cfdi-mapping/mostrador.service');
 const service = require('./reportes-por-facturar.service');
+const erp = require('../erp/erp-sync.service');
+const koreRem = require('../erp/kore-remisiones.service');
 
 const lean = v => ({ select: () => ({ lean: async () => v }) });
 const GLOBAL = '1C02D46C-FF4C-411E-BF11-7960AB39BA9C';   // A0-261009872, 20-oct
@@ -264,4 +269,30 @@ test('refacturada: encabezado con las otras facturas de sus mismas remisiones', 
   await wb.xlsx.load((await service.excel(7, 'mostrador')).buffer);
   const ws = wb.worksheets.find(w => w.name.startsWith('MOSTRADOR A0'));
   expect(ws.getRow(1).getCell(2).value).toBe('TAMBIÉN FACTURADA EN: A0-261015291, A0-261015312');
+});
+
+// 2026-11-13 (usuario: "en las pendientes por facturar solo deben mostrarse las
+// saldadas y aparte las que aún deben abonos"): las remisiones S/R de Kore
+// (sin depósito en Bancos) se reparten por saldo, igual que las de Bancos.
+test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo de Kore → CON PENDIENTES DE PAGO', async () => {
+  const cuenta = (folio, monto) => ({ serieVenta: 'A0', folioVenta: folio, fechaCreacion: '2026-11-12T16:00:00Z', cobros: [{ monto, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto }] }] });
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ centro }) => (centro === 'A0' ? [cuenta('1', 500), cuenta('2', 200), cuenta('3', 80), cuenta('4', 90)] : []));
+  koreRem.infoRemisiones.mockResolvedValue({ sinRespuesta: 1, consultadas: 4, info: new Map([
+    ['A0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', nombre: 'SALDADA', saldoActual: 0 }],
+    ['A0|2', { tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', nombre: 'DEBE', saldoActual: 300 }],
+    ['A0|3', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', nombre: 'SIN SALDO' }],
+    ['A0|4', { tipoPago: 'PUE', nombreTipoMovimiento: 'TICKET SENCILLO', nombre: 'NO PPD', saldoActual: 0 }],
+  ]) });
+  await generarYEsperar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-11-12' }, null);
+  const { datos, advertencias } = terminado();
+  // Pide saldo fresco salvo a las ya liquidadas en la memoria.
+  const { necesitaSaldo } = koreRem.infoRemisiones.mock.calls[0][0];
+  expect([necesitaSaldo('A0|1', { liquidadaEl: new Date() }), necesitaSaldo('A0|2', {})]).toEqual([false, true]);
+  const sr = arr => arr.filter(d => d.idNumo === 'S/R').map(d => [d.cliente, d.importe, d.saldo]);
+  expect(sr(datos.depositosPendientesFactura)).toEqual([['SALDADA', 500, 0]]);
+  expect(sr(datos.depositosPendientesPago)).toEqual([['DEBE', 200, 300], ['SIN SALDO', 80, null]]);
+  // Los de Bancos siguen en su lugar.
+  expect(datos.depositosPendientesFactura.map(d => d.idNumo)).toContain('053966');
+  expect(datos.depositosPendientesPago.map(d => d.idNumo)).toContain('053960');
+  expect(advertencias.join(' ')).toMatch('Kore no respondió el saldo de 1 remisión');
 });

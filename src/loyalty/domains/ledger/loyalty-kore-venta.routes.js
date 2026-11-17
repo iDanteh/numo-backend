@@ -49,6 +49,7 @@ const { verifyKoreApiKey } = require('../../../shared/middleware/kore-api-key-au
 const { authenticate, permit } = require('../../../shared/middleware/auth');
 const { asyncHandler } = require('../../../shared/middleware/error-handler');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
+const { logger } = require('../../../shared/utils/logger');
 const ventaService = require('./loyalty-kore-venta.service');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
@@ -80,10 +81,15 @@ router.get('/saldo', verifyKoreApiKey, asyncHandler(async (req, res) => {
 }));
 
 router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  // Diagnóstico (2026-11-17, pedido explícito del usuario) — mismo criterio que
+  // loyalty-kore-cliente.routes.js: loguear el payload real de Kore para poder inspeccionar el
+  // contrato exacto de acumulación de puntos en test/producción.
+  logger.info('[KoreVentaWebhook] payload recibido (/venta)', req.body);
   res.json(await ventaService.procesarVentaKore(req.body));
 }));
 
 router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  logger.info('[KoreVentaWebhook] payload recibido (/ventas)', req.body);
   res.json(await ventaService.procesarLoteVentasKore(req.body?.ventas));
 }));
 

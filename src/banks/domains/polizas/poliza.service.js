@@ -1920,6 +1920,38 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // vez de $3,950. Mismo caso AIRAM CECILIA FERNANDEZ VASQUEZ (050310, 051427,
   // 051633). Luego por el monto total del depósito.
   const depositosUsados = new Set();
+  // Factura con UN solo depósito ligado y 2+ cobros bancarios que suman más de
+  // lo que ese depósito aplicó a la factura (2026-11-17, ANCELMA ESPINO AQUINO
+  // A0-261101647: complementos $17,916.28 y $935.03, depósito BBVA 058628 de
+  // $17,916.28 — el de $935.03 se aplicó por error del depósito 058627 de otra
+  // factura y Kore lo reversó a bonificación, pero su complemento sigue
+  // vigente): antes los dos tomaban 058628 y el banco salía en $18,851.31.
+  // Ahora el depósito solo se lo lleva el cobro de su monto; los demás se
+  // quedan sin depósito (su cuenta genérica, Bancos por identificar).
+  const cobrosSinDepositoUnico = new Set();
+  {
+    const porLlave = new Map();
+    movs.forEach((m, i) => {
+      if (!(Number(m.debe) > 0) || m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL) return;
+      if (!/^110[12]/.test(m.cuenta?.codigo || '') || m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) return;
+      const llave = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
+      const base = verdadBancaria?.get(llave);
+      if (!base || base._candidatos) return;
+      if (!porLlave.has(llave)) porLlave.set(llave, { base, cobros: [] });
+      porLlave.get(llave).cobros.push({ i, monto: Number(m.debe) });
+    });
+    for (const { base, cobros } of porLlave.values()) {
+      if (cobros.length < 2) continue;
+      const capacidad = base._montoAplicado ?? (base._facturasDeposito === 1 ? base.montoBancoReal : null);
+      if (capacidad == null) continue;
+      const total = cobros.reduce((s, c) => s + c.monto, 0);
+      if (total - capacidad <= TOLERANCIA_CENTAVOS_DEPOSITO) continue;
+      const suyo = cobros.find(c => Math.abs(c.monto - capacidad) < 0.005)
+        ?? cobros.find(c => Math.abs(c.monto - capacidad) <= TOLERANCIA_CENTAVOS_DEPOSITO);
+      if (!suyo) continue;
+      for (const c of cobros) if (c !== suyo) cobrosSinDepositoUnico.add(c.i);
+    }
+  }
   const _depositoPorMonto = (base, llave, monto) => {
     if (!base?._candidatos) return base;
     const libresTodos = base._candidatos.filter(c => !depositosUsados.has(`${llave}|${c._idDeposito}`));
@@ -1956,7 +1988,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   }
   const depositoNIPorCobro = new Map();
 
-  const anotados = movs.map(m => {
+  const anotados = movs.map((m, idx) => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
     // SF no representan un depósito bancario — no se les debe cambiar la
@@ -1977,7 +2009,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
     // Pago) — ver comentario en el caller.
     const llaveBancaria = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
-    const bancarioBase = verdadBancaria?.get(llaveBancaria);
+    const bancarioBase = cobrosSinDepositoUnico.has(idx) ? null : verdadBancaria?.get(llaveBancaria);
     const esCargoCajaBanco = /^110[12]/.test(m.cuenta?.codigo || '') && m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO;
     const bancario = esCargoCajaBanco ? _depositoPorMonto(bancarioBase, llaveBancaria, Number(m.debe)) : bancarioBase;
     // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP

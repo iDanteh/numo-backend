@@ -721,6 +721,7 @@ async function sincronizarNivelesKore() {
       koreId,
       nombre:     String(n.Nombre ?? n.nombre ?? '').trim(),
       porcentaje: porcentaje != null && porcentaje !== '' ? Number(porcentaje) : null,
+      color:      n.Color ?? n.color ?? null,
       activo:     true,
     };
 

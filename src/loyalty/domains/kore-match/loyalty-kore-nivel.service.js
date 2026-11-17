@@ -44,9 +44,14 @@ function _requiereKoreId(koreId) {
  *  explícito del usuario, OBLIGATORIO desde 2026-11-11 — ver el gate en `procesarNivelKore`, mismo
  *  criterio que el gate de `nivel` en `loyalty-kore-cliente.service.js`): booleano, define el
  *  `activo` inicial del nivel. Ya no hay default por ausencia — la presencia está garantizada por
- *  el gate de arriba antes de llegar acá. */
+ *  el gate de arriba antes de llegar acá.
+ *
+ *  `color` (2026-11-17, pedido explícito del usuario): el contrato documentado de este webhook NO
+ *  lo incluye hoy — es OPCIONAL y best-effort, a diferencia de nombre/porcentaje/estatus. Si viene
+ *  en el payload se persiste; si no viene, se omite del `create()`/`update()` por completo (nunca
+ *  se escribe `null`), tampoco es obligatorio en alta. */
 async function _procesarAlta({
-  koreId, nombre, porcentaje, estatus,
+  koreId, nombre, porcentaje, estatus, color,
 }) {
   if (!nombre) {
     throw new BadRequestError('nombre es requerido para dar de alta un nivel.');
@@ -58,6 +63,7 @@ async function _procesarAlta({
   const datos = {
     koreId, nombre, porcentaje: Number(porcentaje), activo: Boolean(estatus),
   };
+  if (color !== undefined && color !== null) datos.color = color;
   const existente = await _buscarOAdoptarNivelKore({ koreId, nombre });
   if (existente) {
     await existente.update(datos);
@@ -90,9 +96,12 @@ async function _procesarAlta({
  *  específico, aunque `nombre`/`porcentaje` siguen siéndolo). No reemplaza al evento `baja` (que
  *  sigue funcionando igual, y sigue sin leer `estatus`), solo da una vía más directa para
  *  activar/desactivar sin tener que mandar un evento aparte — incluyendo "reactivar" un nivel que
- *  un `baja` anterior dejó inactivo, mandando `actualizacion` con `estatus:true`. */
+ *  un `baja` anterior dejó inactivo, mandando `actualizacion` con `estatus:true`.
+ *
+ *  `color` (2026-11-17, pedido explícito del usuario): opcional y best-effort, mismo criterio que
+ *  nombre/porcentaje — si no viene, NO se toca el valor existente (nunca se pisa con null). */
 async function _procesarActualizacion({
-  koreId, nombre, porcentaje, estatus,
+  koreId, nombre, porcentaje, estatus, color,
 }) {
   const fila = await LoyaltyKoreNivel.findOne({ where: { koreId } });
   if (!fila) throw new NotFoundError('Nivel de Kore (koreId no encontrado)');
@@ -105,6 +114,7 @@ async function _procesarActualizacion({
     }
     updates.porcentaje = Number(porcentaje);
   }
+  if (color !== undefined && color !== null) updates.color = color;
   updates.activo = Boolean(estatus);
   await fila.update(updates);
   return { ok: true, evento: 'actualizacion', nivelId: fila.id };
@@ -132,6 +142,11 @@ async function _procesarBaja({ koreId }) {
  * campo (desactiva incondicionalmente) y no lo exige. Nota: no existe un evento de "reactivación"
  * separado — se logra mandando 'actualizacion' con `estatus:true` sobre un nivel que un 'baja'
  * anterior dejó inactivo (o un nuevo 'alta' si Kore re-manda el mismo `koreId`).
+ *
+ * `color` (2026-11-17, pedido explícito del usuario): el contrato documentado de este webhook NO
+ * lo incluye hoy — es OPCIONAL y best-effort en 'alta'/'actualizacion' (nunca obligatorio, a
+ * diferencia de `estatus`). Si viene, se persiste tal cual (hex de Kore); si no viene, el valor
+ * existente no se toca (nunca se pisa con null). 'baja' no lo lee.
  */
 // Notificación en vivo (2026-11-10, pedido explícito del usuario — "relevante para el registro
 // de acumulaciones manuales": el staff consulta esta tabla para saber qué % va a aplicar antes
@@ -141,7 +156,7 @@ async function _procesarBaja({ koreId }) {
 // de `lealtad-config.component.ts`. Señal de invalidación pura, sin payload de negocio.
 async function procesarNivelKore(payload) {
   const {
-    evento, nombre, porcentaje, estatus,
+    evento, nombre, porcentaje, estatus, color,
   } = payload ?? {};
 
   if (!EVENTOS_VALIDOS.includes(evento)) {
@@ -168,11 +183,11 @@ async function procesarNivelKore(payload) {
     resultado = await _procesarBaja({ koreId });
   } else if (evento === 'alta') {
     resultado = await _procesarAlta({
-      koreId, nombre: nombreTrim, porcentaje, estatus,
+      koreId, nombre: nombreTrim, porcentaje, estatus, color,
     });
   } else {
     resultado = await _procesarActualizacion({
-      koreId, nombre: nombreTrim, porcentaje, estatus,
+      koreId, nombre: nombreTrim, porcentaje, estatus, color,
     });
   }
   emitToAll('lealtad-niveles-kore:actualizado', { nivelId: resultado.nivelId });

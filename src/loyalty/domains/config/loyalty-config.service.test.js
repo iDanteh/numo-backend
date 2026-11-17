@@ -839,7 +839,9 @@ describe('actualizarFormaPagoKore', () => {
 // nunca duplicarse.
 
 function makeNivel(overrides = {}) {
-  return { id: 1, koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, esInicial: false, activo: true, update: jest.fn(), ...overrides };
+  return {
+    id: 1, koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, esInicial: false, activo: true, update: jest.fn(), ...overrides,
+  };
 }
 
 describe('sincronizarNivelesKore', () => {
@@ -853,7 +855,7 @@ describe('sincronizarNivelesKore', () => {
 
     expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: 'n1' } });
     expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
-      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, activo: true, esInicial: false,
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, activo: true, esInicial: false,
     });
     expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
   });
@@ -868,9 +870,35 @@ describe('sincronizarNivelesKore', () => {
 
     expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: '6' } });
     expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
-      koreId: '6', nombre: 'Esmeralda', porcentaje: 3, activo: true, esInicial: false,
+      koreId: '6', nombre: 'Esmeralda', porcentaje: 3, color: null, activo: true, esInicial: false,
     });
     expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('guarda el color hex real de Kore (camelCase) en cada sync — "último valor gana", igual que nombre/porcentaje', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ id: 1, nombre: 'Oro', porcentajePuntos: 2.5, color: '#E6DF0A' }]);
+    const existente = makeNivel({ color: '#OLDCOLOR' });
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(existente);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarNivelesKore();
+
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: '1', nombre: 'Oro', porcentaje: 2.5, color: '#E6DF0A', activo: true,
+    });
+  });
+
+  test('sin color en el payload de Kore (PascalCase legado): persiste color:null, no lo omite', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 1.5 }]);
+    const existente = makeNivel({ color: '#AAAAAA' });
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(existente);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarNivelesKore();
+
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, activo: true,
+    });
   });
 
   test('adopta una fila transicional (koreId:null) por nombre en vez de duplicarla, preserva esInicial', async () => {
@@ -884,7 +912,9 @@ describe('sincronizarNivelesKore', () => {
     const resultado = await configService.sincronizarNivelesKore();
 
     expect(LoyaltyKoreNivel.findOne).toHaveBeenNthCalledWith(2, { where: { koreId: null, nombre: 'Bronce' } });
-    expect(transicional.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce', porcentaje: 2, activo: true });
+    expect(transicional.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 2, color: null, activo: true,
+    });
     expect(LoyaltyKoreNivel.create).not.toHaveBeenCalled();
     expect(resultado.actualizados).toBe(1);
   });
@@ -897,7 +927,9 @@ describe('sincronizarNivelesKore', () => {
 
     await configService.sincronizarNivelesKore();
 
-    expect(existente.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce Plus', porcentaje: 1.75, activo: true });
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce Plus', porcentaje: 1.75, color: null, activo: true,
+    });
     expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ esInicial: expect.anything() }));
   });
 

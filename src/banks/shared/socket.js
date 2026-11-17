@@ -3,6 +3,7 @@
 const { Server } = require('socket.io');
 const { createClient } = require('redis');
 const { createAdapter } = require('@socket.io/redis-adapter');
+const { Emitter } = require('@socket.io/redis-emitter');
 const { authenticate }       = require('../../shared/middleware/auth');
 const rbacStore              = require('../../shared/services/rbac-store');
 const { PERMISSIONS }        = require('../../shared/config/rbac');
@@ -17,6 +18,12 @@ let _io = null;
 // para suscribirse).
 let _pubClient = null;
 let _subClient = null;
+// Emitter-only (2026-11-17, extracción del gateway de webhooks Kore, ver
+// loyalty-gateway/app.js) — un proceso que NUNCA acepta conexiones de socket pero
+// necesita poder avisar eventos a los clientes reales conectados al backend
+// principal, usando el MISMO canal Redis que ya escucha `init()` de abajo. Ver
+// `initEmitterOnly()`.
+let _emitter = null;
 
 // Adapta el middleware Express `authenticate` (src/shared/middleware/auth.js) a
 // Socket.IO vía un shim mínimo de req/res — mismo criterio que usan desde hace
@@ -194,20 +201,60 @@ function getIo() {
   return _io;
 }
 
+/**
+ * initEmitterOnly — para procesos que nunca aceptan conexiones de socket (hoy, SOLO
+ * loyalty-gateway/app.js: corre los webhooks de Kore de forma independiente al
+ * backend principal, ver [[architecture/microservicios-evaluacion-lealtad]]) pero
+ * necesitan poder emitir eventos a los clientes reales conectados AL BACKEND
+ * PRINCIPAL. `@socket.io/redis-emitter` expone la misma API `.to(room).emit()`/
+ * `.emit()` que un `Server` real, publicando directo al canal de Redis que
+ * cualquier `Server` con el adapter de `init()` YA está escuchando — no hace falta
+ * levantar un `Server` ni aceptar conexiones acá, por eso es un cliente Redis
+ * suelto (publish-only), no el par pub/sub de arriba.
+ *
+ * Mismo criterio de degradación que `init()`: si Redis no conecta, no revienta —
+ * `_emitter` queda `null` y `emitTo*`/`emitToAll` simplemente no hacen nada (igual
+ * que hoy sin Redis en el backend principal). Nunca llamar junto con `init()` en el
+ * mismo proceso — son modos mutuamente excluyentes del mismo módulo.
+ */
+async function initEmitterOnly() {
+  const redisSocketOpts = {
+    reconnectStrategy: (retries) => {
+      if (retries > 10) return false;
+      return Math.min(retries * 100, 3000);
+    },
+  };
+  const client = createClient({ url: config.redis.url, socket: redisSocketOpts });
+  client.on('error', (err) => logger.error(`[socket][redis] emitter client error: ${err.message}`));
+  try {
+    await client.connect();
+    _emitter = new Emitter(client);
+  } catch (err) {
+    logger.error(`[socket][redis] No se pudo conectar el emitter — este proceso no podrá avisar eventos en vivo: ${err.message}`);
+  }
+}
+
 /** Cierra los clientes Redis del adapter — llamado desde el shutdown de app.js. */
 async function closeRedisAdapter() {
   if (_pubClient) await _pubClient.quit();
   if (_subClient) await _subClient.quit();
 }
 
-/** Emite un evento solo al usuario identificado por su auth0Sub. */
+/** Emite un evento solo al usuario identificado por su auth0Sub. `_io` (backend principal)
+ *  o `_emitter` (loyalty-gateway, ver initEmitterOnly) — nunca ambos a la vez en el mismo
+ *  proceso, mismo criterio en las otras 3 funciones de abajo (emitToBanco/emitToLoyaltyCard/
+ *  emitToAll). */
 function emitToUser(auth0Sub, event, data) {
-  if (_io && auth0Sub) _io.to(`user:${auth0Sub}`).emit(event, data);
+  if (!auth0Sub) return;
+  if (_io) _io.to(`user:${auth0Sub}`).emit(event, data);
+  else if (_emitter) _emitter.to(`user:${auth0Sub}`).emit(event, data);
 }
 
 /** Emite un evento a todos los clientes suscritos a un banco. */
 function emitToBanco(banco, event, data) {
-  if (_io && banco) _io.to(`banco:${banco}`).emit(event, data);
+  if (!banco) return;
+  if (_io) _io.to(`banco:${banco}`).emit(event, data);
+  else if (_emitter) _emitter.to(`banco:${banco}`).emit(event, data);
 }
 
 /** Emite un evento a todos los clientes suscritos a una tarjeta de Lealtad (2026-11-10) —
@@ -216,7 +263,9 @@ function emitToBanco(banco, event, data) {
  *  (sin usuario humano detrás) la llama tal cual, la autenticación de socket solo le
  *  importa a quien SE CONECTA (JWT), nunca a quien emite. */
 function emitToLoyaltyCard(cardId, event, data) {
-  if (_io && cardId) _io.to(`lealtad-tarjeta:${cardId}`).emit(event, data);
+  if (!cardId) return;
+  if (_io) _io.to(`lealtad-tarjeta:${cardId}`).emit(event, data);
+  else if (_emitter) _emitter.to(`lealtad-tarjeta:${cardId}`).emit(event, data);
 }
 
 /** Emite un evento a todos los clientes conectados. */
@@ -224,8 +273,10 @@ function emitToAll(event, data) {
   // eslint-disable-next-line no-console
   console.log(`[DEBUG-socket] pid=${process.pid} worker.id=${require('cluster').worker?.id} emitToAll('${event}') disparado`);
   if (_io) _io.emit(event, data);
+  else if (_emitter) _emitter.emit(event, data);
 }
 
 module.exports = {
-  init, getIo, closeRedisAdapter, emitToUser, emitToBanco, emitToLoyaltyCard, emitToAll, _authenticateSocket,
+  init, initEmitterOnly, getIo, closeRedisAdapter,
+  emitToUser, emitToBanco, emitToLoyaltyCard, emitToAll, _authenticateSocket,
 };

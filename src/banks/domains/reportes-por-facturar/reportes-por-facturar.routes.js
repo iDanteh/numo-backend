@@ -124,7 +124,7 @@ router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (re
 }));
 
 // ── Fichas guardadas (2026-11-05): rastro venta → factura / global → ficha ──
-// POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucursalBanco, denominaciones }
+// POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin } (todos los bancos, sin denominación — 2026-11-17)
 router.post('/fichas/guardar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   await _exigirSucursal(req, req.body?.centroCostoId);
   res.status(201).json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.guardar(req.body ?? {}, req.user)));

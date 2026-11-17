@@ -21,7 +21,9 @@
 const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, NotFoundError } = require('../../../shared/errors/AppError');
 const { normalizarTelefono } = require('../../shared/puntos.util');
-const { crearTarjeta, cambiarNivel, nivelEsValido } = require('../cards/loyalty-card.service');
+const {
+  crearTarjeta, cambiarNivel, nivelEsValido, resolverNombreNivel,
+} = require('../cards/loyalty-card.service');
 // Misma normalización que usa el import de migración (loyalty-import-apply.service.js) y el job
 // de match (loyalty-kore-match.service.js) para `tarjetaLegada` — reusada acá para que el webhook
 // y esas dos vías nunca puedan dejar el campo con un formato distinto entre sí.
@@ -238,8 +240,11 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `nivel`: OBLIGATORIO en 'alta' y 'actualizacion' (2026-11-06, pedido explícito del usuario — Kore
  * controla el nivel por completo, Numo lo necesita siempre, incluso en un ajuste). Si no viene
  * (undefined/null/vacío), 400 "nivel es requerido." ANTES de llegar a _procesarAlta/
- * _procesarActualizacion. Debe ser uno de los niveles activos del catálogo real (`nivelEsValido()`,
- * ver LoyaltyKoreNivel.js), otro valor responde 400. 'alta' sobre una tarjeta nueva lo usa como
+ * _procesarActualizacion. Desde 2026-11-17, Kore manda acá el `id` de categoría (p.ej. "1"), no el
+ * nombre — `resolverNombreNivel()` lo traduce a nombre (tolerante: también acepta el nombre
+ * directo) antes de llegar a _procesarAlta/_procesarActualizacion. Debe resolver a uno de los
+ * niveles activos del catálogo real (`nivelEsValido()`, ver LoyaltyKoreNivel.js), otro valor
+ * responde 400. 'alta' sobre una tarjeta nueva lo usa como
  * nivel inicial. 'actualizacion' (y 'alta' cuando cae a actualización) lo cambia vía
  * `cambiarNivel()` si viene distinto al actual — mismo primitivo que el botón manual "Cambiar
  * nivel", queda en `LoyaltyTierHistory`. 'baja' no lo lee ni lo exige.
@@ -273,6 +278,12 @@ async function procesarClienteKore(payload) {
     throw new BadRequestError('nivel es requerido.');
   }
 
+  // Traducción id→nombre (2026-11-17, bug real: Kore ahora manda el `id` de categoría, p.ej. "1",
+  // en vez del nombre "Oro" que mandaba antes) — ver resolverNombreNivel() en loyalty-card.service.js.
+  // Se resuelve ANTES de telefono/alta/actualizacion para que ambas ramas reciban siempre el nombre
+  // que `nivelEsValido()`/`cambiarNivel()` esperan, sin duplicar la traducción en cada una.
+  const nivelResuelto = await resolverNombreNivel(nivel);
+
   let telefonoNorm;
   try {
     telefonoNorm = normalizarTelefono(telefono);
@@ -281,9 +292,9 @@ async function procesarClienteKore(payload) {
   }
 
   const resultado = evento === 'alta'
-    ? await _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre, nivel })
+    ? await _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre, nivel: nivelResuelto })
     : await _procesarActualizacion({
-      koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada, nivel,
+      koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada, nivel: nivelResuelto,
     });
   emitToAll('lealtad-cliente-kore:actualizado', { cardId: resultado.cardId });
   return resultado;

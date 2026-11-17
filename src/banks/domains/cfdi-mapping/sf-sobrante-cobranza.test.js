@@ -39,6 +39,12 @@ test('depósito $5,000 que aplica $2,100 → sobrante $2,900', async () => {
   expect(r[0]).toMatchObject({ folio: '059000', deposito: 5000, aplicado: 2100, sobrante: 2900 });
 });
 
+test('depósito aplicado solo en parte (no_identificado en Bancos) → también cuenta', async () => {
+  BankMovement.find.mockReturnValue(lean([dep({ status: 'no_identificado' })]));
+  expect((await depositosConSobrantePorFacturas([FACT]))[0]).toMatchObject({ sobrante: 2900 });
+  expect(BankMovement.find.mock.calls[0][0].status).toEqual({ $in: ['identificado', 'no_identificado'] });
+});
+
 test('depósito con OPA o sobrante de $1 o menos (centavos) → no es saldo a favor', async () => {
   BankMovement.find.mockReturnValue(lean([
     dep({ erpLinks: [...dep().erpLinks, { serie: 'OPA', folioExterno: '01200', saldoPagado: 2900 }] }),

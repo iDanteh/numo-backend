@@ -54,6 +54,7 @@ const ventaService = require('./loyalty-kore-venta.service');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
 const canjeCodigoService = require('./loyalty-kore-canje.service');
+const ventaLogService = require('./loyalty-kore-venta-log.service');
 
 const router = express.Router();
 
@@ -80,17 +81,39 @@ router.get('/saldo', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await ventaService.consultarSaldoKore({ telefono, koreClienteId }));
 }));
 
+// Auditoría append-only (2026-11-17, pedido explícito del usuario, ver
+// loyalty-kore-venta-log.service.js): registra CADA request real de Kore a /venta y /ventas, con
+// su resultado — nunca bloquea ni cambia la respuesta real del webhook (si el log falla, se traga
+// el error, mismo criterio que la emisión de socket en otros webhooks de Lealtad).
 router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
   // Diagnóstico (2026-11-17, pedido explícito del usuario) — mismo criterio que
   // loyalty-kore-cliente.routes.js: loguear el payload real de Kore para poder inspeccionar el
   // contrato exacto de acumulación de puntos en test/producción.
   logger.info('[KoreVentaWebhook] payload recibido (/venta)', req.body);
-  res.json(await ventaService.procesarVentaKore(req.body));
+  try {
+    const resultado = await ventaService.procesarVentaKore(req.body);
+    ventaLogService.registrarVentaLog({ endpoint: 'venta', payload: req.body, resultado: 'exito' })
+      .catch((err) => logger.error(`[loyalty-kore-venta-log] No se pudo registrar el log (/venta): ${err.message}`));
+    res.json(resultado);
+  } catch (err) {
+    ventaLogService.registrarVentaLog({ endpoint: 'venta', payload: req.body, resultado: 'error', detalle: err.message })
+      .catch((logErr) => logger.error(`[loyalty-kore-venta-log] No se pudo registrar el log (/venta): ${logErr.message}`));
+    throw err;
+  }
 }));
 
 router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
   logger.info('[KoreVentaWebhook] payload recibido (/ventas)', req.body);
-  res.json(await ventaService.procesarLoteVentasKore(req.body?.ventas));
+  try {
+    const resultado = await ventaService.procesarLoteVentasKore(req.body?.ventas);
+    ventaLogService.registrarVentaLog({ endpoint: 'ventas', payload: req.body, resultado: 'exito' })
+      .catch((err) => logger.error(`[loyalty-kore-venta-log] No se pudo registrar el log (/ventas): ${err.message}`));
+    res.json(resultado);
+  } catch (err) {
+    ventaLogService.registrarVentaLog({ endpoint: 'ventas', payload: req.body, resultado: 'error', detalle: err.message })
+      .catch((logErr) => logger.error(`[loyalty-kore-venta-log] No se pudo registrar el log (/ventas): ${logErr.message}`));
+    throw err;
+  }
 }));
 
 router.post('/venta-cancelada', verifyKoreApiKey, asyncHandler(async (req, res) => {
@@ -115,6 +138,14 @@ router.patch('/ventas-fallidas/:id/resolver', authenticate, permit(PERMISSIONS.L
 
 router.get('/ventas-canceladas-con-deposito', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await ventaCanceladaService.listarVentasCanceladasConDeposito());
+}));
+
+// Auditoría de pagos Kore (2026-11-17, pedido explícito del usuario) — mismo permiso que
+// GET /auditoria/eventos-seguridad (loyalty.routes.js), para que viva en la misma pestaña de
+// "Auditoría de Lealtad" del frontend.
+router.get('/ventas-log', authenticate, permit(PERMISSIONS.LOYALTY_AUDITORIA), asyncHandler(async (req, res) => {
+  const { resultado, endpoint, desde, hasta, limit, offset } = req.query ?? {};
+  res.json(await ventaLogService.listarVentasLog({ resultado, endpoint, desde, hasta, limit, offset }));
 }));
 
 router.post('/canje/solicitar-codigo', verifyKoreApiKey, limiterSolicitarCanje, asyncHandler(async (req, res) => {

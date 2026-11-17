@@ -80,6 +80,9 @@ const REGLA_NO_IDENTIFICADO = 'NI';
 // y Abono a Anticipos de Clientes + IVA de anticipos. Ingreso ya no la registra.
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const REGLA_OPA_COBRANZA = 'OPA-COBRANZA';
+// Saldo a favor del sobrante de un depósito (ver `_movimientosSfSobranteDeCobranza`).
+const REGLA_SF_COBRANZA = 'SF-COBRANZA';
+const SF_SOBRANTE_DESDE = '2026-11-01';
 const TASA_IVA_SALDO_FAVOR          = 0.16;
 const TIPO_ORIGEN_CARGO_ESPECIAL    = 'Cargo Especial';
 const CHUNK_SIZE                    = 200;
@@ -904,6 +907,13 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     advertencias.push(`ℹ ${opaCobranza.agregadas.length} anticipo(s) (OPA) del sobrante de un depósito de cobranza registrado(s) aquí, no en Ingreso: ${opaCobranza.agregadas.join(', ')}`);
   }
 
+  // 7a'. Saldo a favor del sobrante de un depósito sin OPA (desde 2026-11-01) — ver `_movimientosSfSobranteDeCobranza`.
+  const sfCobranza = await _movimientosSfSobranteDeCobranza({ cfdiConRegla, doctosPorUuid, cuentaMap, ccBySerieMap, rfc });
+  todosLosMovimientos.push(...sfCobranza.movs);
+  if (sfCobranza.agregadas.length) {
+    advertencias.push(`ℹ ${sfCobranza.agregadas.length} saldo(s) a favor del sobrante de un depósito registrado(s) aquí: ${sfCobranza.agregadas.join(', ')}`);
+  }
+
   // 7b. Efectivo cobrado en la caja de CEDIS contra la ficha "dd/mm COBRANZA"
   // (cargo al banco + PXA) — solo por día y cuando la póliza incluye CEDIS.
   if (fechaInicio && fechaInicio === fechaFin && (!centroCostoId || serieDelCentro === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS)) {
@@ -1062,6 +1072,86 @@ async function _movimientosOpaDeCobranza({ cfdiConRegla, doctosPorUuid, cuentaMa
   return { movs, agregadas };
 }
 
+/**
+ * SALDO A FAVOR del sobrante de un depósito de cobranza (2026-11-17, pedido del
+ * usuario): cuando la transferencia es MAYOR que lo que se aplicó a las cuentas
+ * del cliente (ej. $5,000 que solo abonan $2,100), el sobrante ($2,900) se
+ * registra para que el depósito salga completo: Cargo al banco por el sobrante
+ * (si el depósito es de un mes anterior al complemento: Depósitos No
+ * Identificados + IVA "NI", igual que el resto de ese depósito) y Abono a
+ * 2103090001 (saldo a favor) por el subtotal + 2104010002 por el IVA — las
+ * mismas cuentas de las líneas 'SF' con que se usa después ese saldo a favor.
+ * - Solo complementos desde el 2026-11-01 (los meses anteriores no cambian).
+ * - Si el depósito trae una OPA, ese sobrante ya es la OPA (`_movimientosOpaDeCobranza`).
+ * - Un sobrante ya registrado en otra póliza de Cobranza vigente no se repite.
+ * - Va con el primer complemento del lote que liquida una factura del depósito;
+ *   `serie` = folio de Numo del depósito y `facturaUuid` = esa factura, para que
+ *   el export lo junte con el renglón de ese mismo depósito.
+ * El caso contrario (cobros MAYORES que el depósito) lo maneja el export:
+ * lo de más queda en Bancos por identificar (`anotarCargosPorFacturaSinAgrupar`).
+ */
+async function _movimientosSfSobranteDeCobranza({ cfdiConRegla, doctosPorUuid, cuentaMap, ccBySerieMap, rfc }) {
+  const vacio = { movs: [], agregadas: [] };
+  if (!cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] || !cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) return vacio;
+
+  const diaPago = c => (c?.fecha ? new Date(c.fecha).toISOString().slice(0, 10) : null);
+  const pagoPorFactura = new Map(); // uuid de factura (MAYÚSCULAS) → primer Pago del lote que la liquida
+  for (const { cfdi, rule } of cfdiConRegla) {
+    if (!rule || !(diaPago(cfdi) >= SF_SOBRANTE_DESDE)) continue;
+    for (const d of (doctosPorUuid.get(cfdi.uuid) ?? [])) {
+      const u = String(d.idDocumento ?? '').toUpperCase();
+      if (u && !pagoPorFactura.has(u)) pagoPorFactura.set(u, cfdi);
+    }
+  }
+  if (!pagoPorFactura.size) return vacio;
+  const depositos = await opaCobranzaSvc.depositosConSobrantePorFacturas([...pagoPorFactura.keys()]);
+  if (!depositos.length) return vacio;
+
+  const folios = [...new Set(depositos.map(d => d.folio).filter(Boolean))];
+  const yaRegistradas = new Set(folios.length ? (await PolizaMovimiento.findAll({
+    where: { serie: { [Op.in]: folios }, reglaNombre: REGLA_SF_COBRANZA },
+    attributes: ['serie'],
+    include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+    raw: true,
+  })).map(r => r.serie) : []);
+
+  const movs = [];
+  const agregadas = [];
+  const vistas = new Set();
+  const r2 = n => Math.round(n * 100) / 100;
+  for (const dep of depositos) {
+    if (!dep.folio || yaRegistradas.has(dep.folio) || vistas.has(dep.folio)) continue;
+    const facturaUuid = [...dep.facturas].find(u => pagoPorFactura.has(u));
+    const pago = facturaUuid ? pagoPorFactura.get(facturaUuid) : null;
+    if (!pago) continue;
+    vistas.add(dep.folio);
+    const cc = pago.serie ? (ccBySerieMap[pago.serie] ?? null) : null;
+    const mesDeposito = dep.fecha ? new Date(dep.fecha).toISOString().slice(0, 7) : null;
+    const mesComplemento = pago.fecha ? new Date(pago.fecha).toISOString().slice(0, 7) : null;
+    const esNoIdentificado = !!(mesDeposito && mesComplemento && mesDeposito < mesComplemento && cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS]);
+    const subtotal = r2(dep.sobrante / (1 + TASA_IVA_SALDO_FAVOR));
+    const iva = r2(dep.sobrante - subtotal);
+    const base = {
+      concepto: [pago.receptor?.nombre, `SF DEP ${dep.folio}`].filter(Boolean).join(' / ').slice(0, 500),
+      serie: dep.folio, cfdiUuid: pago.uuid, facturaUuid,
+      rfcTercero: pago.receptor?.rfc ?? null, ventaFecha: diaPago(pago),
+      centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null, cuentaFaltante: false,
+      tipoComprobante: 'P', metodoPago: pago.metodoPago ?? null, formaPago: '03', folio: pago.folio ?? null,
+      rfcEmisor: pago.emisor?.rfc ?? null, rfcReceptor: pago.receptor?.rfc ?? null, tipoOrigen: 'Pago',
+    };
+    if (esNoIdentificado) {
+      movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS], debe: subtotal, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO });
+      movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO });
+    } else {
+      movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null, cuentaFaltante: !cuentaMap[CODIGO_CUENTA_BANCOS], debe: dep.sobrante, haber: 0, reglaNombre: REGLA_SF_COBRANZA });
+    }
+    movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: 0, haber: subtotal, reglaNombre: REGLA_SF_COBRANZA });
+    movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: 0, haber: iva, reglaNombre: REGLA_SF_COBRANZA });
+    agregadas.push(`dep ${dep.folio} $${dep.sobrante.toFixed(2)} (de $${dep.deposito.toFixed(2)})`);
+  }
+  return { movs, agregadas };
+}
+
 // Mismas categorías/códigos que usa el export CONTPAQ (poliza.service.js) —
 // duplicado a propósito. Solo aplica cuando se filtra por forma de pago.
 const FORMA_PAGO_A_CATEGORIA = { '01': 'efectivo', '03': 'transferencia', '02': 'transferencia', '04': 'tarjeta', '28': 'tarjeta' };
@@ -1178,5 +1268,6 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
 
 module.exports = {
   generarPropuestaCobranza, generarYGuardarCobranza,
-  cfdiToMovimientosCobranza, _prefetchDoctosPago, _movimientosOpaDeCobranza, _efectivoABanco,
+  cfdiToMovimientosCobranza, _prefetchDoctosPago, _movimientosOpaDeCobranza, _movimientosSfSobranteDeCobranza, _efectivoABanco,
+  REGLA_SF_COBRANZA, SF_SOBRANTE_DESDE,
 };

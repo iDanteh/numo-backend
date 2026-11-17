@@ -214,3 +214,49 @@ test('2 complementos de una factura que juntos dan el depósito → los dos con 
   const b = bancos(anotar(movs, 20, verdad));
   expect(b.every(l => l.serie === '050000')).toBe(true);
 });
+
+describe('saldo a favor del sobrante de un depósito (desde 2026-11-01)', () => {
+  const sf = ({ pago, fact, monto, folio }) => {
+    const base = { cfdiUuid: pago, facturaUuid: fact, formaPago: '03', serie: folio, concepto: `X / SF DEP ${folio}`, centroCosto: '101', reglaNombre: 'SF-COBRANZA', tipoOrigen: 'Pago' };
+    const sub = Math.round(monto / 1.16 * 100) / 100;
+    return [
+      { ...base, cuenta: BANCOS, debe: monto, haber: 0 },
+      { ...base, cuenta: { codigo: '2103090001' }, debe: 0, haber: sub },
+      { ...base, cuenta: { codigo: '2104010002' }, debe: 0, haber: Math.round((monto - sub) * 100) / 100 },
+    ];
+  };
+  const dep5000 = { ...deposito('a', '059000', 5000), _montoAplicado: 2100, _sobranteDeposito: 2900 };
+
+  test('cobro $2,100 + SF $2,900 → un solo banco de $5,000 (el depósito completo); Clientes $2,100', () => {
+    const movs = [
+      ...factura({ pago: 'P1', fact: 'F1', monto: 2100, iva: 289.66, concepto: 'X / A0-1' }),
+      ...sf({ pago: 'P1', fact: 'F1', monto: 2900, folio: '059000' }),
+    ];
+    const out = anotar(movs, 20, new Map([['F1', dep5000]]), null, { fechaPoliza: new Date('2026-11-14T12:00:00Z') });
+    expect(bancos(out).map(l => [l.cuenta.codigo, l.serie, l.debe])).toEqual([['1102012001', '059000', 5000]]);
+    expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(2100);
+    const debe = out.reduce((s, l) => s + Number(l.debe), 0);
+    const haber = out.reduce((s, l) => s + Number(l.haber), 0);
+    expect(Math.round((debe - haber) * 100)).toBe(0);
+  });
+
+  test('póliza de noviembre sin la línea SF (generada antes) → el cobro ya no se estira al depósito', () => {
+    const movs = factura({ pago: 'P1', fact: 'F1', monto: 2100, iva: 289.66, concepto: 'X / A0-1' });
+    const out = anotar(movs, 20, new Map([['F1', dep5000]]), null, { fechaPoliza: new Date('2026-11-14T12:00:00Z') });
+    expect(bancos(out)[0].debe).toBe(2100);
+  });
+
+  test('noviembre con sobrante de centavos ($0.25) → igual que el 27-oct: banco y Clientes al depósito', () => {
+    const movs = factura({ pago: 'P1', fact: 'F1', monto: 3033.75, iva: 418.45, concepto: 'OSCAR / A0-1' });
+    const d = { ...deposito('o', '054959', 3034), _montoAplicado: 3033.75, _sobranteDeposito: 0.25 };
+    const out = anotar(movs, 20, new Map([['F1', d]]), null, { fechaPoliza: new Date('2026-11-14T12:00:00Z') });
+    expect(bancos(out)[0].debe).toBe(3034);
+    expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(3034);
+  });
+
+  test('póliza de octubre → igual que antes (el banco toma el monto del depósito)', () => {
+    const movs = factura({ pago: 'P1', fact: 'F1', monto: 2100, iva: 289.66, concepto: 'X / A0-1' });
+    const out = anotar(movs, 20, new Map([['F1', dep5000]]), null, { fechaPoliza: new Date('2026-10-14T12:00:00Z') });
+    expect(bancos(out)[0].debe).toBe(5000);
+  });
+});

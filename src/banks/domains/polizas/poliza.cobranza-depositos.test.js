@@ -213,3 +213,29 @@ test('depósito de este cobro menor que el complemento → banco y Clientes al d
   const haber = out.reduce((s, l) => s + Number(l.haber), 0);
   expect(Math.round((debe - haber) * 100)).toBe(0);
 });
+
+test('ANCELMA 17-nov: 2 complementos ($17,916.28 + $935.03) y un solo depósito de $17,916.28 → banco al monto real; el otro sin depósito', () => {
+  const movs = [
+    ...factura({ pago: 'P1', fact: 'F1', monto: 17916.28, iva: 2471.21, concepto: 'ANCELMA ESPINO AQUINO / A0-261100584' }),
+    ...factura({ pago: 'P2', fact: 'F1', monto: 935.03, iva: 128.97, concepto: 'ANCELMA ESPINO AQUINO / A0-261100584' }),
+  ];
+  const verdad = new Map([['F1', { ...deposito('a', '058628', 17916.28), _montoAplicado: 17916.28 }]]);
+  const out = anotar(movs, 20, verdad);
+  const b = bancos(out).map(l => [l.cuenta.codigo, l.serie, l.debe]);
+  expect(b).toContainEqual(['1102012001', '058628', 17916.28]);
+  expect(b).toContainEqual(['1102011005', 'A0-260909212', 935.03]);
+  expect(b.reduce((s, x) => s + x[2], 0)).toBeCloseTo(18851.31, 2);
+  const debe = out.reduce((s, l) => s + Number(l.debe), 0);
+  const haber = out.reduce((s, l) => s + Number(l.haber), 0);
+  expect(Math.round((debe - haber) * 100)).toBe(0);
+});
+
+test('2 complementos de una factura que juntos dan el depósito → los dos con el depósito (sin cambio)', () => {
+  const movs = [
+    ...factura({ pago: 'P1', fact: 'F1', monto: 1000, iva: 137.93, concepto: 'X / A0-1' }),
+    ...factura({ pago: 'P2', fact: 'F1', monto: 500, iva: 68.97, concepto: 'X / A0-1' }),
+  ];
+  const verdad = new Map([['F1', { ...deposito('a', '050000', 1500), _montoAplicado: 1500 }]]);
+  const b = bancos(anotar(movs, 20, verdad));
+  expect(b.every(l => l.serie === '050000')).toBe(true);
+});

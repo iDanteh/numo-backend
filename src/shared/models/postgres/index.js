@@ -676,6 +676,14 @@ async function syncModels() {
   // sin FKs. Las 3 filas transicionales (Bronce/Plata/Oro, koreId:null) se siembran aparte vía
   // `npm run seed:lealtad` (mismo criterio que LoyaltyAdjustmentReason), no acá.
   await LoyaltyKoreNivel.sync({ force: false });
+  // Columna `color` (2026-11-17, pedido explícito del usuario — hex real de Kore para los chips de
+  // nivel): `sync({force:false})` de arriba NUNCA altera una tabla que ya existe, así que una
+  // columna nueva en el modelo necesita su propio ALTER TABLE explícito acá (mismo bug ya visto
+  // repetidas veces en este archivo con otras tablas — ver comentarios de arriba).
+  await LoyaltyKoreNivel.sequelize.query(`
+    ALTER TABLE loyalty_kore_niveles
+      ADD COLUMN IF NOT EXISTS color VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN color (loyalty_kore_niveles):', e.message));
   // Registro de procesos fallidos del webhook Kore→Numo de venta (2026-10-26, ver
   // LoyaltyKoreVentaFallida.js) — tabla nueva sin FKs.
   await LoyaltyKoreVentaFallida.sync({ force: false });

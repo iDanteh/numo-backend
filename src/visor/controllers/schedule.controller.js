@@ -17,7 +17,8 @@ const _locks = new Set();
 // Map en memoria solo para guardar el timeoutId (no persiste, se recrea al arrancar)
 const _timeouts = new Map();
 
-const KEYS     = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'];
+// satDescargaHoy (2026-11-17): Emitidos del día actual; '' = desactivada.
+const KEYS     = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos', 'satDescargaHoy'];
 const DEFAULTS = {
   satDescarga:              '01:00',
   satDescargaRecibidos:     '22:00',
@@ -25,6 +26,7 @@ const DEFAULTS = {
   erpVerificacion:          '02:00',
   comparacion:              '04:00',
   satVerificacionRecibidos: '06:00',
+  satDescargaHoy:           '',
 };
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -83,16 +85,18 @@ const getSchedule = asyncHandler(async (_req, res) => {
     erpVerificacion:          map.erpVerificacion          ?? DEFAULTS.erpVerificacion,
     comparacion:              map.comparacion              ?? DEFAULTS.comparacion,
     satVerificacionRecibidos: map.satVerificacionRecibidos ?? DEFAULTS.satVerificacionRecibidos,
+    satDescargaHoy:           map.satDescargaHoy           ?? DEFAULTS.satDescargaHoy,
   });
 });
 
 const updateSchedule = asyncHandler(async (req, res) => {
-  const campos = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'];
+  const campos = KEYS;
 
   for (const campo of campos) {
     const valor = req.body[campo];
     if (valor === undefined) continue;
-    if (!TIME_RE.test(valor)) {
+    // La del día actual se puede apagar dejándola vacía.
+    if (!(campo === 'satDescargaHoy' && valor === '') && !TIME_RE.test(valor)) {
       return res.status(400).json({ error: `${campo} debe tener formato HH:MM (ej. 01:30)` });
     }
     await AppConfig.findOneAndUpdate({ key: campo }, { value: valor }, { upsert: true, new: true });
@@ -108,6 +112,7 @@ const updateSchedule = asyncHandler(async (req, res) => {
     erpVerificacion:          map.erpVerificacion          ?? DEFAULTS.erpVerificacion,
     comparacion:              map.comparacion              ?? DEFAULTS.comparacion,
     satVerificacionRecibidos: map.satVerificacionRecibidos ?? DEFAULTS.satVerificacionRecibidos,
+    satDescargaHoy:           map.satDescargaHoy           ?? DEFAULTS.satDescargaHoy,
   };
 
   reprogramarJobs(resultado);

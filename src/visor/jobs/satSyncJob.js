@@ -638,8 +638,15 @@ const liberarVerificandoHuerfanos = async () => {
   }
 };
 
-const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = {}) => {
-  logger.info(`[SatSyncJob] Iniciando descarga masiva nocturna (${tiposObjetivo.join(', ')})...`);
+/**
+ * `soloHoy` (2026-11-17, pedido del usuario): descarga de los Emitidos del DÍA
+ * ACTUAL (desde las 00:00 hasta unos minutos antes de ahora), a la hora que se
+ * programe en "Descarga SAT del día actual". Sin repaso mensual y sin retomar
+ * pendientes/incompletos de otros días (eso lo hace la nocturna) para no gastar
+ * cuota SAT de más.
+ */
+const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'], soloHoy = false } = {}) => {
+  logger.info(`[SatSyncJob] Iniciando descarga masiva ${soloHoy ? 'del día actual' : 'nocturna'} (${tiposObjetivo.join(', ')})...`);
 
   // Fechas en hora de México (el SAT usa CDMX como referencia)
   const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
@@ -656,23 +663,37 @@ const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = 
   tresDate.setDate(tresDate.getDate() - 3);
   const tresMXStr = fmtMX.format(tresDate);
 
-  // ejercicio/periodo derivados de ayer (mes del fin del rango diario)
-  const ejercicio = parseInt(ayerMXStr.split('-')[0], 10);
-  const periodo   = parseInt(ayerMXStr.split('-')[1], 10);
+  // ejercicio/periodo derivados de ayer (mes del fin del rango diario); del día actual, de hoy.
+  const diaPeriodo = soloHoy ? hoyMXStr : ayerMXStr;
+  const ejercicio = parseInt(diaPeriodo.split('-')[0], 10);
+  const periodo   = parseInt(diaPeriodo.split('-')[1], 10);
 
   // ── Rangos de descarga ───────────────────────────────────────────────────────
-  // Siempre: últimos 3 días, XMLs completos (tipoSolicitud forzado a 'CFDI')
-  const rangos = [
-    {
+  // Día actual: de las 00:00 a 2 minutos antes de ahora (el SAT no acepta un fin
+  // de rango en el futuro). Nocturna: últimos 3 días, XMLs completos.
+  const horaCorteMX = () => new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'America/Mexico_City', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).format(new Date(Date.now() - 2 * 60 * 1000));
+  if (soloHoy && fmtMX.format(new Date(Date.now() - 2 * 60 * 1000)) !== hoyMXStr) {
+    logger.info('[SatSyncJob] Descarga del día actual: el día apenas empieza (antes de las 00:02), no hay nada que pedir.');
+    return;
+  }
+  const rangos = soloHoy
+    ? [{
+      fechaInicio:   `${hoyMXStr}T00:00:00`,
+      fechaFin:      `${hoyMXStr}T${horaCorteMX()}`,
+      tipoSolicitud: 'CFDI',
+      label: `día actual (${hoyMXStr})`,
+    }]
+    : [{
       fechaInicio:    `${tresMXStr}T00:00:00`,
       fechaFin:       `${ayerMXStr}T23:59:59`,
       tipoSolicitud:  'CFDI',
       label: `últimos 3 días (${tresMXStr} → ${ayerMXStr})`,
-    },
-  ];
+    }];
 
   // Del día 15 al último día del mes: repaso completo desde el 1ro, XMLs completos
-  if (diaHoy >= 15) {
+  if (!soloHoy && diaHoy >= 15) {
     const mesStrPad = String(mesHoy).padStart(2, '0');
     const primero   = `${anoHoy}-${mesStrPad}-01`;
     rangos.push({
@@ -782,6 +803,11 @@ const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = 
       logger.error(`[SatSyncJob] Error procesando RFC ${rfc}: ${err.message}`);
     }
     // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
+  }
+
+  if (soloHoy) {
+    logger.info('[SatSyncJob] Descarga del día actual completada.');
+    return;
   }
 
   // Retomar solicitudes que vencieron el polling de 60 min en corridas anteriores
@@ -2071,6 +2097,15 @@ const jobDescargaMasiva = async () => {
   }
 };
 
+// Emitidos del día actual (2026-11-17) — ver `soloHoy` en ejecutarDescargaMasiva.
+const jobDescargaHoy = async () => {
+  try {
+    await ejecutarDescargaMasiva({ tipos: ['Emitidos'], soloHoy: true });
+  } catch (err) {
+    logger.error(`[SatSyncJob] Error fatal en descarga del día actual: ${err.message}`);
+  }
+};
+
 // Job separado para Recibidos — corre en un horario distinto al de Emitidos
 // (ver reprogramarJobs) para no disparar solicitudes simultáneas del mismo RFC.
 // Comparte el mismo limitador de cuota SAT (rateLimiter) que Emitidos, así que
@@ -2107,6 +2142,7 @@ let _jobVerif             = null;
 let _jobVerifRecibidos    = null;
 let _jobDescarga          = null;
 let _jobDescargaRecibidos = null;
+let _jobDescargaHoy       = null;
 let _jobERP               = null;
 let _jobComparacion       = null;
 
@@ -2332,11 +2368,14 @@ const reprogramarJobs = ({
   satDescarga = '01:00', satDescargaRecibidos = '22:00',
   erpDescarga = '03:00', erpVerificacion = '02:00', comparacion = '04:00',
   satVerificacionRecibidos = '06:00',
+  // Emitidos del día actual; vacío = desactivada (2026-11-17).
+  satDescargaHoy = '',
 } = {}) => {
   if (_jobVerif)             { _jobVerif.stop();             _jobVerif             = null; }
   if (_jobVerifRecibidos)    { _jobVerifRecibidos.stop();    _jobVerifRecibidos    = null; }
   if (_jobDescarga)          { _jobDescarga.stop();          _jobDescarga          = null; }
   if (_jobDescargaRecibidos) { _jobDescargaRecibidos.stop(); _jobDescargaRecibidos = null; }
+  if (_jobDescargaHoy)       { _jobDescargaHoy.stop();       _jobDescargaHoy       = null; }
   if (_jobERP)               { _jobERP.stop();               _jobERP               = null; }
   if (_jobComparacion)       { _jobComparacion.stop();       _jobComparacion       = null; }
 
@@ -2346,11 +2385,14 @@ const reprogramarJobs = ({
   _jobVerif             = cron.schedule(horaACron(erpVerificacion),         jobVerificacionSAT,         { timezone: 'America/Mexico_City' });
   _jobVerifRecibidos    = cron.schedule(horaACron(satVerificacionRecibidos), jobVerificacionRecibidos,  { timezone: 'America/Mexico_City' });
   _jobComparacion       = cron.schedule(horaACron(comparacion),             jobComparacionAuto,         { timezone: 'America/Mexico_City' });
+  if (satDescargaHoy) {
+    _jobDescargaHoy     = cron.schedule(horaACron(satDescargaHoy),          jobDescargaHoy,             { timezone: 'America/Mexico_City' });
+  }
 
   logger.info(
     `[SatSyncJob] Jobs programados — Descarga SAT Emitidos: ${satDescarga} | Descarga SAT Recibidos: ${satDescargaRecibidos} | ` +
     `Descarga ERP: ${erpDescarga} | Verificación: ${erpVerificacion} | Verificación Recibidos: ${satVerificacionRecibidos} | ` +
-    `Comparación: ${comparacion} (America/Mexico_City)`
+    `Comparación: ${comparacion} | Emitidos del día actual: ${satDescargaHoy || 'desactivada'} (America/Mexico_City)`
   );
 };
 
@@ -2358,7 +2400,7 @@ const reprogramarJobs = ({
 (async () => {
   try {
     const AppConfig = require('../models/AppConfig');
-    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'] } }).lean();
+    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos', 'satDescargaHoy'] } }).lean();
     const map       = Object.fromEntries(configs.map(c => [c.key, c.value]));
     reprogramarJobs({
       satDescarga:              map.satDescarga              ?? '01:00',
@@ -2367,6 +2409,7 @@ const reprogramarJobs = ({
       erpVerificacion:          map.erpVerificacion          ?? '02:00',
       comparacion:              map.comparacion              ?? '04:00',
       satVerificacionRecibidos: map.satVerificacionRecibidos ?? '06:00',
+      satDescargaHoy:           map.satDescargaHoy           ?? '',
     });
   } catch (err) {
     logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/22:00/03:00/02:00/04:00/06:00). Error: ${err.message}`);

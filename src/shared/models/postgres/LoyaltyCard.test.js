@@ -38,11 +38,18 @@ describe('LoyaltyCard — modelo Sequelize (loyalty_cards)', () => {
     expect(attr.allowNull).toBe(false);
   });
 
-  test("nivel: STRING(10) default 'Bronce', isIn [Bronce,Plata,Oro,Azul]", () => {
+  // 2026-11-17: se quitó el `isIn` estático de este campo (candado duplicado del catálogo
+  // dinámico LoyaltyKoreNivel, que rompía altas/cambios de nivel válidos cada vez que Kore
+  // agregaba un nombre nuevo, ej. "Esmeralda" — ver LoyaltyCard.js). La validación real contra
+  // el catálogo vivo la cubren los tests de `nivelEsValido()` en
+  // loyalty-card.service.test.js, no este archivo de esquema.
+  test("nivel: STRING(10) default 'Bronce', sin validación estática contra el catálogo", () => {
     const attr = LoyaltyCard.getAttributes().nivel;
+    expect(attr.type.constructor.name).toBe('STRING');
+    expect(attr.type.options.length).toBe(10);
     expect(attr.allowNull).toBe(false);
     expect(attr.defaultValue).toBe('Bronce');
-    expect(attr.validate.isIn).toEqual([['Bronce', 'Plata', 'Oro', 'Azul']]);
+    expect(attr.validate).toBeUndefined();
   });
 
   test('saldoPuntos: DECIMAL(12,2) NOT NULL default 0', () => {

@@ -97,6 +97,34 @@ describe('evento alta', () => {
       .rejects.toMatchObject({ statusCode: 400 });
   });
 
+  test('color presente en el payload (opcional, best-effort): se persiste en el create', async () => {
+    _buscarOAdoptarNivelKore.mockResolvedValue(null);
+    LoyaltyKoreNivel.create.mockResolvedValue(nivel({ id: 9 }));
+
+    await procesarNivelKore({
+      evento: 'alta', koreId: 'n9', nombre: 'Platino', porcentaje: 3, estatus: true, color: '#E6DF0A',
+    });
+
+    expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
+      koreId: 'n9', nombre: 'Platino', porcentaje: 3, activo: true, color: '#E6DF0A', esInicial: false,
+    });
+  });
+
+  test('sin color en el payload (contrato no lo incluye hoy): el create se omite, nunca se manda null', async () => {
+    _buscarOAdoptarNivelKore.mockResolvedValue(null);
+    LoyaltyKoreNivel.create.mockResolvedValue(nivel({ id: 9 }));
+
+    await procesarNivelKore({
+      evento: 'alta', koreId: 'n9', nombre: 'Platino', porcentaje: 3, estatus: true,
+    });
+
+    expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
+      koreId: 'n9', nombre: 'Platino', porcentaje: 3, activo: true, esInicial: false,
+    });
+    const datosCreados = LoyaltyKoreNivel.create.mock.calls[0][0];
+    expect(datosCreados).not.toHaveProperty('color');
+  });
+
   test('estatus:false crea el nivel ya inactivo', async () => {
     _buscarOAdoptarNivelKore.mockResolvedValue(null);
     LoyaltyKoreNivel.create.mockResolvedValue(nivel({ id: 9 }));
@@ -192,6 +220,26 @@ describe('evento actualizacion', () => {
     await procesarNivelKore({ evento: 'actualizacion', koreId: 'n1', estatus: true });
 
     expect(existente.update).toHaveBeenCalledWith({ activo: true });
+  });
+
+  test('color presente en el payload (opcional, best-effort): se persiste', async () => {
+    const existente = nivel();
+    LoyaltyKoreNivel.findOne.mockResolvedValue(existente);
+
+    await procesarNivelKore({ evento: 'actualizacion', koreId: 'n1', estatus: true, color: '#1E88E5' });
+
+    expect(existente.update).toHaveBeenCalledWith({ activo: true, color: '#1E88E5' });
+  });
+
+  test('sin color en el payload: NO se toca el valor existente (nunca se pisa con null)', async () => {
+    const existente = nivel({ color: '#CD7F32' });
+    LoyaltyKoreNivel.findOne.mockResolvedValue(existente);
+
+    await procesarNivelKore({ evento: 'actualizacion', koreId: 'n1', estatus: true });
+
+    expect(existente.update).toHaveBeenCalledWith({ activo: true });
+    const updatesRecibidos = existente.update.mock.calls[0][0];
+    expect(updatesRecibidos).not.toHaveProperty('color');
   });
 
   test('sin estatus -> 400, no actualiza', async () => {

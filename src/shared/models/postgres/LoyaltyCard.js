@@ -42,12 +42,14 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     type:         DataTypes.STRING(10),
     allowNull:    false,
     defaultValue: 'Bronce',
-    // 2026-11-12: 'Azul' agregado (ver loyalty-import.service.js). Este isIn es una validación
-    // fija a nivel de modelo, independiente del catálogo dinámico LoyaltyKoreNivel que usa
-    // loyalty-card.service.js#nivelEsValido(). Si se agrega otro nivel nuevo a futuro, actualizar
-    // ACÁ también (no se resuelve solo con el catálogo).
-    validate:     { isIn: [['Bronce', 'Plata', 'Oro', 'Azul']] },
-    comment:      'Nivel actual de la tarjeta (D2: STRING + isIn, no ENUM — ver rationale en design.md).',
+    // 2026-11-17: se quitó el `isIn` estático que vivía acá (candado duplicado del catálogo
+    // dinámico). Kore gestiona el catálogo completo de niveles y puede agregar nombres nuevos en
+    // cualquier momento (ej. "Esmeralda") — un array fijo en el modelo queda desincronizado tarde
+    // o temprano y rompe altas/cambios de nivel válidos con SequelizeValidationError, como ya pasó.
+    // ÚNICA fuente de verdad: LoyaltyKoreNivel (catálogo real) vía
+    // loyalty-card.service.js#nivelEsValido(), que ya se consulta antes de cualquier
+    // .create()/.update() que toque este campo. No volver a agregar un isIn fijo acá.
+    comment:      'Nivel actual de la tarjeta (D2: STRING, no ENUM — ver rationale en design.md). Validado contra el catálogo dinámico LoyaltyKoreNivel, no acá.',
   },
   saldoPuntos: {
     type:         DataTypes.DECIMAL(12, 2),

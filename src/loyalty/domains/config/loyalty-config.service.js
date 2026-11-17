@@ -698,7 +698,13 @@ async function _buscarOAdoptarNivelKore({ koreId, nombre }) {
  *  se pisa en cada sync (a diferencia de `acumulaPuntos` en conceptos/formas de pago) porque acá
  *  es la fuente real, no un hint. `esInicial` nunca se toca por un sync. Marca `activo:false` en
  *  lo que ya no vino de Kore — las filas transicionales (`koreId` todavía null) se excluyen de esa
- *  desactivación, nunca se apagan solas por no aparecer en una corrida puntual. */
+ *  desactivación, nunca se apagan solas por no aparecer en una corrida puntual.
+ *
+ *  Claves tolerantes a 2 casings (2026-11-17, bug real encontrado contra el endpoint real de Kore
+ *  `/configuracion/puntos_numo/categorias`): el contrato original asumía PascalCase (`Id`/`Nombre`/
+ *  `Porcentaje`, igual que conceptos/formas de pago), pero este endpoint entrega camelCase
+ *  (`id`/`nombre`/`porcentajePuntos`) — sin el fallback, `koreId` quedaba '' para toda fila real y
+ *  el `continue` de abajo las descartaba todas en silencio. */
 async function sincronizarNivelesKore() {
   const nivelesKore = await koreCatalogosClient.obtenerNivelesKore();
   const idsVistos = new Set();
@@ -706,14 +712,15 @@ async function sincronizarNivelesKore() {
   let actualizados = 0;
 
   for (const n of nivelesKore) {
-    const koreId = String(n.Id ?? n.ID ?? '').trim();
+    const koreId = String(n.Id ?? n.ID ?? n.id ?? '').trim();
     if (!koreId) continue;
     idsVistos.add(koreId);
 
+    const porcentaje = n.Porcentaje ?? n.porcentajePuntos ?? n.porcentaje;
     const datos = {
       koreId,
-      nombre:     String(n.Nombre ?? '').trim(),
-      porcentaje: n.Porcentaje != null && n.Porcentaje !== '' ? Number(n.Porcentaje) : null,
+      nombre:     String(n.Nombre ?? n.nombre ?? '').trim(),
+      porcentaje: porcentaje != null && porcentaje !== '' ? Number(porcentaje) : null,
       activo:     true,
     };
 

@@ -858,6 +858,21 @@ describe('sincronizarNivelesKore', () => {
     expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
   });
 
+  test('acepta el shape real de Kore (camelCase: id/nombre/porcentajePuntos), no solo PascalCase', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ id: 6, nombre: 'Esmeralda', porcentajePuntos: 3 }]);
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(null); // por koreId
+    LoyaltyKoreNivel.create.mockResolvedValue(makeNivel());
+    LoyaltyKoreNivel.findAll.mockResolvedValue([]);
+
+    const resultado = await configService.sincronizarNivelesKore();
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: '6' } });
+    expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
+      koreId: '6', nombre: 'Esmeralda', porcentaje: 3, activo: true, esInicial: false,
+    });
+    expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
   test('adopta una fila transicional (koreId:null) por nombre en vez de duplicarla, preserva esInicial', async () => {
     const transicional = makeNivel({ id: 5, koreId: null, nombre: 'Bronce', porcentaje: null, esInicial: true });
     koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 2 }]);

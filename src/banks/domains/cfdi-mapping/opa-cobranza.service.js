@@ -86,7 +86,7 @@ async function referenciaOpaDeCobranza(cfdi, refOpa, cache = new Map()) {
 const MINIMO_SOBRANTE_SF = 1;
 
 /**
- * Depósitos (identificados) ligados a estas facturas cuyo monto es MAYOR que lo
+ * Depósitos (identificados o no) ligados a estas facturas cuyo monto es MAYOR que lo
  * que aplicaron a cuentas en Kore — el sobrante va como SALDO A FAVOR en la
  * póliza de Cobranza (2026-11-17, pedido del usuario: transferencia de $5,000
  * que solo abona $2,100 → $2,900 de saldo a favor). Los que traen una OPA se
@@ -98,7 +98,10 @@ async function depositosConSobrantePorFacturas(facturaUuids) {
   if (!uuids.length) return [];
   const movs = await BankMovement.find({
     'erpLinks.folioFiscal': { $in: uuids.flatMap(u => [u, u.toLowerCase()]) },
-    status: 'identificado',
+    // También 'no_identificado' (2026-11-17, decisión del usuario): un depósito
+    // aplicado solo en parte se queda así en Bancos — justo los que tienen sobrante
+    // (052275 sobran $300, 056003 $466.28). 'otros'/'reclasificado' no son cobranza.
+    status: { $in: ['identificado', 'no_identificado'] },
   }).select('fecha folio deposito erpLinks').lean();
   const r2 = n => Math.round(n * 100) / 100;
   const out = [];

@@ -33,6 +33,13 @@ jest.mock('./loyalty-kore-canje.service', () => ({
   solicitarCodigoCanje: jest.fn(),
   validarCodigoCanje: jest.fn(),
 }));
+// Auditoría de /venta y /ventas (2026-11-17) — mockeado para no pegarle a Postgres real desde
+// estos tests de wiring (la lógica real de filtros se prueba en
+// loyalty-kore-venta-log.service.test.js). Resuelve por default para no dejar promesas colgadas.
+jest.mock('./loyalty-kore-venta-log.service', () => ({
+  registrarVentaLog: jest.fn().mockResolvedValue(undefined),
+  listarVentasLog: jest.fn(),
+}));
 // Mismo criterio que loyalty-public.routes.test.js: `express-rate-limit` sigue siendo REAL (no
 // mockeado), pero el store sí se mockea — un `FakeRedisStore` que implementa el contrato real
 // (increment/decrement/resetKey/init) para que el conteo de 429 del limiter por teléfono
@@ -71,6 +78,7 @@ const ventaService = require('./loyalty-kore-venta.service');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
 const canjeCodigoService = require('./loyalty-kore-canje.service');
+const ventaLogService = require('./loyalty-kore-venta-log.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 function perms(...list) { return { 'x-test-permissions': JSON.stringify(list) }; }
@@ -103,6 +111,32 @@ describe('POST /venta', () => {
     expect(ventaService.procesarVentaKore).toHaveBeenCalledWith(expect.objectContaining(body));
     expect(res.body).toEqual({ serieFolio: 'A0-1', status: 'aplicado' });
   });
+
+  // Auditoría (2026-11-17, pedido explícito del usuario): cada request real se registra con su
+  // resultado — nunca cambia la respuesta real del webhook (ver loyalty-kore-venta-log.service.js).
+  test('registra el log con resultado "exito" cuando el service responde bien', async () => {
+    const body = { serieFolio: 'A0-1', telefono: '5512345678' };
+    ventaService.procesarVentaKore.mockResolvedValue({ status: 'aplicado' });
+    await request(freshApp()).post('/venta').send(body);
+    await new Promise((r) => setImmediate(r)); // el registro es fire-and-forget (.catch, no await)
+    expect(ventaLogService.registrarVentaLog).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: 'venta', resultado: 'exito', payload: expect.objectContaining(body) }),
+    );
+  });
+
+  test('registra el log con resultado "error" y el detalle cuando el service revienta, y sigue respondiendo el error real', async () => {
+    const body = { serieFolio: 'A0-1', telefono: '5512345678' };
+    const err = Object.assign(new Error('La venta no existe en Kore.'), { statusCode: 400 });
+    ventaService.procesarVentaKore.mockRejectedValue(err);
+
+    const res = await request(freshApp()).post('/venta').send(body);
+    await new Promise((r) => setImmediate(r));
+
+    expect(res.status).toBe(400);
+    expect(ventaLogService.registrarVentaLog).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: 'venta', resultado: 'error', detalle: 'La venta no existe en Kore.' }),
+    );
+  });
 });
 
 describe('POST /ventas (lote)', () => {
@@ -118,6 +152,16 @@ describe('POST /ventas (lote)', () => {
     expect(res.status).toBe(200);
     expect(ventaService.procesarLoteVentasKore).toHaveBeenCalledWith(ventas);
     expect(res.body.resultados).toHaveLength(2);
+  });
+
+  test('registra el log con endpoint "ventas" y resultado "exito"', async () => {
+    const ventas = [{ serieFolio: 'A0-1' }];
+    ventaService.procesarLoteVentasKore.mockResolvedValue({ resultados: [] });
+    await request(freshApp()).post('/ventas').send({ ventas });
+    await new Promise((r) => setImmediate(r));
+    expect(ventaLogService.registrarVentaLog).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: 'ventas', resultado: 'exito' }),
+    );
   });
 });
 
@@ -205,6 +249,24 @@ describe('POST /canje/validar-codigo', () => {
     expect(res.status).toBe(200);
     expect(canjeCodigoService.validarCodigoCanje).toHaveBeenCalledWith('5512345678', '123456');
     expect(res.body).toEqual({ valido: true });
+  });
+});
+
+describe('GET /ventas-log — requiere loyalty:auditoria, sesión Numo', () => {
+  test('403 sin el permiso', async () => {
+    const res = await request(freshApp()).get('/ventas-log');
+    expect(res.status).toBe(403);
+  });
+
+  test('200 con el permiso, pasa los filtros de query al service', async () => {
+    ventaLogService.listarVentasLog.mockResolvedValue({ total: 0, logs: [] });
+    const res = await request(freshApp()).get('/ventas-log')
+      .query({ resultado: 'error', endpoint: 'venta', desde: '2026-11-01' })
+      .set(perms(PERMISSIONS.LOYALTY_AUDITORIA));
+    expect(res.status).toBe(200);
+    expect(ventaLogService.listarVentasLog).toHaveBeenCalledWith(expect.objectContaining({
+      resultado: 'error', endpoint: 'venta', desde: '2026-11-01',
+    }));
   });
 });
 

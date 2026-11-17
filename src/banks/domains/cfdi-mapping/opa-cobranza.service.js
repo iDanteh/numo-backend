@@ -77,4 +77,44 @@ async function referenciaOpaDeCobranza(cfdi, refOpa, cache = new Map()) {
   return resultado;
 }
 
-module.exports = { depositosConOpaPorFacturas, referenciaOpaDeCobranza };
+/**
+ * Sobrante mínimo para registrarlo como saldo a favor (2026-11-17, decisión del
+ * usuario): con $1.00 o menos son centavos y el export ajusta el banco y Clientes
+ * al monto del depósito (regla del 27-oct, caso OSCAR $0.25). Mismo valor en
+ * poliza.service.js (`MINIMO_SOBRANTE_SF`).
+ */
+const MINIMO_SOBRANTE_SF = 1;
+
+/**
+ * Depósitos (identificados) ligados a estas facturas cuyo monto es MAYOR que lo
+ * que aplicaron a cuentas en Kore — el sobrante va como SALDO A FAVOR en la
+ * póliza de Cobranza (2026-11-17, pedido del usuario: transferencia de $5,000
+ * que solo abona $2,100 → $2,900 de saldo a favor). Los que traen una OPA se
+ * quedan fuera: su sobrante ya es esa OPA (`depositosConOpaPorFacturas`).
+ * @returns {Promise<{ idDeposito: string, folio: string|null, fecha: Date|null, deposito: number, aplicado: number, sobrante: number, facturas: Set<string> }[]>}
+ */
+async function depositosConSobrantePorFacturas(facturaUuids) {
+  const uuids = [...new Set((facturaUuids ?? []).filter(Boolean).map(u => String(u).toUpperCase()))];
+  if (!uuids.length) return [];
+  const movs = await BankMovement.find({
+    'erpLinks.folioFiscal': { $in: uuids.flatMap(u => [u, u.toLowerCase()]) },
+    status: 'identificado',
+  }).select('fecha folio deposito erpLinks').lean();
+  const r2 = n => Math.round(n * 100) / 100;
+  const out = [];
+  for (const m of movs) {
+    const links = m.erpLinks ?? [];
+    if (typeof m.deposito !== 'number' || links.some(esLinkOpa)) continue;
+    const aplicado = r2(links.reduce((s, l) => s + montoLink(l), 0));
+    const sobrante = r2(m.deposito - aplicado);
+    if (sobrante <= MINIMO_SOBRANTE_SF) continue;
+    out.push({
+      idDeposito: String(m._id), folio: m.folio ?? null, fecha: m.fecha ?? null,
+      deposito: m.deposito, aplicado, sobrante,
+      facturas: new Set(links.map(l => String(l.folioFiscal ?? '').toUpperCase()).filter(Boolean)),
+    });
+  }
+  return out;
+}
+
+module.exports = { depositosConOpaPorFacturas, depositosConSobrantePorFacturas, referenciaOpaDeCobranza, MINIMO_SOBRANTE_SF };

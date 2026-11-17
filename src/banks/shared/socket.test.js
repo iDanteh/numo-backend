@@ -33,6 +33,17 @@ jest.mock('@socket.io/redis-adapter', () => ({
   createAdapter: jest.fn((pubClient, subClient) => ({ __fakeAdapter: true, pubClient, subClient })),
 }));
 
+// Emitter-only (2026-11-17, initEmitterOnly — ver loyalty-gateway/app.js): mismo
+// criterio que el adapter de arriba, el contenido real no le importa a este test,
+// solo poder verificar CON QUÉ se llamó `.to()/.emit()`.
+jest.mock('@socket.io/redis-emitter', () => ({
+  Emitter: jest.fn().mockImplementation(function EmitterCtor(client) {
+    this.client = client;
+    this.to = jest.fn().mockReturnThis();
+    this.emit = jest.fn();
+  }),
+}));
+
 jest.mock('socket.io', () => {
   const ServerMock = jest.fn().mockImplementation(function ServerCtor(httpServer, opts) {
     this.httpServer = httpServer;
@@ -162,5 +173,58 @@ describe('init() — adapter Redis (cluster nativo + Redis, 2026-11-11)', () => 
 
     expect(pubClient.quit).toHaveBeenCalledTimes(1);
     expect(subClient.quit).toHaveBeenCalledTimes(1);
+  });
+});
+
+// initEmitterOnly (2026-11-17, loyalty-gateway/app.js — webhooks de Kore corriendo en un
+// proceso aparte del backend principal, ver [[architecture/microservicios-evaluacion-lealtad]]):
+// un módulo FRESH por test (jest.resetModules()) para no heredar el `_io` que ya quedó seteado
+// por los tests de init() de arriba — acá necesitamos empezar desde `_io`/`_emitter` ambos null.
+describe('initEmitterOnly() + fallback a emitter en emitTo*/emitToAll (sin _io real)', () => {
+  let freshSocket;
+  let freshCreateClient;
+  let EmitterMock;
+
+  beforeEach(() => {
+    jest.resetModules();
+    // eslint-disable-next-line global-require
+    freshCreateClient = require('redis').createClient;
+    // eslint-disable-next-line global-require
+    EmitterMock = require('@socket.io/redis-emitter').Emitter;
+    // eslint-disable-next-line global-require
+    freshSocket = require('./socket');
+  });
+
+  afterEach(() => jest.clearAllMocks());
+
+  test('conecta un cliente Redis suelto (no un par pub/sub) y arma el Emitter con ese cliente', async () => {
+    await freshSocket.initEmitterOnly();
+
+    expect(freshCreateClient).toHaveBeenCalledTimes(1);
+    const client = freshCreateClient.mock.results[0].value;
+    expect(client.duplicate).not.toHaveBeenCalled(); // no es el patrón pub/sub de init()
+    expect(client.connect).toHaveBeenCalledTimes(1);
+    expect(EmitterMock).toHaveBeenCalledWith(client);
+  });
+
+  test('emitToAll(): sin _io, publica vía el emitter', async () => {
+    await freshSocket.initEmitterOnly();
+    freshSocket.emitToAll('lealtad-cliente-kore:actualizado', { cardId: 'c1' });
+
+    const emitterInstance = EmitterMock.mock.instances[0];
+    expect(emitterInstance.emit).toHaveBeenCalledWith('lealtad-cliente-kore:actualizado', { cardId: 'c1' });
+  });
+
+  test('emitToLoyaltyCard(): sin _io, publica a la sala correcta vía el emitter', async () => {
+    await freshSocket.initEmitterOnly();
+    freshSocket.emitToLoyaltyCard('card-9', 'evt', { y: 2 });
+
+    const emitterInstance = EmitterMock.mock.instances[0];
+    expect(emitterInstance.to).toHaveBeenCalledWith('lealtad-tarjeta:card-9');
+    expect(emitterInstance.to.mock.results[0].value.emit).toHaveBeenCalledWith('evt', { y: 2 });
+  });
+
+  test('sin init() ni initEmitterOnly() (ninguno llamado todavía): emitToAll no revienta y no emite nada', () => {
+    expect(() => freshSocket.emitToAll('evento', {})).not.toThrow();
   });
 });

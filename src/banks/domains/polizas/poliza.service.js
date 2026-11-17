@@ -264,6 +264,11 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null,
         // Lo que este depósito aplicó a ESTA factura (CxC vinculada) — una
         // factura pagada con porciones de varios depósitos se reparte por aquí.
         _montoAplicado: typeof link.saldoPagado === 'number' ? link.saldoPagado : null,
+        // Depósito − lo que aplicó a TODAS sus cuentas: desde 2026-11-01 ese
+        // sobrante va como saldo a favor (SF-COBRANZA) en la póliza de Cobranza.
+        _sobranteDeposito: montoBancoReal != null
+          ? Math.round((montoBancoReal - (m.erpLinks ?? []).reduce((s, l) => s + (typeof l.saldoPagado === 'number' ? l.saldoPagado : Number(l.total) || 0), 0)) * 100) / 100
+          : null,
       };
       if (!todosPorUuid.has(uuidResuelto)) todosPorUuid.set(uuidResuelto, new Map());
       todosPorUuid.get(uuidResuelto).set(candidato._idDeposito, { ...candidato });
@@ -1907,7 +1912,18 @@ function agruparNoIdentificadosPorDeposito(lineas) {
 // (redondeo del complemento) en Cobranza — más que esto es otro depósito.
 const TOLERANCIA_CENTAVOS_DEPOSITO = 0.10;
 
-function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
+// Saldo a favor del sobrante de un depósito en Cobranza (2026-11-17, ver
+// cobranza-poliza-generator `_movimientosSfSobranteDeCobranza`).
+const REGLA_SF_COBRANZA = 'SF-COBRANZA';
+const SF_SOBRANTE_DESDE = '2026-11-01';
+// Con $1.00 o menos de sobrante (centavos) sigue el ajuste al depósito del 27-oct
+// (decisión del usuario 2026-11-17); mismo valor en opa-cobranza.service.js.
+const MINIMO_SOBRANTE_SF = 1;
+
+function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null, { fechaPoliza = null } = {}) {
+  // Desde el corte, el sobrante de un depósito va como saldo a favor: el cobro
+  // ya no se "estira" al monto del depósito (ver ajuste de centavos abajo).
+  const sfSobranteActivo = !!fechaPoliza && new Date(fechaPoliza).toISOString().slice(0, 10) >= SF_SOBRANTE_DESDE;
   // Factura pagada con 2+ depósitos (caso real HERRAMIENTAS CANANEA
   // A0-260907729, 7-oct: $4,062.26 dep 51168 + $4,000 dep 5416): cada Cargo
   // toma el depósito de SU monto, sin repetir — antes ambos tomaban el único
@@ -1934,6 +1950,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     movs.forEach((m, i) => {
       if (!(Number(m.debe) > 0) || m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL) return;
       if (!/^110[12]/.test(m.cuenta?.codigo || '') || m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) return;
+      if (m.reglaNombre === REGLA_SF_COBRANZA) return;
       const llave = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
       const base = verdadBancaria?.get(llave);
       if (!base || base._candidatos) return;
@@ -2011,7 +2028,11 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     const llaveBancaria = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
     const bancarioBase = cobrosSinDepositoUnico.has(idx) ? null : verdadBancaria?.get(llaveBancaria);
     const esCargoCajaBanco = /^110[12]/.test(m.cuenta?.codigo || '') && m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO;
-    const bancario = esCargoCajaBanco ? _depositoPorMonto(bancarioBase, llaveBancaria, Number(m.debe)) : bancarioBase;
+    // Saldo a favor del sobrante: siempre SU depósito (serie = folio de Numo),
+    // sin gastar un depósito de los cobros.
+    const bancario = m.reglaNombre === REGLA_SF_COBRANZA
+      ? ([...(bancarioBase?._candidatos ?? []), ...(bancarioBase ? [bancarioBase] : [])].find(c => c.referencia && c.referencia === m.serie) ?? null)
+      : (esCargoCajaBanco ? _depositoPorMonto(bancarioBase, llaveBancaria, Number(m.debe)) : bancarioBase);
     // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP
     // CHEQUE BNM") va igual que una transferencia: banco real, folio de Numo
     // en columna C, subcódigo 20 (2026-10-06, pólizas manuales: 29-sep
@@ -2116,7 +2137,9 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // que el depósito sea de ESTE cobro: lo que aplicó a la factura en Bancos
     // es el monto del complemento. Sin ese dato se queda el límite anterior.
     let debeCargo = Number(m.debe);
-    if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1) {
+    const sobranteVaASaldoFavor = sfSobranteActivo && (bancario?._sobranteDeposito ?? 0) > MINIMO_SOBRANTE_SF;
+    if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1
+      && m.reglaNombre !== REGLA_SF_COBRANZA && !sobranteVaASaldoFavor) {
       const diferencia = Math.round((bancario.montoBancoReal - debeCargo) * 100) / 100;
       const depositoDeEsteCobro = bancario._montoAplicado != null
         ? Math.abs(bancario._montoAplicado - debeCargo) < 0.005
@@ -4385,7 +4408,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
     bloques = [{
       tipoVenta: null,
       movs:      esPagos
-        ? anotarCargosPorFacturaSinAgrupar(movimientos, 20, verdadBancaria, nombresClientes)
+        ? anotarCargosPorFacturaSinAgrupar(movimientos, 20, verdadBancaria, nombresClientes, { fechaPoliza: fechaFinal })
         : ordenarCargoAntesDeAbono(movimientos),
       folio:     overrides.folioContado   ?? poliza.numero,
       concepto:  overrides.conceptoContado ?? poliza.concepto,

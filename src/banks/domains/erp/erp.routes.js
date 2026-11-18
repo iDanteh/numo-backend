@@ -2726,19 +2726,19 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 // /sync-erp-kore/recompute más abajo, y el cron nuevo en banks/jobs/erpSyncCron.js.
 //
 // Alcance, deliberadamente angosto:
-// - Movimientos NO `identificado` (no_identificado/reclasificado/otros): se ignoran por
-//   completo — cero consultas a Kore, cero escritura. Ya no hay ningún camino automático
-//   para que un movimiento se identifique solo; identificar sigue siendo 100% una acción
-//   humana (UI, cobro-panel, Solicitudes de Cobro).
-// - Movimientos YA `identificado` (cobrados/aplicados): se les recupera ÚNICAMENTE
-//   erpLinks[].folioFiscal si sigue null y sigue dentro de la ventana de 60 días
-//   (_folioFiscalDentroDeVentanaReintento, sin cambios) — nada más se toca. Ni siquiera
-//   movimientosKore/tieneRetencion/saldoActual se refrescan.
+// - CUALQUIER status (identificado/no_identificado/reclasificado/otros) es candidato —
+//   ampliado 2026-11-18: una CxC puede tener un erpLink real con folioFiscal pendiente aunque
+//   el movimiento no haya alcanzado 'identificado' todavía (ej. sobrante sin resolver que
+//   supera ERP_TOLERANCE), y Kore ya puede traer el folio fiscal igual. Identificar sigue
+//   siendo 100% una acción humana — este job NUNCA toca status ni ningún campo de saldo.
+// - Para CADA link con folioFiscal null dentro de la ventana de 60 días
+//   (_folioFiscalDentroDeVentanaReintento, sin cambios) se recupera ÚNICAMENTE
+//   erpLinks[].folioFiscal — nada más se toca. Ni siquiera movimientosKore/tieneRetencion/
+//   saldoActual/status se refrescan.
 async function _recuperarFolioFiscalJob(auth0Sub, jobId, fechaInicio, fechaFin) {
   syncCurrentJobId = jobId;
   try {
     const filter = {
-      status: 'identificado',
       erpLinks: { $elemMatch: { serie: { $ne: null }, folioExterno: { $ne: null }, folioFiscal: null } },
     };
     if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };

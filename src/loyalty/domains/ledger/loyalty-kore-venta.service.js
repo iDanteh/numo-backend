@@ -90,6 +90,7 @@ const { toCents, fromCents, calcularPuntos, normalizarTelefono } = require('../.
 const configService = require('../config/loyalty-config.service');
 const { _resolverCentroCostoPorSerieFolio, _obtenerCentroCosto, _aplicarMovimiento } = require('./loyalty-ledger.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
+const { findByAuth0Sub } = require('../../../banks/domains/users/user.service');
 const { logger } = require('../../../shared/utils/logger');
 const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 
@@ -106,9 +107,10 @@ const REINTENTOS_DELAYS_MS = [500, 1500]; // 3 intentos en total (1 + 2 reintent
 const _sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // `usuarioAplicaNombre` desapareció del contrato (2026-11-06) — el ledger sigue queriendo un
-// `usuarioNombre` legible para el detalle de movimientos, así que se usa un valor fijo descriptivo,
-// mismo criterio que `ACTOR_WEBHOOK` en loyalty-kore-cliente.service.js. `usuarioId` SÍ sigue
-// viniendo real (`abono.usuarioAplicaId`).
+// `usuarioNombre` legible para el detalle de movimientos. Mientras no se pueda resolver el sub real
+// (ver `_resolverUsuarioNombre` abajo), se usa este valor fijo descriptivo como fallback, mismo
+// criterio que `ACTOR_WEBHOOK` en loyalty-kore-cliente.service.js. `usuarioId` SÍ sigue viniendo real
+// (`abono.usuarioAplicaId`).
 const USUARIO_NOMBRE_WEBHOOK = 'Kore (webhook venta)';
 
 function _refAcumulacion(serieFolio, idAbono) { return `${serieFolio}:${idAbono}:ACUMULACION`; }
@@ -307,6 +309,30 @@ function _respuestaIdempotenteAbono(idAbono, filas) {
 }
 
 /**
+ * Resuelve `abono.usuarioAplicaId` a un nombre real de SOLO LECTURA, mediante `findByAuth0Sub`
+ * (nunca crea un usuario — a diferencia de `resolveUser`/`findOrCreate` del flujo manual, acá el sub
+ * puede no tener ningún usuario real registrado en Numo). El adaptador interno de Solicitudes de
+ * Cobro manda en este mismo campo un `_id` de Mongo en vez de un sub de Auth0 (ver
+ * collection-request.service.js) — `findByAuth0Sub` simplemente no encuentra nada para ese formato y
+ * cae al fallback, sin romper nada. Cacheado en `estado` (compartido entre TODOS los abonos del
+ * mismo request): varios abonos de la misma CxC suelen compartir el mismo cajero.
+ */
+async function _resolverUsuarioNombre(usuarioAplicaId, estado) {
+  estado.usuariosResueltos = estado.usuariosResueltos || {};
+  if (usuarioAplicaId in estado.usuariosResueltos) return estado.usuariosResueltos[usuarioAplicaId];
+
+  let nombre = USUARIO_NOMBRE_WEBHOOK;
+  try {
+    const user = await findByAuth0Sub(usuarioAplicaId);
+    if (user?.nombre) nombre = user.nombre;
+  } catch (err) {
+    logger.warn(`[loyalty-kore-venta] No se pudo resolver usuarioAplicaId "${usuarioAplicaId}" a nombre: ${err.message}`);
+  }
+  estado.usuariosResueltos[usuarioAplicaId] = nombre;
+  return nombre;
+}
+
+/**
  * Aplica UN abono nuevo (nunca antes visto) dentro de su propio savepoint (`t` ya es la transacción
  * del savepoint, no la del request completo — ver el caller). Puede lanzar `BadRequestError` (tarjeta
  * inactiva, saldo insuficiente) o `SequelizeUniqueConstraintError` (carrera) — ambos los maneja el
@@ -315,6 +341,8 @@ function _respuestaIdempotenteAbono(idAbono, filas) {
 async function _procesarUnAbonoNuevo({
   t, card, datos, abono, estado, centroCosto, participaLealtad, concepto, pctNivelInfo, promoVigente,
 }) {
+  const usuarioNombre = await _resolverUsuarioNombre(abono.usuarioAplicaId, estado);
+
   // ── Canje: gate independiente, se resuelve ANTES que la acumulación ──────
   let formaPuntosLinea = null;
   const formasResueltas = [];
@@ -401,7 +429,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refCanje(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 
@@ -420,7 +448,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refAcumulacion(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 
@@ -440,7 +468,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refPromocion(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 

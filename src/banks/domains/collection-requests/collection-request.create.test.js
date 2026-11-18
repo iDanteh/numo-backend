@@ -210,12 +210,19 @@ describe('create() — formas de pago de saldo a favor / anticipo', () => {
 // monedero de puntos, a diferencia de ErpSaldoFavor — ver tipoSaldoEspecial en
 // collection-request-erp-links.js, 2026-11-18).
 describe('create() — forma de pago "Puntos"', () => {
-  test('"Puntos" sin saldosAplicados -> BadRequestError', async () => {
+  // Bug real 2026-11-18: la primera versión de este cambio EXIGÍA saldosAplicados también
+  // para 'puntos' — rompía identificar() de solicitudes ya creadas (antes de que 'puntos'
+  // existiera como tipoSaldoEspecial) al hacer cr.save(), aunque nada de esas solicitudes
+  // hubiera cambiado. Fix: autocompletar con el importe completo en vez de exigirlo — no
+  // hay nada que el llamador deba elegir para "puntos" (a diferencia de saldo_favor/anticipo).
+  test('"Puntos" sin saldosAplicados -> se autocompleta con el importe completo, crea normalmente', async () => {
     const data = validData({
       formasPago: [{ formaPagoId: 'fp-1', formaPagoDescripcion: 'PUNTOS', importe: 955.02 }],
     });
-    await expect(service.create(data)).rejects.toThrow(/requiere saldosAplicados/);
-    expect(CollectionRequest.create).not.toHaveBeenCalled();
+    await expect(service.create(data)).resolves.toBeDefined();
+    const [payload] = CollectionRequest.create.mock.calls[0];
+    const puntos = payload.formasPago.find(f => f.formaPagoDescripcion === 'PUNTOS');
+    expect(puntos.saldosAplicados).toEqual([{ monto: 955.02 }]);
   });
 
   test('saldosAplicados con monto <= 0 -> BadRequestError', async () => {

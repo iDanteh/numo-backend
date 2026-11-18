@@ -301,6 +301,15 @@ collectionRequestSchema.pre('validate', function (next) {
     const tipo = tipoSaldoEspecial(f);
     if (!tipo) continue;
     const exigeId = tipo !== 'puntos';
+    // "Puntos" no tiene nada que el llamador deba elegir (a diferencia de saldo_favor/
+    // anticipo, donde el id identifica QUÉ registro de Kore se usó) — el monto SIEMPRE es
+    // el importe completo de esta línea. Autocompletar acá en vez de exigirlo evita romper
+    // documentos ya guardados ANTES de que 'puntos' existiera como tipoSaldoEspecial (bug
+    // real 2026-11-18: identificar() de una solicitud vieja fallaba al hacer cr.save() con
+    // este mismo pre('validate'), aunque nada de esa solicitud hubiera cambiado).
+    if (tipo === 'puntos' && !f.saldosAplicados?.length) {
+      f.saldosAplicados = [{ monto: f.importe }];
+    }
     if (!f.saldosAplicados?.length) {
       return next(new Error(
         `La forma de pago "${f.formaPagoDescripcion}" requiere saldosAplicados (${exigeId ? 'id + ' : ''}monto de cada ${tipo === 'puntos' ? 'puntos' : 'saldo a favor/anticipo'} usado)`,

@@ -39,6 +39,9 @@ jest.mock('../config/loyalty-config.service', () => ({
 jest.mock('./loyalty-venta-fallida.service', () => ({
   registrarVentaFallida: jest.fn(),
 }));
+jest.mock('../../../banks/domains/users/user.service', () => ({
+  findByAuth0Sub: jest.fn(),
+}));
 // Notificación en vivo (2026-11-10) — ver mismo criterio en loyalty-kore-cliente.service.test.js.
 jest.mock('../../../banks/shared/socket', () => ({ emitToLoyaltyCard: jest.fn() }));
 
@@ -49,6 +52,7 @@ const { sequelize } = require('../../../config/database.postgres');
 const centrosCostoService = require('../../../banks/domains/centros-costo/centros-costo.service');
 const configService = require('../config/loyalty-config.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
+const { findByAuth0Sub } = require('../../../banks/domains/users/user.service');
 const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 const ventaService = require('./loyalty-kore-venta.service');
 
@@ -123,6 +127,9 @@ beforeEach(() => {
     if (where.koreId === 'FP-PUNTOS') return Promise.resolve({ koreId: 'FP-PUNTOS', acumulaPuntos: false, esPuntos: true });
     return Promise.resolve(null);
   });
+  // Por default nadie matchea (sub de Auth0 sin usuario real en Numo) — cada test que quiera
+  // probar la resolución real sobreescribe esto puntualmente.
+  findByAuth0Sub.mockResolvedValue(null);
 });
 
 describe('consultarSaldoKore', () => {
@@ -182,6 +189,26 @@ describe('procesarVentaKore — validación', () => {
   it('404 si la tarjeta no existe', async () => {
     LoyaltyCard.findOne.mockResolvedValue(null);
     await expect(ventaService.procesarVentaKore(PAYLOAD_BASE)).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+describe('procesarVentaKore — resolución de usuarioNombre (Auth0 sub -> nombre real)', () => {
+  it('usa el nombre real cuando usuarioAplicaId matchea un usuario de Numo', async () => {
+    mockCard(makeCard());
+    findByAuth0Sub.mockResolvedValue({ nombre: 'Juan Pérez' });
+    await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    expect(findByAuth0Sub).toHaveBeenCalledWith('U1');
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.usuarioNombre).toBe('Juan Pérez');
+    expect(filaNivel.usuarioId).toBe('U1');
+  });
+
+  it('cae al nombre fijo "Kore (webhook venta)" si el sub no tiene usuario real en Numo', async () => {
+    mockCard(makeCard());
+    findByAuth0Sub.mockResolvedValue(null);
+    await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.usuarioNombre).toBe('Kore (webhook venta)');
   });
 });
 

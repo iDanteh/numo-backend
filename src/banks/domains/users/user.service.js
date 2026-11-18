@@ -40,6 +40,16 @@ async function findOrCreate({ auth0Sub, nombre, email }) {
   return newUser;
 }
 
+/**
+ * Busca un usuario por su auth0Sub de SOLO LECTURA — a diferencia de findOrCreate(), nunca crea un
+ * registro nuevo si no existe. Usado por integraciones server-to-server (ej. el webhook de venta de
+ * Kore en Lealtad) que reciben un sub de Auth0 de un sistema externo y solo quieren mostrar un nombre
+ * legible SI ese sub ya tiene un usuario real en Numo — crear uno fantasma ahí sería incorrecto.
+ */
+async function findByAuth0Sub(auth0Sub) {
+  return userRepo.findByAuth0Sub(auth0Sub);
+}
+
 async function listUsers() {
   return userRepo.findAll();
 }
@@ -156,4 +166,6 @@ async function updateSucursales(id, sucursalIds, todas = false) {
   return user;
 }
 
-module.exports = { findOrCreate, listUsers, updateRole, toggleActive, updateEmpresas, updateExtraPermissions, updateSucursales };
+module.exports = {
+  findOrCreate, findByAuth0Sub, listUsers, updateRole, toggleActive, updateEmpresas, updateExtraPermissions, updateSucursales,
+};

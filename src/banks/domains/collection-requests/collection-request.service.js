@@ -182,6 +182,11 @@ async function create(data, files = []) {
     const tipo = tipoSaldoEspecial(f);
     if (!tipo) return false;
     const exigeId = tipo !== 'puntos';
+    // Mismo autocompletado que el pre('validate') del modelo — "puntos" no tiene nada
+    // que elegir, el monto es siempre el importe completo de la línea.
+    if (tipo === 'puntos' && !f.saldosAplicados.length) {
+      f.saldosAplicados = [{ monto: f.importe }];
+    }
     if (!f.saldosAplicados.length) return true;
     if (f.saldosAplicados.some(s => (exigeId && !s.id) || !(s.monto > 0))) return true;
     const suma = Math.round(f.saldosAplicados.reduce((s, x) => s + x.monto, 0) * 100) / 100;

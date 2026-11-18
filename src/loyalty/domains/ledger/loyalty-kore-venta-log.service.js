@@ -10,7 +10,13 @@
  * loyalty-kore-venta.routes.js, mismo criterio que el resto de la auditoría
  * no-bloqueante de este proyecto (emisión de socket, etc.).
  */
-const { Op } = require('sequelize');
+// cast/col/where son exports nombrados del paquete `sequelize`, igual que Op. `where` se importa
+// como `sequelizeWhere` porque la función listarVentasLog ya usa `where` como nombre de su objeto
+// de condiciones — con el mismo nombre, el `const where = {}` local taparía el import (TDZ) y
+// romperia la llamada a la función de Sequelize.
+const {
+  Op, cast, col, where: sequelizeWhere,
+} = require('sequelize');
 const { LoyaltyKoreVentaLog } = require('../../../shared/models/postgres');
 const { BadRequestError } = require('../../../shared/errors/AppError');
 
@@ -39,10 +45,11 @@ async function registrarVentaLog({
  * Lista logs de venta Kore, más recientes primero. Todos los filtros son opcionales.
  *
  * @param {{resultado?: 'exito'|'error', endpoint?: 'venta'|'ventas', desde?: string,
- *          hasta?: string, limit?: number, offset?: number}} filtros
+ *          hasta?: string, limit?: number, offset?: number, serieFolio?: string,
+ *          telefono?: string, puntosAbonados?: string}} filtros
  */
 async function listarVentasLog({
-  resultado, endpoint, desde, hasta, limit, offset,
+  resultado, endpoint, desde, hasta, limit, offset, serieFolio, telefono, puntosAbonados,
 } = {}) {
   if (resultado && !['exito', 'error'].includes(resultado)) {
     throw new BadRequestError('resultado debe ser "exito" o "error".');
@@ -62,6 +69,15 @@ async function listarVentasLog({
     if (desdeFecha) where.createdAt[Op.gte] = desdeFecha;
     if (hastaFecha) where.createdAt[Op.lte] = hastaFecha;
   }
+
+  // Búsqueda de texto sobre el payload crudo: serieFolio/telefono/puntosAbonados
+  // viven en niveles distintos del JSON según endpoint ('venta' vs 'ventas' en lote),
+  // así que no hay un único JSON path exacto; ILIKE sobre payload::text cubre ambas formas.
+  const condicionesTexto = [];
+  if (serieFolio) condicionesTexto.push(sequelizeWhere(cast(col('payload'), 'text'), { [Op.iLike]: `%${serieFolio}%` }));
+  if (telefono) condicionesTexto.push(sequelizeWhere(cast(col('payload'), 'text'), { [Op.iLike]: `%${telefono}%` }));
+  if (puntosAbonados) condicionesTexto.push(sequelizeWhere(cast(col('payload'), 'text'), { [Op.iLike]: `%${puntosAbonados}%` }));
+  if (condicionesTexto.length) where[Op.and] = condicionesTexto;
 
   const limitFinal = Number(limit) > 0 ? Math.min(Number(limit), LIMITE_MAX) : LIMITE_DEFAULT;
   const offsetFinal = Number(offset) > 0 ? Number(offset) : 0;

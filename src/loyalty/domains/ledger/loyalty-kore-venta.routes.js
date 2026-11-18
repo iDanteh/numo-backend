@@ -355,8 +355,12 @@ router.get('/ventas-canceladas-con-deposito', authenticate, permit(PERMISSIONS.L
 // GET /auditoria/eventos-seguridad (loyalty.routes.js), para que viva en la misma pestaña de
 // "Auditoría de Lealtad" del frontend.
 router.get('/ventas-log', authenticate, permit(PERMISSIONS.LOYALTY_AUDITORIA), asyncHandler(async (req, res) => {
-  const { resultado, endpoint, desde, hasta, limit, offset } = req.query ?? {};
-  res.json(await ventaLogService.listarVentasLog({ resultado, endpoint, desde, hasta, limit, offset }));
+  const {
+    resultado, endpoint, desde, hasta, limit, offset, serieFolio, telefono, puntosAbonados,
+  } = req.query ?? {};
+  res.json(await ventaLogService.listarVentasLog({
+    resultado, endpoint, desde, hasta, limit, offset, serieFolio, telefono, puntosAbonados,
+  }));
 }));
 
 /**

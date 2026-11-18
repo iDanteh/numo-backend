@@ -1,7 +1,7 @@
 'use strict';
 
-// Corrida automática diaria: SOLO recuperar folio fiscal de CxC ya identificadas/cobradas
-// pendientes de timbrar (2026-09-21, decisión explícita del usuario — ver
+// Corrida automática diaria: SOLO recuperar folio fiscal de CxC con erpLink pendiente de
+// timbrar, sin importar el status del movimiento (2026-09-21, ampliado 2026-11-18 — ver
 // _recuperarFolioFiscalJob en erp.routes.js para el motivo completo: ningún job automático
 // debe volver a recalcular saldoErp/status de ningún movimiento). Antes disparaba
 // runErpSyncAutomatico() (Sync Saldo ERP → Recalcular saldo ERP encadenado) — esa función

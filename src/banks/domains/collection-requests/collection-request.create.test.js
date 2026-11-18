@@ -205,6 +205,65 @@ describe('create() — formas de pago de saldo a favor / anticipo', () => {
   });
 });
 
+// ── Puntos (monedero Club Tuberos) — mismo saldosAplicados que saldo a favor/
+// anticipo, pero SIN exigir `id` (Kore no expone un registro puntual para el
+// monedero de puntos, a diferencia de ErpSaldoFavor — ver tipoSaldoEspecial en
+// collection-request-erp-links.js, 2026-11-18).
+describe('create() — forma de pago "Puntos"', () => {
+  test('"Puntos" sin saldosAplicados -> BadRequestError', async () => {
+    const data = validData({
+      formasPago: [{ formaPagoId: 'fp-1', formaPagoDescripcion: 'PUNTOS', importe: 955.02 }],
+    });
+    await expect(service.create(data)).rejects.toThrow(/requiere saldosAplicados/);
+    expect(CollectionRequest.create).not.toHaveBeenCalled();
+  });
+
+  test('saldosAplicados con monto <= 0 -> BadRequestError', async () => {
+    const data = validData({
+      formasPago: [{
+        formaPagoId: 'fp-1', formaPagoDescripcion: 'PUNTOS', importe: 955.02,
+        saldosAplicados: [{ monto: 0 }],
+      }],
+    });
+    await expect(service.create(data)).rejects.toThrow(/requiere saldosAplicados/);
+  });
+
+  test('suma de saldosAplicados no coincide con el importe -> BadRequestError', async () => {
+    const data = validData({
+      formasPago: [{
+        formaPagoId: 'fp-1', formaPagoDescripcion: 'PUNTOS', importe: 955.02,
+        saldosAplicados: [{ monto: 500 }],
+      }],
+    });
+    await expect(service.create(data)).rejects.toThrow(/requiere saldosAplicados/);
+  });
+
+  test('saldosAplicados válido SIN id (solo monto) -> crea normalmente', async () => {
+    const data = validData({
+      formasPago: [
+        { formaPagoId: 'fp-efectivo', formaPagoDescripcion: 'Efectivo', importe: 3000 },
+        {
+          formaPagoId: 'fp-puntos', formaPagoDescripcion: 'PUNTOS', importe: 955.02,
+          saldosAplicados: [{ monto: 955.02 }],
+        },
+      ],
+    });
+    await expect(service.create(data)).resolves.toBeDefined();
+    expect(CollectionRequest.create).toHaveBeenCalledTimes(1);
+  });
+
+  test('saldosAplicados con id presente también pasa (no debe romper si Kore lo manda)', async () => {
+    const data = validData({
+      formasPago: [{
+        formaPagoId: 'fp-1', formaPagoDescripcion: 'PUNTOS', importe: 955.02,
+        saldosAplicados: [{ id: 'monedero-irrelevante', monto: 955.02 }],
+      }],
+    });
+    await expect(service.create(data)).resolves.toBeDefined();
+    expect(CollectionRequest.create).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ── Modo 2 (varias CxC, siempre del mismo cliente) ──────────────────────────
 
 describe('create() — Modo 2 (varias CxC)', () => {

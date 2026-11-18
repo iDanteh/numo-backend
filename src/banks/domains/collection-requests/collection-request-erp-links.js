@@ -28,8 +28,14 @@ function esFormaBancaria(f) {
 }
 
 // Puerto exacto de esSaldoEspecial() en cobro-panel.component.ts — clasifica una
-// forma de pago como saldo a favor / anticipo, los dos únicos tipos que requieren
-// un id de Kore + monto específico (ver formasPago[].saldosAplicados en el modelo).
+// forma de pago como saldo a favor / anticipo / puntos, los tipos que requieren
+// saldosAplicados (ver formasPago[].saldosAplicados en el modelo). Saldo a favor y
+// anticipo exigen `id` (registro puntual ErpSaldoFavor en Kore); "puntos" (monedero
+// Club Tuberos, 2026-11-18) NO — Kore no expone un registro con id propio para el
+// monedero, solo manda el monto por forma de pago (ver payload real de /venta: forma
+// de pago "PUNTOS" trae el id de CATÁLOGO genérico, no un id de saldo puntual) —
+// saldosAplicados para 'puntos' es auditoría/trazabilidad local (monto), igual que
+// para sus hermanos sigue siendo auditoría local, nunca se manda de vuelta a Kore.
 // "Compensación" se detecta en el frontend pero no maneja id/monto propio — viaja
 // como forma de pago normal en DetalleFormaPago, sin entrada en saldosAFavorAUsar/
 // anticipos, así que aquí no se clasifica como caso especial.
@@ -37,6 +43,7 @@ function tipoSaldoEspecial(f) {
   const n = normFormaPago(f?.formaPagoDescripcion);
   if (n.includes('saldo a favor')) return 'saldo_favor';
   if (n === 'anticipo') return 'anticipo';
+  if (n.includes('puntos')) return 'puntos';
   return null;
 }
 

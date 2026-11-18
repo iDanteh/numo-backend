@@ -3,7 +3,8 @@
 // erp.routes.recuperarFolioFiscal.test.js — cubre _recuperarFolioFiscalJob() y el
 // apagado de /sync-erp-kore y /sync-erp-kore/recompute (2026-09-21, decisión explícita
 // del usuario: ningún job automático debe volver a tocar saldoErp/status de ningún
-// movimiento — solo se recupera folioFiscal de CxC ya identificadas/cobradas). Archivo
+// movimiento — solo se recupera folioFiscal, sin importar el status, ampliado 2026-11-18).
+// Archivo
 // separado de erp.routes.test.js para poder mockear BankMovement.model limpio, sin
 // arriesgar los demás tests de ese archivo (que corren contra el modelo real, sin mock,
 // confiando en que nunca tocan Mongo de verdad).
@@ -76,7 +77,7 @@ describe('POST /sync-erp-kore y /sync-erp-kore/recompute — DESHABILITADAS (202
   });
 });
 
-describe('_recuperarFolioFiscalJob — alcance angosto (solo folioFiscal de movimientos ya identificado)', () => {
+describe('_recuperarFolioFiscalJob — alcance angosto (solo folioFiscal, cualquier status)', () => {
   function mockCandidatos(docs) {
     const lean = jest.fn().mockResolvedValue(docs);
     const select = jest.fn().mockReturnValue({ lean });
@@ -84,15 +85,35 @@ describe('_recuperarFolioFiscalJob — alcance angosto (solo folioFiscal de movi
     return { select, lean };
   }
 
-  test('el filtro de Mongo exige status:identificado + al menos un link con serie/folioExterno/folioFiscal:null', async () => {
+  test('el filtro de Mongo NO exige status — solo al menos un link con serie/folioExterno/folioFiscal:null', async () => {
     mockCandidatos([]);
     await router._recuperarFolioFiscalJob(null, 'job-1', null, null);
 
     const filtro = BankMovement.find.mock.calls[0][0];
-    expect(filtro.status).toBe('identificado');
+    expect(filtro.status).toBeUndefined();
     expect(filtro.erpLinks.$elemMatch).toEqual({
       serie: { $ne: null }, folioExterno: { $ne: null }, folioFiscal: null,
     });
+  });
+
+  test('recupera folioFiscal de un movimiento no_identificado (sobrante sin resolver) sin tocar status/saldo', async () => {
+    mockCandidatos([{
+      _id: 'mov-no-id', folio: '056358', banco: 'BBVA', concepto: 'x', deposito: 7522.03, fecha: new Date(),
+      status: 'no_identificado',
+      erpLinks: [{ erpId: 'erp-no-id', serie: 'C0', folioExterno: '261100192', folioFiscal: null, conciliacionFinalizadaAt: null }],
+      identificadoPor: [{ erpId: 'erp-no-id', userId: 'user-1', fechaId: new Date() }],
+    }]);
+    sincronizarCuentasPendientes.mockResolvedValue({ raw: [{ folioFiscal: '79488C6B-E344-491F-934B-6D61E5B49C89' }] });
+    BankMovement.updateOne.mockResolvedValue({});
+
+    await router._recuperarFolioFiscalJob(null, 'job-no-id', null, null);
+
+    expect(BankMovement.updateOne).toHaveBeenCalledTimes(1);
+    const [filtro, update] = BankMovement.updateOne.mock.calls[0];
+    expect(filtro).toEqual({ _id: 'mov-no-id', 'erpLinks.erpId': 'erp-no-id' });
+    expect(update.$set).toEqual({ 'erpLinks.$.folioFiscal': '79488C6B-E344-491F-934B-6D61E5B49C89' });
+    expect(update.$set).not.toHaveProperty('saldoErp');
+    expect(update.$set).not.toHaveProperty('status');
   });
 
   test('cuando Kore devuelve un folioFiscal real, se escribe SOLO erpLinks.$.folioFiscal (nunca saldoErp/status)', async () => {

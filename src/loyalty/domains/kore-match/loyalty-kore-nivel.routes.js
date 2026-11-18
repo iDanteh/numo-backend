@@ -19,6 +19,57 @@ const nivelService = require('./loyalty-kore-nivel.service');
 
 const router = express.Router();
 
+/**
+ * @swagger
+ * /api/loyalty/kore/niveles:
+ *   post:
+ *     tags: [Lealtad Kore - Niveles]
+ *     summary: Alta, ajuste o baja de un nivel del catálogo de Kore
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             description: Payload de alta/ajuste/baja de nivel.
+ *           examples:
+ *             alta:
+ *               summary: Alta de nivel
+ *               value:
+ *                 evento: "alta"
+ *                 koreId: "n4"
+ *                 nombre: "Platino"
+ *                 porcentaje: 7.5
+ *                 estatus: true
+ *             actualizacion:
+ *               summary: Actualización de nivel
+ *               value:
+ *                 evento: "actualizacion"
+ *                 koreId: "n1"
+ *                 porcentaje: 2
+ *                 estatus: true
+ *             baja:
+ *               summary: Baja de nivel
+ *               value:
+ *                 evento: "baja"
+ *                 koreId: "n4"
+ *     responses:
+ *       200:
+ *         description: Nivel procesado.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               ok: true
+ *               evento: "alta"
+ *               nivelId: 58
+ *               creado: true
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/niveles', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await nivelService.procesarNivelKore(req.body));
 }));

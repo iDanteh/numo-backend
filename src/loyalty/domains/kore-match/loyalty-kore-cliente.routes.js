@@ -20,6 +20,59 @@ const clienteService = require('./loyalty-kore-cliente.service');
 
 const router = express.Router();
 
+/**
+ * @swagger
+ * /api/loyalty/kore/clientes:
+ *   post:
+ *     tags: [Lealtad Kore - Clientes]
+ *     summary: Alta, baja o actualización de un cliente del catálogo de Kore
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             description: Payload de alta/baja/actualización de cliente Kore.
+ *           examples:
+ *             alta:
+ *               summary: Alta de cliente
+ *               value:
+ *                 evento: "alta"
+ *                 koreClienteId: "KORE-CLI-00981"
+ *                 telefono: "9511771923"
+ *                 nombre: "María López Hernández"
+ *                 nivel: "Bronce"
+ *             actualizacion:
+ *               summary: Actualización de cliente
+ *               value:
+ *                 evento: "actualizacion"
+ *                 koreClienteId: "KORE-CLI-00981"
+ *                 telefono: "9511779900"
+ *                 nombre: "María López Hernández"
+ *                 activo: true
+ *                 nivel: "Bronce"
+ *             baja:
+ *               summary: Baja de cliente
+ *               value:
+ *                 evento: "baja"
+ *                 koreClienteId: "KORE-CLI-00981"
+ *     responses:
+ *       200:
+ *         description: Cliente procesado.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               ok: true
+ *               evento: "alta"
+ *               cardId: 1842
+ *               creada: true
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/clientes', verifyKoreApiKey, asyncHandler(async (req, res) => {
   // Diagnóstico temporal (2026-11-05): no había forma de correlacionar un 409/404 de este
   // webhook con el payload real que lo disparó — los logs de error solo traían el stack y la

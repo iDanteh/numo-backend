@@ -76,6 +76,41 @@ const limiterSolicitarCanje = rateLimit({
   store: new RedisStore({ prefix: 'rl:loyalty-canje-solicitar:', sendCommand: (...args) => redisClient.sendCommand(args) }),
 });
 
+/**
+ * @swagger
+ * /api/loyalty/kore/saldo:
+ *   get:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Consulta el saldo de puntos de un cliente
+ *     security:
+ *       - apiKeyAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: telefono
+ *         schema:
+ *           type: string
+ *           example: "9511771923"
+ *         description: Teléfono del cliente. Requerido si no se envía koreClienteId.
+ *       - in: query
+ *         name: koreClienteId
+ *         schema:
+ *           type: string
+ *           example: "1134"
+ *         description: ID del cliente en Kore. Requerido si no se envía telefono.
+ *     responses:
+ *       200:
+ *         description: Saldo de puntos del cliente.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               tieneTarjeta: true
+ *               saldoDisponible: 1250.00
+ *               nivel: "Plata"
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.get('/saldo', verifyKoreApiKey, asyncHandler(async (req, res) => {
   const { telefono, koreClienteId } = req.query ?? {};
   res.json(await ventaService.consultarSaldoKore({ telefono, koreClienteId }));
@@ -85,6 +120,59 @@ router.get('/saldo', verifyKoreApiKey, asyncHandler(async (req, res) => {
 // loyalty-kore-venta-log.service.js): registra CADA request real de Kore a /venta y /ventas, con
 // su resultado — nunca bloquea ni cambia la respuesta real del webhook (si el log falla, se traga
 // el error, mismo criterio que la emisión de socket en otros webhooks de Lealtad).
+/**
+ * @swagger
+ * /api/loyalty/kore/venta:
+ *   post:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Procesa una venta (acumulación/canje de puntos)
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             description: Payload de venta de Kore.
+ *           example:
+ *             telefono: "9511771923"
+ *             koreClienteId: "1134"
+ *             serieFolio: "A0-261100034"
+ *             conceptoId: "5fbd63472ab0c60001c64692"
+ *             metodoPago: "PUE"
+ *             abonos:
+ *               - idAbono: "6aee0e1b2ff6fb0001f89db0"
+ *                 fecha: "2026-11-06T17:27:55.620246Z"
+ *                 subtotal: 579.3621
+ *                 total: 672.06
+ *                 formasPago:
+ *                   - formaPagoId: "5f85d826acfcf300018a088a"
+ *                     importe: 672.06
+ *                 usuarioAplicaId: "auth0|6494db046ee6f0aa8795c14e"
+ *                 puntosAbonados: 8.69
+ *     responses:
+ *       200:
+ *         description: Venta procesada.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               serieFolio: "A0-261100034"
+ *               status: "aplicado"
+ *               puntosDescontados: 0
+ *               puntosAcumulados: 8.69
+ *               saldoResultante: 108.69
+ *               abonos:
+ *                 - idAbono: "6aee0e1b2ff6fb0001f89db0"
+ *                   success: true
+ *                   status: "aplicado"
+ *                   puntosDescontados: 0
+ *                   puntosAcumulados: 8.69
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
   // Diagnóstico (2026-11-17, pedido explícito del usuario) — mismo criterio que
   // loyalty-kore-cliente.routes.js: loguear el payload real de Kore para poder inspeccionar el
@@ -102,6 +190,66 @@ router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
   }
 }));
 
+/**
+ * @swagger
+ * /api/loyalty/kore/ventas:
+ *   post:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Procesa un lote de ventas (acumulación/canje de puntos)
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               ventas:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   description: Payload de venta de Kore (mismo formato que POST /venta).
+ *           example:
+ *             ventas:
+ *               - telefono: "9511771923"
+ *                 serieFolio: "A1-260605500"
+ *                 conceptoId: "5fbbe696d6cdbf0001adde15"
+ *                 metodoPago: "PUE"
+ *                 abonos:
+ *                   - idAbono: "6aee0d412ff6fb0001f89d55"
+ *                     fecha: "2026-10-27T12:00:00Z"
+ *                     subtotal: 1000.00
+ *                     total: 1160.00
+ *                     formasPago:
+ *                       - formaPagoId: "5f85d826acfcf300018a088a"
+ *                         importe: 1160.00
+ *                     usuarioAplicaId: "auth0|6494db046ee6f0aa8795c14e"
+ *                     puntosAbonados: 15.00
+ *     responses:
+ *       200:
+ *         description: Lote de ventas procesado.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               resultados:
+ *                 - serieFolio: "A1-260605500"
+ *                   success: true
+ *                   status: "aplicado"
+ *                   puntosDescontados: 0
+ *                   puntosAcumulados: 15.00
+ *                   saldoResultante: 115.00
+ *                   abonos:
+ *                     - idAbono: "6aee0d412ff6fb0001f89d55"
+ *                       success: true
+ *                       status: "aplicado"
+ *                       puntosDescontados: 0
+ *                       puntosAcumulados: 15.00
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
   logger.info('[KoreVentaWebhook] payload recibido (/ventas)', req.body);
   try {
@@ -116,6 +264,69 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
   }
 }));
 
+/**
+ * @swagger
+ * /api/loyalty/kore/venta-cancelada:
+ *   post:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Avisa que Kore canceló una venta ya procesada
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               serieFolio:
+ *                 type: string
+ *               serieFolioCancelacion:
+ *                 type: string
+ *               tipoCancelacion:
+ *                 type: string
+ *               importeCancelado:
+ *                 type: number
+ *               montoVenta:
+ *                 type: number
+ *               motivoCancelacion:
+ *                 type: string
+ *               clienteId:
+ *                 type: string
+ *               nombreCliente:
+ *                 type: string
+ *           examples:
+ *             cancelacionTotal:
+ *               summary: Cancelación total de la venta
+ *               value:
+ *                 serieFolio: "A0-260605320"
+ *                 serieFolioCancelacion: "A0-900000001"
+ *                 tipoCancelacion: "total"
+ *                 motivoCancelacion: "cliente canceló la compra"
+ *             cancelacionParcial:
+ *               summary: Devolución parcial de la venta
+ *               value:
+ *                 serieFolio: "A0-260605320"
+ *                 serieFolioCancelacion: "A0-900000002"
+ *                 tipoCancelacion: "parcial"
+ *                 importeCancelado: 200.00
+ *                 motivoCancelacion: "devolución parcial de mercancía"
+ *     responses:
+ *       200:
+ *         description: Cancelación procesada.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               ok: true
+ *               revertido: true
+ *               tipoCancelacion: "total"
+ *               puntosRevertidos: "-60.00"
+ *               saldoResultante: 140
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/venta-cancelada', verifyKoreApiKey, asyncHandler(async (req, res) => {
   const {
     serieFolio, serieFolioCancelacion, tipoCancelacion, importeCancelado,
@@ -148,10 +359,78 @@ router.get('/ventas-log', authenticate, permit(PERMISSIONS.LOYALTY_AUDITORIA), a
   res.json(await ventaLogService.listarVentasLog({ resultado, endpoint, desde, hasta, limit, offset }));
 }));
 
+/**
+ * @swagger
+ * /api/loyalty/kore/canje/solicitar-codigo:
+ *   post:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Solicita un código de autorización de un solo uso para canjear puntos
+ *     description: Limitado a 3 solicitudes / 15 min por teléfono.
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               telefono:
+ *                 type: string
+ *           example:
+ *             telefono: "5512345678"
+ *     responses:
+ *       200:
+ *         description: Código generado y enviado al cliente.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               mensaje: "Código enviado"
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ *       429:
+ *         description: Demasiadas solicitudes de código para este teléfono.
+ */
 router.post('/canje/solicitar-codigo', verifyKoreApiKey, limiterSolicitarCanje, asyncHandler(async (req, res) => {
   res.json(await canjeCodigoService.solicitarCodigoCanje(req.body?.telefono));
 }));
 
+/**
+ * @swagger
+ * /api/loyalty/kore/canje/validar-codigo:
+ *   post:
+ *     tags: [Lealtad Kore - Venta]
+ *     summary: Valida el código de autorización para canjear puntos en una venta
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               telefono:
+ *                 type: string
+ *               codigo:
+ *                 type: string
+ *           example:
+ *             telefono: "5512345678"
+ *             codigo: "483920"
+ *     responses:
+ *       200:
+ *         description: Código válido.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               valido: true
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/canje/validar-codigo', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await canjeCodigoService.validarCodigoCanje(req.body?.telefono, req.body?.codigo));
 }));

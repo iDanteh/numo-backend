@@ -36,6 +36,8 @@ const helmet = require('helmet');
 const cors = require('cors');
 const compression = require('compression');
 const morgan = require('morgan');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpec = require('./swagger');
 const { checkPostgresOk } = require('../shared/utils/db-health');
 const socketMgr = require('../banks/shared/socket');
 const errorHandler = require('../shared/middleware/error-handler');
@@ -68,6 +70,16 @@ app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) }
 app.use('/api/loyalty/kore', loyaltyKoreVentaRoutes);
 app.use('/api/loyalty/kore', loyaltyKoreClienteRoutes);
 app.use('/api/loyalty/kore', loyaltyKoreNivelRoutes);
+
+// Swagger UI (2026-11-18, pedido explícito del usuario): entorno interactivo para que Kore
+// pueda probar los webhooks en vez de depender solo de Insomnia/Postman o el PDF estático.
+// `res.removeHeader` quita el CSP restrictivo que `helmet()` ya puso arriba SOLO para esta
+// ruta — swagger-ui-express sirve HTML/JS inline que ese CSP por defecto bloquea. El resto del
+// gateway (los webhooks JSON) sigue con el CSP de helmet intacto.
+app.use('/api-docs', (_req, res, next) => {
+  res.removeHeader('Content-Security-Policy');
+  next();
+}, swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 // Health check propio — solo Postgres, nunca Mongo (este proceso no la usa).
 // Docker usa este endpoint para marcar el contenedor como healthy/unhealthy,

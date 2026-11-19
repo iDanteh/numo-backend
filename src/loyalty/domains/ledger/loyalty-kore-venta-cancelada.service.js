@@ -148,18 +148,35 @@ function _validarPayloadCancelacion(payload) {
 
 /**
  * Resuelve `montoVentaOriginal` (en pesos) para prorratear una cancelación
- * parcial. Fuente autoritativa: la fila ACUMULACION ya guardada (nunca se
- * recalcula a partir de lo que reenvíe Kore). Si no existe (venta 100% CANJE,
- * nunca acumuló puntos nuevos), cae al `montoVenta` del body — ahí no hay 2
- * fuentes de verdad en conflicto porque Numo nunca tuvo una propia. Lanza
- * `ConflictError` (409) si ambas fuentes existen y no coinciden dentro de
- * `TOLERANCIA_PESOS`.
+ * parcial. Fuente autoritativa: la SUMA de todas las filas ACUMULACION ya
+ * guardadas (nunca se recalcula a partir de lo que reenvíe Kore). Si no existe
+ * ninguna (venta 100% CANJE, nunca acumuló puntos nuevos), cae al `montoVenta`
+ * del body — ahí no hay 2 fuentes de verdad en conflicto porque Numo nunca
+ * tuvo una propia. Lanza `ConflictError` (409) si ambas fuentes existen y no
+ * coinciden dentro de `TOLERANCIA_PESOS`.
+ *
+ * FIX 2026-11-19 (bug real encontrado leyendo el código, no hipotético):
+ * `loyalty-kore-venta.service.js` puede generar 2+ filas ACUMULACION para el
+ * MISMO `serieFolio` cuando la CxC tiene varios abonos (una por `idAbono`,
+ * cada una con su propio `montoVenta = abono.subtotal` — ver
+ * `_procesarUnAbonoNuevo`). Antes este resolver tomaba (`.find()`) solo la
+ * PRIMERA fila, usando el subtotal de un solo abono como si fuera "el monto
+ * total de la venta" que pide la sección 6 del contrato — con 2+ abonos, la
+ * fracción de cualquier cancelación parcial quedaba mal calculada.
+ *
+ * LIMITACIÓN CONOCIDA que este fix NO resuelve: un abono que no calificó para
+ * acumular (ej. pagado 100% con una forma de pago que no suma puntos) no deja
+ * ninguna fila ACUMULACION — su subtotal sigue siendo invisible acá, así que
+ * la suma puede seguir subestimando el monto real de la venta si la CxC tiene
+ * abonos mixtos (algunos acumulan, otros no). Resolverlo del todo requiere
+ * trackear el subtotal de cada abono que llega, califique o no, en algún
+ * lugar durable — queda como pendiente de diseño aparte.
  */
 function _resolverMontoVentaOriginal({ originales, montoVentaBody }) {
-  const filaAcumulacion = originales.find((f) => f.tipo === 'ACUMULACION' && f.montoVenta != null);
+  const filasAcumulacion = originales.filter((f) => f.tipo === 'ACUMULACION' && f.montoVenta != null);
 
-  if (filaAcumulacion) {
-    const montoVentaOriginal = Number(filaAcumulacion.montoVenta);
+  if (filasAcumulacion.length) {
+    const montoVentaOriginal = filasAcumulacion.reduce((acc, f) => acc + Number(f.montoVenta), 0);
     if (montoVentaBody != null && Math.abs(montoVentaOriginal - montoVentaBody) > TOLERANCIA_PESOS) {
       throw new ConflictError(
         `El montoVenta recibido ($${montoVentaBody}) no coincide con el monto de la venta original guardado ($${montoVentaOriginal}).`,

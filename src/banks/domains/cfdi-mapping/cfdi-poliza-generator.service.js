@@ -2894,11 +2894,11 @@ async function _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, 
     satStatus:         'Vigente',
     isActive:          true,
     ...(serie ? { serie } : {}),
-  }).select('uuid documentosRelacionados receptor metodoPago serie folio fecha').lean();
+  }).select('uuid documentosRelacionados receptor metodoPago formaPago serie folio fecha').lean();
 
   const uuids = satCfdis.map(c => c.uuid);
   const erpCfdis = uuids.length
-    ? await CFDI.find({ uuid: { $in: uuids }, source: 'ERP' }).select('uuid documentosRelacionados metodoPago').lean()
+    ? await CFDI.find({ uuid: { $in: uuids }, source: 'ERP' }).select('uuid documentosRelacionados metodoPago formaPago').lean()
     : [];
   const erpMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
 
@@ -2920,6 +2920,7 @@ async function _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, 
         ...c,
         documentosRelacionados: erp?.documentosRelacionados ?? c.documentosRelacionados ?? [],
         metodoPago:             c.metodoPago ?? erp?.metodoPago ?? null,
+        formaPago:              c.formaPago ?? erp?.formaPago ?? null,
       };
     })
     .filter(c => c.documentosRelacionados.length > 0);

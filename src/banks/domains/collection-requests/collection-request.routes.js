@@ -78,6 +78,97 @@ router.post('/analyze',
 // (Kore) directamente, autenticado con API key, no con sesión Numo. El campo
 // multipart es "comprobantes" (repetido una vez por archivo) — antes era
 // "comprobante" (singular); Kore debe actualizar su integración.
+/**
+ * @swagger
+ * /api/collection-requests:
+ *   post:
+ *     tags: [Solicitudes de Cobro - Kore]
+ *     summary: Crea una solicitud de cobro (ERP → Numo)
+ *     description: >
+ *       Lo llama Kore directamente, autenticado con API key (no hay sesión Numo).
+ *       Idempotente por `solicitudIdErp`: un reintento con el mismo valor regresa
+ *       la solicitud ya creada, sin duplicar nada.
+ *
+ *
+ *       **`telefono` y `cxcs[].subtotal` habilitan la acumulación de puntos de
+ *       Lealtad** (ver `integracion-kore-puntos-lealtad`, sección 8). Si
+ *       `telefono` no viene, la solicitud se crea y se cobra con total
+ *       normalidad, pero NUNCA intenta acumular puntos — "cero costo" por
+ *       diseño, sin ningún error. Si `telefono` sí viene pero una CxC no trae
+ *       `subtotal` (numérico > 0) junto con `serie`/`folioExterno`, esa CxC
+ *       puntual se omite de la acumulación, también en silencio. Ninguno de
+ *       los dos casos se refleja en la respuesta de este endpoint ni en la de
+ *       `/identificar` — usá el ejemplo de respuesta de abajo para confirmar
+ *       con un request real si estos dos campos están llegando.
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required: [cxcs, formasPago, solicitudIdErp, usuarioSolicitanteId]
+ *             properties:
+ *               cxcs:
+ *                 type: string
+ *                 description: >
+ *                   Arreglo (JSON stringificado) de CxC a cobrar. Cada elemento
+ *                   admite `subtotal` (opcional, numérico > 0) — sin él, esa CxC
+ *                   no participa en la acumulación de puntos aunque `telefono`
+ *                   sí venga.
+ *                 example: '[{"erpId":"CXC-9981","serie":"E0","folioExterno":"261100018","subtotal":1724.14}]'
+ *               formasPago:
+ *                 type: string
+ *                 description: Arreglo (JSON stringificado) de formas de pago del cobro.
+ *                 example: '[{"formaPagoId":"5fa572ddee58480001d04586","formaPagoDescripcion":"TRANSFERENCIA","importe":1000}]'
+ *               descripcion:
+ *                 type: string
+ *               conceptoId:
+ *                 type: string
+ *               telefono:
+ *                 type: string
+ *                 description: >
+ *                   Teléfono del cliente final (10 dígitos), a nivel SOLICITUD
+ *                   (no por CxC — todas las CxC de una misma solicitud son del
+ *                   mismo cliente). Es la llave que habilita todo el bloque de
+ *                   acumulación de puntos; sin este campo, cualquier `subtotal`/
+ *                   `puntosAbonados` que traigan las CxC queda sin efecto.
+ *                 example: "9511771923"
+ *               solicitudIdErp:
+ *                 type: string
+ *                 description: ID propio de la solicitud en Kore — clave de idempotencia.
+ *               usuarioSolicitanteId:
+ *                 type: string
+ *               usuarioSolicitanteNombre:
+ *                 type: string
+ *               comprobantes:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                   format: binary
+ *                 description: Hasta 6 comprobantes (JPG/PNG/WEBP/GIF/PDF), campo repetido.
+ *     responses:
+ *       201:
+ *         description: >
+ *           Solicitud creada (o la ya existente, si `solicitudIdErp` ya se
+ *           había usado). Revisá `telefono` y `cxcs[].subtotal` en la
+ *           respuesta — si vienen `null` pese a haberlos mandado en el
+ *           request, algo en el payload no los está transmitiendo.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               _id: "6afe205c6a35f9a9ae048058"
+ *               status: "pendiente"
+ *               telefono: null
+ *               cxcs: [{ serie: "E0", folioExterno: "261100018", subtotal: null }]
+ *       400:
+ *         description: Datos inválidos (ver mensaje de error).
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/',
   verifyKoreApiKey,
   uploadComprobante.array('comprobantes', MAX_COMPROBANTES),
@@ -188,6 +279,28 @@ router.get('/mias/report', authenticate, permit('collections:read'), asyncHandle
 // estado de la solicitud que él mismo creó, autenticado con su API key (no hay
 // sesión Numo). Debe ir antes de /:id para que Express no intente matchear
 // "erp" como si fuera un _id de Mongo.
+/**
+ * @swagger
+ * /api/collection-requests/erp/{solicitudIdErp}:
+ *   get:
+ *     tags: [Solicitudes de Cobro - Kore]
+ *     summary: Consulta el estado de una solicitud por el ID que Kore le asignó
+ *     security:
+ *       - apiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: solicitudIdErp
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Solicitud encontrada.
+ *       404:
+ *         description: No existe ninguna solicitud con ese solicitudIdErp.
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.get('/erp/:solicitudIdErp', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await service.getByErpId(req.params.solicitudIdErp));
 }));
@@ -198,6 +311,39 @@ router.get('/erp/:solicitudIdErp', verifyKoreApiKey, asyncHandler(async (req, re
 // en este router (API key, no sesión Auth0/Numo). Body: { canceladoPorUserId,
 // canceladoPorNombre } — la identidad del usuario de Kore que confirmó la
 // cancelación, para mostrar "Cancelado por el usuario X" en la bandeja.
+/**
+ * @swagger
+ * /api/collection-requests/erp/{solicitudIdErp}/cancelar:
+ *   post:
+ *     tags: [Solicitudes de Cobro - Kore]
+ *     summary: Kore avisa que canceló la CxC de su lado mientras la solicitud seguía pendiente en Numo
+ *     security:
+ *       - apiKeyAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: solicitudIdErp
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               canceladoPorUserId:
+ *                 type: string
+ *               canceladoPorNombre:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Solicitud marcada como cancelada.
+ *       404:
+ *         description: No existe ninguna solicitud con ese solicitudIdErp.
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/erp/:solicitudIdErp/cancelar', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await service.cancelarPorErp(req.params.solicitudIdErp, req.body));
 }));
@@ -211,6 +357,52 @@ router.post('/erp/:solicitudIdErp/cancelar', verifyKoreApiKey, asyncHandler(asyn
 // `origenCuentaId` — el `id` de la CxC que generó el excedente (Kore no conoce
 // el solicitudIdErp de Numo, pero SIEMPRE tiene a mano el id de esa CxC). Debe
 // ir antes de /:id para que Express no intente matchear "erp" como un _id.
+/**
+ * @swagger
+ * /api/collection-requests/erp/anticipos-generados:
+ *   post:
+ *     tags: [Solicitudes de Cobro - Kore]
+ *     summary: Kore avisa que generó un anticipo por sobrepago de una CxC cobrada vía Solicitudes de Cobro
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [origenCuentaId]
+ *             description: El objeto "Cuenta" del anticipo tal cual Kore ya lo arma, más `origenCuentaId`.
+ *             properties:
+ *               id:
+ *                 type: string
+ *               serie:
+ *                 type: string
+ *               folio:
+ *                 type: string
+ *               serieExterna:
+ *                 type: string
+ *               folioExterno:
+ *                 type: string
+ *               total:
+ *                 type: number
+ *               fechaCreacion:
+ *                 type: string
+ *               personaId:
+ *                 type: string
+ *               nombrePersona:
+ *                 type: string
+ *               anotacion:
+ *                 type: string
+ *               origenCuentaId:
+ *                 type: string
+ *                 description: El `id` de la CxC que generó el excedente.
+ *     responses:
+ *       201:
+ *         description: Anticipo registrado.
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/erp/anticipos-generados', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.status(201).json(await anticipoGeneradoService.registrarAnticipoGenerado(req.body));
 }));

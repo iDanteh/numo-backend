@@ -108,6 +108,18 @@ function _esSaldoAFavor(fp) {
   return /saldo\s*a\s*favor/i.test(fp?.nombre ?? '');
 }
 
+// "ANTICIPO" (claveSat 30, mismo que SF) = aplicación de un anticipo OPA a la
+// venta — no es dinero cobrado. El cargo de la factura (Reg 22C "Factura
+// Final Anticipo") ya lo da el cierre OPA (Cargo Anticipos 2103010001 + IVA
+// 2104010002) en la póliza vendedora; si además se generara aquí el "cobro de
+// otra sucursal" la venta quedaba pagada dos veces (caso real 19-nov,
+// COMERCIALIZADORA TORCA B0-261100630 / factura B0-261100265, Hidalgo 4-nov:
+// OPA-01338 aplicado en la caja de Construcasa → Cargo extra $1,805.39 a
+// Bancos por identificar).
+function _esAnticipoOPA(fp) {
+  return /^\s*anticipo\s*$/i.test(fp?.nombre ?? '');
+}
+
 // "PUNTOS" = monedero electrónico Club Tuberos aplicado como forma de pago —
 // mismo principio que Saldo a Favor (reduce un pasivo existente, no es
 // dinero nuevo), pero cuenta distinta (2103090002, Anticipos Otros Club
@@ -892,7 +904,7 @@ async function construirMovimientosPuente({
         const cfdisEncontrados = await CFDI.find({
           'emisor.rfc': rfc,
           $or: queryPairs,
-        }).select('serie folio receptor metodoPago uuid').lean();
+        }).select('serie folio receptor metodoPago formaPago uuid').lean();
         // OJO: la colección CFDI puede tener MÁS DE UN documento para el mismo
         // uuid/serie/folio (un "stub" incompleto sincronizado antes que el CFDI
         // completo, ej. sin `metodoPago` — confirmado con el usuario
@@ -1300,6 +1312,7 @@ async function construirMovimientosPuente({
         : 0;
       const montoCobroRepartir = Math.round((montoCobro - montoSFYaCubiertoDeEsteCobro) * 100) / 100;
       let acumulado = 0;
+      let montoAnticipoOmitido = 0;
       // `lineas`: cada forma de pago se convierte en 1 línea contable, EXCEPTO
       // "saldo a favor", que se parte en 2 (subtotal a cuentaSaldoFavorId, IVA
       // a cuentaIvaSaldoFavorId) — ver encabezado del archivo. `esSF: true`
@@ -1320,6 +1333,16 @@ async function construirMovimientosPuente({
         // corregido, para que la suma total siga cuadrando con `montoCobro`.
         if (_esSaldoAFavor(fp) && montoSFReal != null) montoAsignado = montoSFReal;
         acumulado += montoAsignado;
+
+        // Anticipo OPA aplicado a una factura con forma de pago 30 (Reg 22C,
+        // trae su propio cierre OPA): sin línea (ver `_esAnticipoOPA`). Si la
+        // factura es de otra forma de pago (ej. 01 con pago mixto efectivo +
+        // anticipo, casos ABASUR I0-261100074 / B0-261006113) NO hay cierre
+        // OPA y esta línea es el único Cargo de esa porción — se deja.
+        if (_esAnticipoOPA(fp) && String(cfdiOriginal?.formaPago ?? '').trim() === '30') {
+          if (montoAsignado > 0) montoAnticipoOmitido += montoAsignado;
+          return;
+        }
 
         if (_esSaldoAFavor(fp)) {
           if (!cuentaSaldoFavorId || !cuentaIvaSaldoFavorId || montoAsignado <= 0) return;
@@ -1398,7 +1421,15 @@ async function construirMovimientosPuente({
           formaPago:   (fp.claveSat ?? '').trim() || null,
         });
       });
-      if (!lineas.length) continue;
+      if (!lineas.length) {
+        // Cobro 100% anticipo OPA: sin renglones, y se limpia la fila que una
+        // corrida anterior pudo haber dejado en la cola de la cobradora.
+        if (montoAnticipoOmitido > 0 && !esPPD && cobro.folioOrigen
+            && centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
+          await _sincronizarCobroSucursalPendiente({ rfc, folioOrigen: cobro.folioOrigen, centroCostoIdDestino: null, lineas: [] });
+        }
+        continue;
+      }
 
       // PPD (Crédito): el cierre de la CxC cobrada en otra sucursal es
       // responsabilidad exclusiva de Cobranza, nunca de Ingreso — antes este
@@ -1420,8 +1451,8 @@ async function construirMovimientosPuente({
           const uuidUpper = cfdiOriginal.uuid.toUpperCase();
           const prevCubierto = facturasVendedorCubiertas.get(uuidUpper) ?? { monto: 0, detalle: [] };
           facturasVendedorCubiertas.set(uuidUpper, {
-            monto: parseFloat((prevCubierto.monto + montoCobro).toFixed(2)),
-            detalle: [...prevCubierto.detalle, { serieVenta: cuenta.serieVenta ?? null, folioVenta: cuenta.folioVenta ?? null, monto: montoCobro }],
+            monto: parseFloat((prevCubierto.monto + montoCobro - montoAnticipoOmitido).toFixed(2)),
+            detalle: [...prevCubierto.detalle, { serieVenta: cuenta.serieVenta ?? null, folioVenta: cuenta.folioVenta ?? null, monto: parseFloat((montoCobro - montoAnticipoOmitido).toFixed(2)) }],
           });
         }
         lineas.forEach(l => {

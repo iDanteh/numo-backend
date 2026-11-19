@@ -169,6 +169,27 @@ describe('procesarVentaCanceladaKore — parcial', () => {
     }), expect.anything());
   });
 
+  it('FIX 2026-11-19: suma el montoVenta de TODAS las filas ACUMULACION (CxC con 2+ abonos), no solo la primera', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    // CxC con 2 abonos: $600 (20 pts) + $400 (10 pts) = $1000 total, 30 pts neto. Antes del fix,
+    // _resolverMontoVentaOriginal tomaba SOLO el primer abono ($600) como "monto total de la
+    // venta" — acá se verifica que usa la suma real ($1000).
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      filaLedger({ tipo: 'ACUMULACION', puntos: '20.00', referenciaExterna: `${SF}:abono1:ACUMULACION`, montoVenta: '600.00' }),
+      filaLedger({ tipo: 'ACUMULACION', puntos: '10.00', referenciaExterna: `${SF}:abono2:ACUMULACION`, montoVenta: '400.00' }),
+    ]);
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '100.00' }));
+
+    // Cancela $200 (20% de los $1000 reales) -> debe revertir 20% de 30 pts = 6 pts.
+    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
+      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 200,
+    });
+
+    expect(res).toEqual({
+      ok: true, revertido: true, tipoCancelacion: 'parcial', puntosRevertidos: '-6.00', saldoResultante: 94,
+    });
+  });
+
   it('usa el montoVenta del body cuando no hay fila ACUMULACION guardada (venta 100% CANJE)', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([

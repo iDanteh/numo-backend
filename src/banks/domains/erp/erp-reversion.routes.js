@@ -30,6 +30,13 @@ const REFERENCIA_REGEX = /^[0-9a-fA-F]{24}$/;
  *       Responde de inmediato con el conteo de movimientos afectados (ya se conoce sin
  *       reconsultar Kore) y sigue el procesamiento real (reconsulta + ajuste + auditoría) en
  *       segundo plano, sin mantener la conexión de Kore abierta.
+ *
+ *       Si el payload incluye `referencia`, Numo también revierte — de forma best-effort e
+ *       independiente del resultado bancario — los puntos de Lealtad que ese abono puntual
+ *       haya generado o descontado (acumulación y/o canje), siempre que ese abono haya tenido
+ *       algún efecto de lealtad. No tiene efecto si el abono nunca generó puntos, si ya fue
+ *       revertido antes (reintentos son seguros), o si una cancelación de venta total ya lo
+ *       cubrió previamente.
  *     security:
  *       - apiKeyAuth: []
  *     requestBody:
@@ -49,7 +56,12 @@ const REFERENCIA_REGEX = /^[0-9a-fA-F]{24}$/;
  *                 type: string
  *               referencia:
  *                 type: string
- *                 description: ObjectId (24 hex) del movimiento bancario, si Kore lo conoce.
+ *                 description: >
+ *                   ObjectId (24 hex) del movimiento bancario, si Kore lo conoce. Es también el
+ *                   `idAbono` que Kore usa en `POST /api/loyalty/kore/venta` — cuando se incluye,
+ *                   Numo lo usa para ubicar y revertir el efecto de Lealtad de ESE abono puntual
+ *                   (ver arriba). Puede venir aun cuando `monto` es 0 (abono sin aporte bancario
+ *                   real, p. ej. pagado con efectivo + puntos).
  *               motivo:
  *                 type: string
  *               fecha:

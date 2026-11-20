@@ -36,20 +36,22 @@ const router = express.Router();
  *             description: Payload de alta/ajuste/baja de nivel.
  *           examples:
  *             alta:
- *               summary: Alta de nivel
+ *               summary: Alta de nivel (incluye color opcional, best-effort)
  *               value:
  *                 evento: "alta"
  *                 koreId: "n4"
  *                 nombre: "Platino"
  *                 porcentaje: 7.5
  *                 estatus: true
+ *                 color: "#C0C0C0"
  *             actualizacion:
- *               summary: Actualización de nivel
+ *               summary: Actualización de nivel (incluye color opcional, best-effort)
  *               value:
  *                 evento: "actualizacion"
  *                 koreId: "n1"
  *                 porcentaje: 2
  *                 estatus: true
+ *                 color: "#CD7F32"
  *             baja:
  *               summary: Baja de nivel
  *               value:

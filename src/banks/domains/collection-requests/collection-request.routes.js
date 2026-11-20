@@ -114,18 +114,24 @@ router.post('/analyze',
  *                 type: string
  *                 description: >
  *                   Arreglo (JSON stringificado) de CxC a cobrar. Cada elemento
- *                   admite `subtotal` (opcional, numérico > 0) — sin él, esa CxC
- *                   no participa en la acumulación de puntos aunque `telefono`
- *                   sí venga.
- *                 example: '[{"erpId":"CXC-9981","serie":"E0","folioExterno":"261100018","subtotal":1724.14}]'
+ *                   admite, opcionalmente además de `erpId`/`serie`/`folioExterno`,
+ *                   `subtotal` (numérico > 0 — sin él, esa CxC no participa en la
+ *                   acumulación de puntos aunque `telefono` sí venga) y
+ *                   `puntosAbonados` (si Kore ya trae el pre-cálculo de puntos de
+ *                   esa CxC, Numo lo usa directo en vez de recalcularlo).
+ *                 example: '[{"erpId":"CXC-9981","serie":"E0","folioExterno":"261100018","subtotal":1724.14,"puntosAbonados":8.69}]'
  *               formasPago:
  *                 type: string
  *                 description: Arreglo (JSON stringificado) de formas de pago del cobro.
  *                 example: '[{"formaPagoId":"5fa572ddee58480001d04586","formaPagoDescripcion":"TRANSFERENCIA","importe":1000}]'
  *               descripcion:
  *                 type: string
+ *                 description: Opcional — si no viene, Numo genera una descripción por defecto con el solicitante y la fecha.
+ *                 example: "Cobro de factura E0-261100018"
  *               conceptoId:
  *                 type: string
+ *                 description: Opcional — ID del concepto de la venta en el catálogo de Kore. Sin él, el cobro no puede aplicarse automáticamente en Kore al identificar.
+ *                 example: "5fbd63472ab0c60001c64692"
  *               telefono:
  *                 type: string
  *                 description: >
@@ -142,6 +148,8 @@ router.post('/analyze',
  *                 type: string
  *               usuarioSolicitanteNombre:
  *                 type: string
+ *                 description: Opcional — se usa en la descripción autogenerada cuando `descripcion` no viene.
+ *                 example: "Juan Pérez"
  *               comprobantes:
  *                 type: array
  *                 items:

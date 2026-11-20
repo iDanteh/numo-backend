@@ -284,3 +284,25 @@ test('acumuladoDesde: busca desde esa fecha y no hace la búsqueda de anteriores
   const filtro = BankMovement.find.mock.calls[0][0];
   expect(filtro.$or[0].fecha).toEqual({ $gte: new Date('2026-01-01T00:00:00.000Z'), $lte: new Date('2026-10-30T23:59:59.999Z') });
 });
+
+// 2026-11-20 (factura A0-261110111): el vínculo en Bancos
+// aún no trae el UUID de la factura → se liga por la remisión que la ampara.
+test('uuidPorRemision liga depósitos sin folioFiscal por su remisión', async () => {
+  const FACT = '6C2D6D4C-DE8A-48A2-9AF1-DA9A7E3E5288';
+  BankMovement.find.mockReturnValue({ lean: async () => [
+    { folio: '056001', banco: 'BBVA', fecha: '2026-11-20', concepto: 'SPEI RECIBIDOSANTANDER', deposito: 9120.85,
+      erpLinks: [{ folioFiscal: null, serie: 'A0', folioExterno: '261002627', saldoPagado: 9120.85, tipoPago: 'PPD' }] },
+  ] });
+  erp.obtenerDesglosesCobroAlmacen.mockResolvedValue([{ serieVenta: 'A0', folioVenta: '261002627', fechaCreacion: '2026-10-08' }]);
+  erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'CLIENTE CONSIGNACION', tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' });
+  const cfdisFact = [{ uuid: FACT, serie: 'A0', folio: '261110111', fecha: '2026-11-20T16:37:25Z', total: 9120.85, receptor: { rfc: 'XXXX010101XX1' } }];
+  const movs = [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: FACT }];
+
+  // Sin el mapa (como la póliza) no lo encuentra.
+  expect(await detectarMovimientosMostrador({ rfc: 'X', cfdis: cfdisFact, movimientos: movs })).toEqual([]);
+
+  const [f] = await detectarMovimientosMostrador({ rfc: 'X', cfdis: cfdisFact, movimientos: movs, uuidPorRemision: new Map([['A0|261002627', FACT]]) });
+  expect(f).toMatchObject({ folio: '261110111', esGlobal: false, totalAplicado: 9120.85 });
+  expect(f.depositos.map(d => [d.idNumo, d.remisiones, d.ppdPorFacturar])).toEqual([['056001', ['A0-261002627'], true]]);
+  expect(BankMovement.find.mock.calls[1][0].$or[1]).toEqual({ 'erpLinks.folioExterno': { $in: ['261002627'] } });
+});

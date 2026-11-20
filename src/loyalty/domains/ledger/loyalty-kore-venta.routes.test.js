@@ -21,9 +21,9 @@ jest.mock('./loyalty-kore-venta.service', () => ({
   procesarVentaKore: jest.fn(),
   procesarLoteVentasKore: jest.fn(),
 }));
-jest.mock('./loyalty-kore-venta-cancelada.service', () => ({
-  procesarVentaCanceladaKore: jest.fn(),
-  listarVentasCanceladasConDeposito: jest.fn(),
+jest.mock('./loyalty-kore-venta-retiro.service', () => ({
+  procesarVentaRetiroKore: jest.fn(),
+  listarVentasRetiradasConDeposito: jest.fn(),
 }));
 jest.mock('./loyalty-venta-fallida.service', () => ({
   listarVentasFallidas: jest.fn(),
@@ -75,7 +75,7 @@ const express = require('express');
 const request = require('supertest');
 const router = require('./loyalty-kore-venta.routes');
 const ventaService = require('./loyalty-kore-venta.service');
-const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
+const ventaRetiroService = require('./loyalty-kore-venta-retiro.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
 const canjeCodigoService = require('./loyalty-kore-canje.service');
 const ventaLogService = require('./loyalty-kore-venta-log.service');
@@ -165,12 +165,12 @@ describe('POST /ventas (lote)', () => {
   });
 });
 
-describe('POST /venta-cancelada', () => {
-  test('no requiere sesión Numo (solo verifyKoreApiKey, mockeado como no-op) y pasa serieFolio/motivoCancelacion al service', async () => {
-    ventaCanceladaService.procesarVentaCanceladaKore.mockResolvedValue({ ok: true, revertido: true });
-    const res = await request(freshApp()).post('/venta-cancelada').send({ serieFolio: 'A0-1', motivoCancelacion: 'cliente canceló' });
+describe('POST /venta-retiro', () => {
+  test('no requiere sesión Numo (solo verifyKoreApiKey, mockeado como no-op) y pasa serieFolio/motivoRetiro al service', async () => {
+    ventaRetiroService.procesarVentaRetiroKore.mockResolvedValue({ ok: true, revertido: true });
+    const res = await request(freshApp()).post('/venta-retiro').send({ serieFolio: 'A0-1', motivoRetiro: 'cliente canceló' });
     expect(res.status).toBe(200);
-    expect(ventaCanceladaService.procesarVentaCanceladaKore).toHaveBeenCalledWith({ serieFolio: 'A0-1', motivoCancelacion: 'cliente canceló' });
+    expect(ventaRetiroService.procesarVentaRetiroKore).toHaveBeenCalledWith({ serieFolio: 'A0-1', motivoRetiro: 'cliente canceló' });
     expect(res.body).toEqual({ ok: true, revertido: true });
   });
 });
@@ -270,15 +270,15 @@ describe('GET /ventas-log — requiere loyalty:auditoria, sesión Numo', () => {
   });
 });
 
-describe('GET /ventas-canceladas-con-deposito — requiere loyalty:config, sesión Numo', () => {
+describe('GET /ventas-retiradas-con-deposito — requiere loyalty:config, sesión Numo', () => {
   test('403 sin el permiso', async () => {
-    const res = await request(freshApp()).get('/ventas-canceladas-con-deposito');
+    const res = await request(freshApp()).get('/ventas-retiradas-con-deposito');
     expect(res.status).toBe(403);
   });
 
   test('200 con el permiso', async () => {
-    ventaCanceladaService.listarVentasCanceladasConDeposito.mockResolvedValue([]);
-    const res = await request(freshApp()).get('/ventas-canceladas-con-deposito').set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    ventaRetiroService.listarVentasRetiradasConDeposito.mockResolvedValue([]);
+    const res = await request(freshApp()).get('/ventas-retiradas-con-deposito').set(perms(PERMISSIONS.LOYALTY_CONFIG));
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
   });

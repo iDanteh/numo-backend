@@ -8,17 +8,19 @@
  * ese router es staff-only de punta a punta por diseño (ver su propio
  * docstring) y nunca debe mezclar autenticación por API key server-to-server.
  *
- * `GET /saldo`, `POST /venta`, `POST /ventas` y `POST /venta-cancelada` los llama
+ * `GET /saldo`, `POST /venta`, `POST /ventas` y `POST /venta-retiro` los llama
  * Kore (`verifyKoreApiKey`, mismo secreto que Solicitudes de Cobro/`cxc-reversiones`
  * — ver contrato en `Docs/integracion-kore-puntos-lealtad-DRAFT.md`). `POST /ventas`
  * (plural, 2026-10-27, pedido explícito del usuario) procesa varias ventas en un
  * solo request — ver `loyalty-kore-venta.service.js#procesarLoteVentasKore`; no
  * reemplaza a `POST /venta`, que sigue existiendo para una sola venta.
- * `POST /venta-cancelada` (2026-11-04, pedido explícito del usuario) avisa que Kore
- * canceló una venta ya procesada — ver
- * `loyalty-kore-venta-cancelada.service.js#procesarVentaCanceladaKore`.
+ * `POST /venta-retiro` (2026-11-04, pedido explícito del usuario; renombrado el
+ * 2026-11-20 desde su nombre anterior asociado a cancelación de venta — ver
+ * docstring de `loyalty-kore-venta-retiro.service.js`) avisa que Kore retiró (total o
+ * parcialmente) una venta ya procesada — ver
+ * `loyalty-kore-venta-retiro.service.js#procesarVentaRetiroKore`.
  * `GET /ventas-fallidas`, `PATCH /ventas-fallidas/:id/resolver` y
- * `GET /ventas-canceladas-con-deposito` son para el equipo de Numo (sesión
+ * `GET /ventas-retiradas-con-deposito` son para el equipo de Numo (sesión
  * staff normal, mismo permiso que el resto de Configuración de Lealtad) — sin
  * pantalla de Angular todavía, eso es un paso aparte.
  *
@@ -51,7 +53,7 @@ const { asyncHandler } = require('../../../shared/middleware/error-handler');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 const { logger } = require('../../../shared/utils/logger');
 const ventaService = require('./loyalty-kore-venta.service');
-const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
+const ventaRetiroService = require('./loyalty-kore-venta-retiro.service');
 const ventaFallidaService = require('./loyalty-venta-fallida.service');
 const canjeCodigoService = require('./loyalty-kore-canje.service');
 const ventaLogService = require('./loyalty-kore-venta-log.service');
@@ -382,10 +384,13 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
 
 /**
  * @swagger
- * /api/loyalty/kore/venta-cancelada:
+ * /api/loyalty/kore/venta-retiro:
  *   post:
  *     tags: [Lealtad Kore - Venta]
- *     summary: Avisa que Kore canceló una venta ya procesada
+ *     summary: Avisa que Kore retiró (total o parcialmente) una venta ya procesada
+ *     description: >
+ *       Kore NO debe incluir ningún campo de identidad (id Auth0, nombre) del usuario
+ *       que ejecuta el retiro de su lado — este endpoint no lo requiere ni lo persiste.
  *     security:
  *       - apiKeyAuth: []
  *     requestBody:
@@ -397,44 +402,44 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *             properties:
  *               serieFolio:
  *                 type: string
- *               serieFolioCancelacion:
+ *               serieFolioRetiro:
  *                 type: string
- *               tipoCancelacion:
+ *               tipoRetiro:
  *                 type: string
- *               importeCancelado:
+ *               importeRetirado:
  *                 type: number
  *               montoVenta:
  *                 type: number
- *               motivoCancelacion:
+ *               motivoRetiro:
  *                 type: string
  *               clienteId:
  *                 type: string
  *               nombreCliente:
  *                 type: string
  *           examples:
- *             cancelacionTotal:
- *               summary: Cancelación total de la venta (con los campos opcionales informativos)
+ *             retiroTotal:
+ *               summary: Retiro total de la venta (con los campos opcionales informativos)
  *               value:
  *                 serieFolio: "A0-260605320"
- *                 serieFolioCancelacion: "A0-900000001"
- *                 tipoCancelacion: "total"
- *                 motivoCancelacion: "cliente canceló la compra"
+ *                 serieFolioRetiro: "A0-900000001"
+ *                 tipoRetiro: "total"
+ *                 motivoRetiro: "cliente canceló la compra"
  *                 clienteId: "KORE-CLI-00981"
  *                 nombreCliente: "María López Hernández"
- *             cancelacionParcial:
+ *             retiroParcial:
  *               summary: Devolución parcial de la venta (con montoVenta opcional para chequeo de consistencia)
  *               value:
  *                 serieFolio: "A0-260605320"
- *                 serieFolioCancelacion: "A0-900000002"
- *                 tipoCancelacion: "parcial"
- *                 importeCancelado: 200.00
+ *                 serieFolioRetiro: "A0-900000002"
+ *                 tipoRetiro: "parcial"
+ *                 importeRetirado: 200.00
  *                 montoVenta: 1000.00
- *                 motivoCancelacion: "devolución parcial de mercancía"
+ *                 motivoRetiro: "devolución parcial de mercancía"
  *                 clienteId: "KORE-CLI-00981"
  *                 nombreCliente: "María López Hernández"
  *     responses:
  *       200:
- *         description: Cancelación procesada.
+ *         description: Retiro procesado.
  *         content:
  *           application/json:
  *             schema:
@@ -442,20 +447,20 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *             example:
  *               ok: true
  *               revertido: true
- *               tipoCancelacion: "total"
+ *               tipoRetiro: "total"
  *               puntosRevertidos: "-60.00"
  *               saldoResultante: 140
  *       401:
  *         description: X-Api-Key inválida o faltante.
  */
-router.post('/venta-cancelada', verifyKoreApiKey, asyncHandler(async (req, res) => {
+router.post('/venta-retiro', verifyKoreApiKey, asyncHandler(async (req, res) => {
   const {
-    serieFolio, serieFolioCancelacion, tipoCancelacion, importeCancelado,
-    montoVenta, motivoCancelacion, clienteId, nombreCliente,
+    serieFolio, serieFolioRetiro, tipoRetiro, importeRetirado,
+    montoVenta, motivoRetiro, clienteId, nombreCliente,
   } = req.body ?? {};
-  res.json(await ventaCanceladaService.procesarVentaCanceladaKore({
-    serieFolio, serieFolioCancelacion, tipoCancelacion, importeCancelado,
-    montoVenta, motivoCancelacion, clienteId, nombreCliente,
+  res.json(await ventaRetiroService.procesarVentaRetiroKore({
+    serieFolio, serieFolioRetiro, tipoRetiro, importeRetirado,
+    montoVenta, motivoRetiro, clienteId, nombreCliente,
   }));
 }));
 
@@ -468,8 +473,8 @@ router.patch('/ventas-fallidas/:id/resolver', authenticate, permit(PERMISSIONS.L
   res.json(await ventaFallidaService.marcarVentaFallidaResuelta(req.params.id, req.user));
 }));
 
-router.get('/ventas-canceladas-con-deposito', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
-  res.json(await ventaCanceladaService.listarVentasCanceladasConDeposito());
+router.get('/ventas-retiradas-con-deposito', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await ventaRetiroService.listarVentasRetiradasConDeposito());
 }));
 
 // Auditoría de pagos Kore (2026-11-17, pedido explícito del usuario) — mismo permiso que

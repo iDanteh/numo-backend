@@ -766,7 +766,7 @@ describe('listarMovimientosGlobal — reporte "Movimientos" (2026-10-29)', () =>
       include: [
         { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
         { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
-        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre'], 'serieFacturacion'] },
       ],
       order: [['createdAt', 'DESC']],
     });

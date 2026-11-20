@@ -646,7 +646,10 @@ async function listarMovimientosGlobal(filtros = {}) {
       // `attributes: ['nombre']` tal cual rompería contra Postgres real (columna inexistente);
       // se trae la columna real `sucursal` pero se alias-ea como `nombre` en el resultado para
       // no romper el contrato de API ya acordado con el frontend (`centroCosto.nombre`).
-      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+      // `serieFacturacion` (2026-11-20, pedido explícito del usuario): código del centro tal cual
+      // lo usa Kore (A0, B0, etc.) — para el reporte "Movimientos por centro", que agrupa por este
+      // código en vez de por el nombre de sucursal.
+      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre'], 'serieFacturacion'] },
     ],
     order: [['createdAt', 'DESC']],
   });

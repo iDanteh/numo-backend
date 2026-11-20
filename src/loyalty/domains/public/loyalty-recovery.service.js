@@ -46,9 +46,11 @@
  * confirmar el código OTP se emite un token de sesión (`consultaSesionTokenHash`
  * en LoyaltyCard, alta entropía — ver generarSesionToken/nip.util.js, NO es el
  * código OTP ni se compara con bcrypt) que permite "ver de nuevo" el saldo
- * (`verConsultaSesion`) hasta `SESION_USOS_INICIALES` veces más SIN pedir un
- * código nuevo — la vista que ya se muestra al confirmar el código no cuenta
- * contra ese número (1 vista por código + 3 por sesión = 4 totales,
+ * (`verConsultaSesion`) hasta un número configurable de veces más SIN pedir un
+ * código nuevo (`SESION_CONSULTA_USOS_MAX`, 2026-11-20, ver
+ * loyalty-config.service.js — default 3 si nunca se configuró, 0 deshabilita
+ * las vistas extra de verdad) — la vista que ya se muestra al confirmar el
+ * código no cuenta contra ese número (1 vista por código + N por sesión,
  * confirmado con el usuario). Al agotarse los usos, la sesión se limpia
  * (token/usos/expiración a null) para que no se pueda reusar aunque todavía
  * esté dentro de la ventana de tiempo. La misma sesión habilita
@@ -70,8 +72,9 @@
  * Límite mensual de consultas CON CÓDIGO (2026-11-09, pedido explícito del usuario, blindaje
  * adicional): tope configurable (`CONSULTA_CODIGO_MAX_MES`, ver loyalty-config.service.js) de
  * cuántos ciclos de código completos (`solicitarCodigo` + `confirmarCodigoConsulta` exitoso) puede
- * hacer UNA tarjeta por mes calendario (zona America/Mexico_City) — las 3 vistas de sesión NO
- * cuentan aparte, son parte del mismo ciclo. Preserva el threat model al 100%: si el límite ya se
+ * hacer UNA tarjeta por mes calendario (zona America/Mexico_City) — las vistas de sesión (número
+ * configurable, ver `SESION_CONSULTA_USOS_MAX` arriba) NO cuentan aparte, son parte del mismo
+ * ciclo. Preserva el threat model al 100%: si el límite ya se
  * alcanzó, `solicitarCodigo` simplemente NO genera un código real (deja `recuperacionCodigoHash`
  * intacto) pero devuelve el MISMO mensaje genérico de siempre — ningún campo, status ni timing
  * distinto hacia afuera. `confirmarCodigoConsulta` no necesita ningún chequeo nuevo: sin código
@@ -99,9 +102,10 @@ const configService = require('../config/loyalty-config.service');
 
 const CODIGO_VIGENCIA_MS = 10 * 60 * 1000;
 
-// Sesión de consulta post-código (2026-11-09) — ver docstring de arriba.
+// Sesión de consulta post-código (2026-11-09) — ver docstring de arriba. El número de usos ya NO
+// es fijo (2026-11-20): se resuelve en vivo vía configService.obtenerSesionConsultaUsosMax()
+// dentro de confirmarCodigoConsulta (default 3, 0 deshabilita las vistas extra).
 const SESION_VIGENCIA_MS = 15 * 60 * 1000;
-const SESION_USOS_INICIALES = 3;
 
 /**
  * Período "YYYY-MM" en zona America/Mexico_City — mismo patrón timezone-safe que `_hoyMexico()`
@@ -351,6 +355,11 @@ async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
   // plano SOLO en esta respuesta (igual que `codigoDev` arriba): nunca se vuelve a poder leer una
   // vez emitido, solo se guarda su hash.
   const sesionToken = generarSesionToken();
+  // Límite de consultas SIN código (2026-11-20) — resuelto UNA sola vez acá y reusado en los dos
+  // puntos de este método que antes usaban el fijo SESION_USOS_INICIALES (ver
+  // loyalty-config.service.js#obtenerSesionConsultaUsosMax: default 3, 0 deshabilita las vistas
+  // extra de verdad, nunca "ilimitado").
+  const usosMax = await configService.obtenerSesionConsultaUsosMax();
   // Límite mensual de consultas con código (2026-11-09) — el reset perezoso se PERSISTE acá (único
   // lugar que escribe estos 2 campos): si el período guardado ya no es el actual, arranca de 1 en
   // el período nuevo; si coincide, suma 1 al contador existente. Mismo update() que el resto de la
@@ -362,7 +371,7 @@ async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
   await card.update({
     ...CODIGO_CONSUMIDO,
     consultaSesionTokenHash:     hashSesionToken(sesionToken),
-    consultaSesionUsosRestantes: SESION_USOS_INICIALES,
+    consultaSesionUsosRestantes: usosMax,
     consultaSesionExpiraEn:      new Date(Date.now() + SESION_VIGENCIA_MS),
     ultimaConsultaAt:            new Date(),
     totalConsultas:              (card.totalConsultas || 0) + 1,
@@ -377,7 +386,7 @@ async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
   const movimientos = await ledgerService.listarMovimientosPublicos(card.id);
   return {
     nombre: card.nombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos, movimientos,
-    token: sesionToken, usosRestantes: SESION_USOS_INICIALES,
+    token: sesionToken, usosRestantes: usosMax,
     // Correo ya registrado en una sesión anterior (2026-11-09, si existe) — el frontend lo usa
     // para mostrar el campo ya bloqueado/opaco desde el primer vistazo, sin depender de que haya
     // pasado por guardarEmailConsulta() en ESTA misma sesión de navegador.

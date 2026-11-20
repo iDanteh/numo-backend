@@ -150,7 +150,8 @@ async function guardarCongelamientoMeses(meses, user) {
  * CONSULTA_CODIGO_MAX_MES (2026-11-09, pedido explícito del usuario) — blindaje adicional sobre
  * la consulta pública de puntos: tope de cuántos ciclos de código ("solicitar código" +
  * "confirmar código" exitoso) puede completar UNA tarjeta por mes calendario (zona
- * America/Mexico_City). Las vistas de sesión (3 extra sin código, ver loyalty-recovery.service.js)
+ * America/Mexico_City). Las vistas de sesión (extra sin código, cantidad configurable — ver
+ * SESION_CONSULTA_USOS_MAX más abajo, loyalty-recovery.service.js)
  * NO cuentan aparte — son parte del mismo ciclo ya contado. Mismo mecanismo que
  * CONGELAMIENTO_MESES (`GlobalConfig` sección `lealtad`, `tipo:'numero'`), idéntico criterio
  * deshabilitado = sin configurar o en 0 (D11: nunca default inventado).
@@ -181,6 +182,54 @@ async function guardarConsultaCodigoMaxMes(max, user) {
     tipo: 'numero', usuarioId, usuarioNombre,
   });
   return n > 0 ? n : null;
+}
+
+/**
+ * SESION_CONSULTA_USOS_MAX (2026-11-20, pedido explícito del usuario) — cuántas vistas EXTRA
+ * (sin pedir un código nuevo) puede hacer una tarjeta dentro de la sesión corta que abre
+ * `confirmarCodigoConsulta` (ver loyalty-recovery.service.js, `verConsultaSesion`). Mismo
+ * mecanismo que el resto (`GlobalConfig` sección `lealtad`, `tipo:'numero'`), pero con semántica
+ * DELIBERADAMENTE DISTINTA a CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES: acá vacío/sin
+ * configurar usa el default histórico **3** (el valor que antes vivía hardcodeado como
+ * `SESION_USOS_INICIALES`, para que una instalación sin tocar esta config no cambie de
+ * comportamiento), y **0 significa DESHABILITADO de verdad** (cada consulta exige un código
+ * nuevo) — nunca "ilimitado", a diferencia de la convención 0/vacío=sin-límite del resto de esta
+ * pantalla: "ilimitado" rompería el propósito de blindaje OTP de la sesión corta.
+ */
+const SESION_CONSULTA_USOS_MAX_DEFAULT = 3;
+
+function _validarSesionConsultaUsosMax(valor) {
+  if (valor === null || valor === undefined || valor === '') {
+    throw new BadRequestError('El límite de consultas sin código es requerido: un número entero mayor o igual a 0 (0 deshabilita las vistas extra).');
+  }
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestError('El límite de consultas sin código debe ser un número entero mayor o igual a 0 (0 deshabilita las vistas extra).');
+  }
+  return n;
+}
+
+/** Entero configurado, o el default (3) si nunca se guardó nada o el valor guardado es inválido
+ *  (defensivo, mismo criterio que obtenerCanjeCodigoVigenciaMin). Nunca null: a diferencia de
+ *  CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES, acá 0 es un valor real (deshabilitado), no la
+ *  señal de "sin configurar". */
+async function obtenerSesionConsultaUsosMax() {
+  const valor = await globalConfigService.getValue(SECTION, 'SESION_CONSULTA_USOS_MAX').catch(() => null);
+  if (valor === null) return SESION_CONSULTA_USOS_MAX_DEFAULT;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n >= 0) ? n : SESION_CONSULTA_USOS_MAX_DEFAULT;
+}
+
+/** Guarda el límite de consultas sin código. A diferencia de guardarCongelamientoMeses/
+ *  guardarConsultaCodigoMaxMes, acá NO admite null/undefined/vacío (no hay "deshabilitar
+ *  guardando vacío" — 0 ya es un valor explícito real con ese significado). */
+async function guardarSesionConsultaUsosMax(max, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarSesionConsultaUsosMax(max);
+  await globalConfigService.setValue(SECTION, 'SESION_CONSULTA_USOS_MAX', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n;
 }
 
 /**
@@ -219,6 +268,41 @@ async function guardarCanjeCodigoVigenciaMin(minutos, user) {
     tipo: 'numero', usuarioId, usuarioNombre,
   });
   return n;
+}
+
+/**
+ * PERMITIR_SALDO_NEGATIVO_CANJE (2026-11-20, pedido explícito del usuario, PROVISIONAL) — decisión
+ * de negocio consumida por `loyalty-kore-venta.service.js#_procesarUnAbonoNuevo`: si un abono de
+ * Kore pide descontar más puntos de los que tiene la tarjeta, por default (`false`, sin tocar
+ * esta config) se sigue bloqueando exactamente como hoy (`BadRequestError`). Si se activa
+ * (`true`), el abono se aplica igual (el saldo queda negativo) con una advertencia en la
+ * respuesta — reemplaza el CHECK `loyalty_cards_saldo_no_negativo` de Postgres (D4, eliminado a
+ * propósito, ver migración en shared/models/postgres/index.js): el control pasa a ser 100% de la
+ * app. Mismo mecanismo que el resto (`GlobalConfig` sección `lealtad`), pero `tipo:'booleano'`
+ * (ya contemplado en el STRING(20) de `GlobalConfig.tipo`, aunque ninguna otra config de este
+ * proyecto lo usaba todavía) en vez de `'numero'`. Fuera de alcance: `loyalty-ledger.service.js`
+ * (canje/ajuste manual de staff) sigue bloqueando saldo negativo siempre, esta config no lo toca.
+ */
+function _validarPermitirSaldoNegativoCanje(valor) {
+  if (typeof valor === 'boolean') return valor;
+  if (valor === 'true') return true;
+  if (valor === 'false') return false;
+  throw new BadRequestError('permitirSaldoNegativoCanje debe ser true o false.');
+}
+
+/** `false` (bloquea saldo negativo, comportamiento de siempre) si nunca se configuró nada. */
+async function obtenerPermitirSaldoNegativoCanje() {
+  const valor = await globalConfigService.getValue(SECTION, 'PERMITIR_SALDO_NEGATIVO_CANJE').catch(() => null);
+  return valor === 'true';
+}
+
+async function guardarPermitirSaldoNegativoCanje(valor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const habilitado = _validarPermitirSaldoNegativoCanje(valor);
+  await globalConfigService.setValue(SECTION, 'PERMITIR_SALDO_NEGATIVO_CANJE', String(habilitado), {
+    tipo: 'booleano', usuarioId, usuarioNombre,
+  });
+  return habilitado;
 }
 
 /**
@@ -796,8 +880,12 @@ module.exports = {
   guardarCongelamientoMeses,
   obtenerConsultaCodigoMaxMes,
   guardarConsultaCodigoMaxMes,
+  obtenerSesionConsultaUsosMax,
+  guardarSesionConsultaUsosMax,
   obtenerCanjeCodigoVigenciaMin,
   guardarCanjeCodigoVigenciaMin,
+  obtenerPermitirSaldoNegativoCanje,
+  guardarPermitirSaldoNegativoCanje,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

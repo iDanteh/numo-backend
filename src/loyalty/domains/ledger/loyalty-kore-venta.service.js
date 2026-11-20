@@ -78,6 +78,13 @@
  *    `POST /venta`, hasta `MAX_VENTAS_POR_LOTE` ventas por request, procesadas en serie, cada una
  *    independiente (una que falla no aborta las demás) — cada "venta" del lote trae su propio
  *    `abonos[]` con el contrato nuevo, ver su propio docstring más abajo.
+ *  - Saldo negativo en canje (2026-11-20, PROVISIONAL, pedido explícito del usuario): por default
+ *    un canje que supera el saldo disponible sigue bloqueando el abono (400), exactamente igual
+ *    que siempre. Si `PERMITIR_SALDO_NEGATIVO_CANJE` (ver loyalty-config.service.js) está activo,
+ *    el abono se aplica igual (saldo resultante negativo) con un campo `advertencia` en la
+ *    respuesta de ESE abono — reemplaza el CHECK de Postgres `loyalty_cards_saldo_no_negativo`
+ *    (D4, eliminado a propósito), el control pasa a ser 100% de esta capa. Fuera de alcance:
+ *    `loyalty-ledger.service.js` (canje/ajuste manual de staff) sigue bloqueando siempre.
  */
 
 const { Transaction, Op } = require('sequelize');
@@ -406,11 +413,26 @@ async function _procesarUnAbonoNuevo({
     puntosPromoCents = promoVigente ? calcularPuntos(montoBaseCalculoCents, Number(promoVigente.porcentajeBono)) : 0;
   }
 
+  // Saldo negativo en canje (2026-11-20, PROVISIONAL, pedido explícito del usuario): por default
+  // (PERMITIR_SALDO_NEGATIVO_CANJE:false) se sigue bloqueando exactamente igual que siempre, mismo
+  // BadRequestError/mensaje. Si está activo, el abono se deja aplicar igual (saldo resultante
+  // negativo) con una advertencia — nunca cambia el gate de "tarjeta inactiva" arriba.
+  let advertenciaSaldoNegativo = null;
   if (puntosDescontadosCents > 0) {
     if (!card.activa) throw new BadRequestError(`La tarjeta está inactiva, no se puede descontar puntos (abono "${abono.idAbono}").`);
     const saldoActualCents = toCents(card.saldoPuntos);
     if (puntosDescontadosCents > saldoActualCents) {
-      throw new BadRequestError(`El monto de puntos a usar supera el saldo disponible del cliente (abono "${abono.idAbono}").`);
+      const permitirSaldoNegativo = await configService.obtenerPermitirSaldoNegativoCanje();
+      if (!permitirSaldoNegativo) {
+        throw new BadRequestError(`El monto de puntos a usar supera el saldo disponible del cliente (abono "${abono.idAbono}").`);
+      }
+      const saldoResultanteCents = saldoActualCents - puntosDescontadosCents;
+      logger.warn(
+        `[loyalty-kore-venta] Saldo de puntos quedará negativo (PERMITIR_SALDO_NEGATIVO_CANJE activo): `
+        + `tarjeta=${card.id} abono="${abono.idAbono}" saldoAnterior=${fromCents(saldoActualCents)} `
+        + `puntosADescontar=${fromCents(puntosDescontadosCents)} saldoResultante=${fromCents(saldoResultanteCents)}`,
+      );
+      advertenciaSaldoNegativo = 'El saldo de puntos quedó negativo.';
     }
   }
   if ((puntosNivelCents > 0 || puntosPromoCents > 0) && !card.activa) {
@@ -482,6 +504,10 @@ async function _procesarUnAbonoNuevo({
     status: huboMovimiento ? 'aplicado' : 'no_califica',
     puntosDescontados: entryCanje ? Math.abs(Number(entryCanje.puntos)) : 0,
     puntosAcumulados,
+    // Solo presente cuando PERMITIR_SALDO_NEGATIVO_CANJE dejó pasar un descuento que superaba el
+    // saldo disponible (ver arriba) — nunca cambia el shape general de la respuesta para el resto
+    // de los abonos.
+    ...(advertenciaSaldoNegativo ? { advertencia: advertenciaSaldoNegativo } : {}),
   };
 }
 

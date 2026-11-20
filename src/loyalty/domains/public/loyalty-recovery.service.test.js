@@ -45,6 +45,7 @@ jest.mock('../cards/loyalty-card-audit.service', () => ({
 // loyalty-config.service.test.js; acá solo se verifica que solicitarCodigo lo consulte y respete.
 jest.mock('../config/loyalty-config.service', () => ({
   obtenerConsultaCodigoMaxMes: jest.fn(),
+  obtenerSesionConsultaUsosMax: jest.fn(),
 }));
 
 const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
@@ -112,6 +113,10 @@ beforeEach(() => {
   // Default: sin límite configurado (preserva el comportamiento de todos los tests que no
   // ejercitan el límite mensual explícitamente) — ver describe dedicado más abajo.
   configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(null);
+  // Default: 3 (el valor histórico fijo, SESION_USOS_INICIALES de antes de 2026-11-20) — preserva
+  // el comportamiento de todos los tests que no ejercitan este límite explícitamente, ver describe
+  // dedicado más abajo.
+  configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
 });
 
 afterAll(() => {
@@ -553,6 +558,54 @@ describe('Límite mensual de consultas CON CÓDIGO (2026-11-09, blindaje adicion
       consultaCodigoMesPeriodo: periodoActualMexico(),
       consultaCodigoMesContador: 1,
     }));
+  });
+});
+
+describe('Límite de consultas SIN código (SESION_CONSULTA_USOS_MAX, 2026-11-20)', () => {
+  test('default (3, sin configurar) → confirmarCodigoConsulta abre la sesión con usosRestantes:3', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(3);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 3 }));
+  });
+
+  test('valor configurado distinto del default (ej. 5) → se respeta en vez del fijo de antes', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(5);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(5);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 5 }));
+  });
+
+  test('0 (deshabilitado de verdad, NO "ilimitado") → la sesión se abre con usosRestantes:0, sin vistas extra', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(0);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(0);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 0 }));
+  });
+
+  test('con 0 configurado, un intento posterior de verConsultaSesion rechaza de inmediato (nunca decrementa en negativo)', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 0 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).not.toHaveBeenCalled();
   });
 });
 

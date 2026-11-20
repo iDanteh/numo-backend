@@ -55,7 +55,7 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     type:         DataTypes.DECIMAL(12, 2),
     allowNull:    false,
     defaultValue: 0,
-    comment:      'Saldo denormalizado de puntos. Respaldado por CHECK saldo_puntos >= 0 (D4).',
+    comment:      'Saldo denormalizado de puntos. Puede quedar negativo si PERMITIR_SALDO_NEGATIVO_CANJE está activo (2026-11-20) — el CHECK >= 0 (D4) se eliminó a propósito, el control es 100% de la app (ver loyalty-kore-venta.service.js).',
   },
   activa: {
     type:         DataTypes.BOOLEAN,

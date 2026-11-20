@@ -55,6 +55,10 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   guardarCongelamientoMeses: jest.fn(),
   obtenerConsultaCodigoMaxMes: jest.fn(),
   guardarConsultaCodigoMaxMes: jest.fn(),
+  obtenerSesionConsultaUsosMax: jest.fn(),
+  guardarSesionConsultaUsosMax: jest.fn(),
+  obtenerPermitirSaldoNegativoCanje: jest.fn(),
+  guardarPermitirSaldoNegativoCanje: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -134,6 +138,10 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
     { metodo: 'get',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 1 } },
+    { metodo: 'get',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 3 } },
+    { metodo: 'get',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { habilitado: true } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -381,6 +389,42 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ max: 1 });
     expect(configService.guardarConsultaCodigoMaxMes).toHaveBeenCalledWith(1, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/sesion-consulta-usos-max llama a obtenerSesionConsultaUsosMax', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
+    const res = await request(app).get('/config/sesion-consulta-usos-max').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 3 });
+    expect(configService.obtenerSesionConsultaUsosMax).toHaveBeenCalled();
+  });
+
+  test('PUT /config/sesion-consulta-usos-max llama a guardarSesionConsultaUsosMax con max y el usuario', async () => {
+    configService.guardarSesionConsultaUsosMax.mockResolvedValue(0);
+    const res = await request(app).put('/config/sesion-consulta-usos-max')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ max: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 0 });
+    expect(configService.guardarSesionConsultaUsosMax).toHaveBeenCalledWith(0, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/permitir-saldo-negativo-canje llama a obtenerPermitirSaldoNegativoCanje', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
+    const res = await request(app).get('/config/permitir-saldo-negativo-canje').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ habilitado: false });
+    expect(configService.obtenerPermitirSaldoNegativoCanje).toHaveBeenCalled();
+  });
+
+  test('PUT /config/permitir-saldo-negativo-canje llama a guardarPermitirSaldoNegativoCanje con habilitado y el usuario', async () => {
+    configService.guardarPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    const res = await request(app).put('/config/permitir-saldo-negativo-canje')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ habilitado: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ habilitado: true });
+    expect(configService.guardarPermitirSaldoNegativoCanje).toHaveBeenCalledWith(true, expect.objectContaining({ dbId: '1' }));
   });
 
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {

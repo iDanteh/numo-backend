@@ -209,6 +209,66 @@ describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite men
   );
 });
 
+describe('obtenerSesionConsultaUsosMax / guardarSesionConsultaUsosMax (límite de consultas SIN código, 2026-11-20)', () => {
+  test('obtenerSesionConsultaUsosMax devuelve el default (3) cuando getValue tira (nunca configurado)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(3);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'SESION_CONSULTA_USOS_MAX');
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve 0 cuando el valor guardado es "0" (deshabilitado de verdad, NO default)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(0);
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('5');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(5);
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve el default si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('abc');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(3);
+  });
+
+  test('guardarSesionConsultaUsosMax(5) llama a setValue con tipo:"numero" y devuelve 5', async () => {
+    const resultado = await configService.guardarSesionConsultaUsosMax(5, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'SESION_CONSULTA_USOS_MAX', '5',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(5);
+  });
+
+  test('guardarSesionConsultaUsosMax(0) persiste "0" y devuelve 0 (deshabilitado de verdad, no se normaliza a null)', async () => {
+    const resultado = await configService.guardarSesionConsultaUsosMax(0, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'SESION_CONSULTA_USOS_MAX', '0', expect.objectContaining({ tipo: 'numero' }),
+    );
+    expect(resultado).toBe(0);
+  });
+
+  test.each([null, undefined, ''])(
+    'guardarSesionConsultaUsosMax(%p) inválido (a diferencia de CONGELAMIENTO_MESES, acá vacío no deshabilita) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarSesionConsultaUsosMax(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
+    'guardarSesionConsultaUsosMax(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarSesionConsultaUsosMax(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('obtenerCanjeCodigoVigenciaMin / guardarCanjeCodigoVigenciaMin (código de autorización de canje, 2026-11-13)', () => {
   test('obtenerCanjeCodigoVigenciaMin devuelve el default (5) cuando getValue tira (a diferencia de D11, acá sí hace falta un default usable)', async () => {
     globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
@@ -240,6 +300,59 @@ describe('obtenerCanjeCodigoVigenciaMin / guardarCanjeCodigoVigenciaMin (código
     async (valor) => {
       await expect(
         configService.guardarCanjeCodigoVigenciaMin(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerPermitirSaldoNegativoCanje / guardarPermitirSaldoNegativoCanje (saldo negativo en canje, 2026-11-20, PROVISIONAL)', () => {
+  test('obtenerPermitirSaldoNegativoCanje devuelve false cuando getValue tira (nunca configurado, default bloquea)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(false);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE');
+  });
+
+  test('obtenerPermitirSaldoNegativoCanje devuelve true cuando el valor guardado es "true"', async () => {
+    globalConfigService.getValue.mockResolvedValue('true');
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(true);
+  });
+
+  test('obtenerPermitirSaldoNegativoCanje devuelve false cuando el valor guardado es "false"', async () => {
+    globalConfigService.getValue.mockResolvedValue('false');
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(false);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje(true) llama a setValue con tipo:"booleano" y devuelve true', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje(true, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'true',
+      expect.objectContaining({ tipo: 'booleano', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(true);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje(false) persiste "false" y devuelve false', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje(false, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'false', expect.objectContaining({ tipo: 'booleano' }),
+    );
+    expect(resultado).toBe(false);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje acepta los strings "true"/"false" (ej. payload HTTP crudo)', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje('true', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'true', expect.anything(),
+    );
+    expect(resultado).toBe(true);
+  });
+
+  test.each([[1, 'número'], ['si', 'string no boolean'], [null, 'null'], [undefined, 'undefined']])(
+    'guardarPermitirSaldoNegativoCanje(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarPermitirSaldoNegativoCanje(valor, USER),
       ).rejects.toMatchObject({ statusCode: 400 });
       expect(globalConfigService.setValue).not.toHaveBeenCalled();
     },

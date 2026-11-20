@@ -35,6 +35,7 @@ jest.mock('../config/loyalty-config.service', () => ({
   obtenerPorcentajeNivel: jest.fn(),
   sincronizarConceptosKore: jest.fn(),
   sincronizarFormasPagoKore: jest.fn(),
+  obtenerPermitirSaldoNegativoCanje: jest.fn(),
 }));
 jest.mock('./loyalty-venta-fallida.service', () => ({
   registrarVentaFallida: jest.fn(),
@@ -121,6 +122,9 @@ beforeEach(() => {
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data, saldoResultante: data.saldoResultante }));
   configService.obtenerPorcentajeNivel.mockResolvedValue(5);
   configService.obtenerPromocionVigente.mockResolvedValue(null);
+  // Default: bloquea saldo negativo (comportamiento de siempre) — preserva el resto de esta suite,
+  // ver describe dedicado más abajo para el caso activo.
+  configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
   LoyaltyKoreConcepto.findOne.mockResolvedValue({ koreId: 'CONCEPTO-1', acumulaPuntos: true });
   LoyaltyKoreFormaPago.findOne.mockImplementation(({ where }) => {
     if (where.koreId === 'FP-EFECTIVO') return Promise.resolve({ koreId: 'FP-EFECTIVO', acumulaPuntos: true, esPuntos: false });
@@ -368,6 +372,63 @@ describe('procesarVentaKore — devengación (canje)', () => {
 
   it('el abono falla (statusCode 400) si la tarjeta está inactiva', async () => {
     mockCard(makeCard({ activa: false, saldoPuntos: '600.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });
+  });
+});
+
+describe('procesarVentaKore — saldo negativo en canje (PERMITIR_SALDO_NEGATIVO_CANJE, 2026-11-20, PROVISIONAL)', () => {
+  const payloadConPuntos = {
+    ...PAYLOAD_BASE,
+    abonos: [abono({
+      formasPago: [
+        { formaPagoId: 'FP-EFECTIVO', importe: 660 },
+        { formaPagoId: 'FP-PUNTOS', importe: 500 },
+      ],
+      total: 1160,
+    })],
+  };
+
+  it('default (false): un canje que supera el saldo sigue bloqueando el abono (400), mismo mensaje de siempre', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '100.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });
+    expect(res.abonos[0].error).toMatch(/supera el saldo disponible/);
+  });
+
+  it('activo (true): el canje se aplica igual, el saldo queda negativo y el abono trae `advertencia`', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '100.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('aplicado');
+    expect(res.puntosDescontados).toBe(500);
+    expect(res.puntosAcumulados).toBe(0);
+    expect(res.saldoResultante).toBe(-400);
+    expect(res.abonos[0]).toMatchObject({
+      idAbono: 'ABONO-1', success: true, status: 'aplicado', puntosDescontados: 500,
+      advertencia: expect.any(String),
+    });
+  });
+
+  it('activo (true) pero el saldo alcanza: nunca agrega `advertencia` (el gate solo aplica cuando de verdad excede)', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '600.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('aplicado');
+    expect(res.saldoResultante).toBe(100);
+    expect(res.abonos[0]).not.toHaveProperty('advertencia');
+  });
+
+  it('activo (true) pero tarjeta inactiva: sigue bloqueando (400) — el flag nunca permite descontar de una tarjeta inactiva', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false }));
+    mockCard(makeCard({ activa: false, saldoPuntos: '100.00' }));
     const res = await ventaService.procesarVentaKore(payloadConPuntos);
     expect(res.status).toBe('fallido');
     expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });

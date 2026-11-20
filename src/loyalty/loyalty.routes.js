@@ -233,6 +233,19 @@ router.put('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.L
   res.json({ max: await configService.guardarConsultaCodigoMaxMes(req.body?.max, req.user) });
 }));
 
+// Límite de consultas SIN código (2026-11-20) — vistas extra dentro de la sesión corta que abre
+// confirmarCodigoConsulta (ver loyalty-recovery.service.js#verConsultaSesion), sin pedir un código
+// nuevo. Mismo criterio de permisos que arriba. `{ max: number }` — a diferencia de
+// CONSULTA_CODIGO_MAX_MES, acá NUNCA es null: default 3 si nunca se configuró, 0 deshabilita de
+// verdad las vistas extra (nunca "sin límite", ver loyalty-config.service.js).
+router.get('/config/sesion-consulta-usos-max', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.obtenerSesionConsultaUsosMax() });
+}));
+
+router.put('/config/sesion-consulta-usos-max', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.guardarSesionConsultaUsosMax(req.body?.max, req.user) });
+}));
+
 // Vigencia del código de autorización de canje (2026-11-13) — minutos que dura vigente el código
 // de un solo uso que Numo manda al cliente para autorizar un canje de puntos en una venta de Kore
 // (ver loyalty-kore-canje.service.js). Mismo criterio de permisos que arriba. A diferencia de
@@ -244,6 +257,18 @@ router.get('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOY
 
 router.put('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json({ minutos: await configService.guardarCanjeCodigoVigenciaMin(req.body?.minutos, req.user) });
+}));
+
+// Permitir saldo negativo en canje de puntos en venta (2026-11-20, PROVISIONAL, pedido explícito
+// del usuario) — decisión consumida por loyalty-kore-venta.service.js#_procesarUnAbonoNuevo.
+// Mismo criterio de permisos que el resto. `{ habilitado: boolean }`, default false (bloquea saldo
+// negativo, comportamiento de siempre) si nunca se configuró.
+router.get('/config/permitir-saldo-negativo-canje', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ habilitado: await configService.obtenerPermitirSaldoNegativoCanje() });
+}));
+
+router.put('/config/permitir-saldo-negativo-canje', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ habilitado: await configService.guardarPermitirSaldoNegativoCanje(req.body?.habilitado, req.user) });
 }));
 
 // Auditoría de eventos OTP (2026-11-13, pedido explícito del usuario) — quién pidió/validó un

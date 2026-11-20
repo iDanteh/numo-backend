@@ -799,14 +799,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS telefono_candidato  VARCHAR(20)
   `).catch(e => console.warn('[syncModels] ADD COLUMN motivo/grupo_id/telefono_candidato (loyalty_pending_enrollments):', e.message));
 
-  // Respaldo de BD para D4 (consistencia de saldo): ningún script o bug futuro
-  // puede dejar saldo_puntos negativo, incluso si algún día alguien escribe
-  // fuera de _aplicarMovimiento. Idempotente vía bloque DO + catch duplicate_object.
+  // Constraint D4 (saldo_puntos >= 0) eliminado a propósito: ahora el saldo negativo
+  // es una decisión de negocio configurable (PERMITIR_SALDO_NEGATIVO_CANJE), controlada
+  // 100% a nivel app en loyalty-kore-venta.service.js. Drop idempotente.
   await LoyaltyCard.sequelize.query(`
-    DO $$ BEGIN
-      ALTER TABLE loyalty_cards ADD CONSTRAINT loyalty_cards_saldo_no_negativo CHECK (saldo_puntos >= 0);
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `).catch(e => console.warn('[syncModels] CHECK loyalty_cards_saldo_no_negativo:', e.message));
+    ALTER TABLE loyalty_cards DROP CONSTRAINT IF EXISTS loyalty_cards_saldo_no_negativo;
+  `).catch(e => console.warn('[syncModels] DROP CHECK loyalty_cards_saldo_no_negativo:', e.message));
 
   // Match de clientes con Kore (monedero externo) — columnas nuevas sobre loyalty_cards, que YA
   // existía con datos reales: idempotente, mismo patrón que el resto de este archivo. Ver

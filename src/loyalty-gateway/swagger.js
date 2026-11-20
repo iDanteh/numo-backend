@@ -62,6 +62,7 @@ const options = {
     path.join(__dirname, '../loyalty/domains/kore-match/loyalty-kore-cliente.routes.js'),
     path.join(__dirname, '../loyalty/domains/kore-match/loyalty-kore-nivel.routes.js'),
     path.join(__dirname, '../banks/domains/collection-requests/collection-request.routes.js'),
+    path.join(__dirname, '../banks/domains/erp/erp-reversion.routes.js'),
   ],
 };
 

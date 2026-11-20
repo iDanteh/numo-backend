@@ -213,6 +213,7 @@ router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *           example:
  *             ventas:
  *               - telefono: "9511771923"
+ *                 koreClienteId: "1134"
  *                 serieFolio: "A1-260605500"
  *                 conceptoId: "5fbbe696d6cdbf0001adde15"
  *                 metodoPago: "PUE"
@@ -297,20 +298,25 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *                 type: string
  *           examples:
  *             cancelacionTotal:
- *               summary: Cancelación total de la venta
+ *               summary: Cancelación total de la venta (con los campos opcionales informativos)
  *               value:
  *                 serieFolio: "A0-260605320"
  *                 serieFolioCancelacion: "A0-900000001"
  *                 tipoCancelacion: "total"
  *                 motivoCancelacion: "cliente canceló la compra"
+ *                 clienteId: "KORE-CLI-00981"
+ *                 nombreCliente: "María López Hernández"
  *             cancelacionParcial:
- *               summary: Devolución parcial de la venta
+ *               summary: Devolución parcial de la venta (con montoVenta opcional para chequeo de consistencia)
  *               value:
  *                 serieFolio: "A0-260605320"
  *                 serieFolioCancelacion: "A0-900000002"
  *                 tipoCancelacion: "parcial"
  *                 importeCancelado: 200.00
+ *                 montoVenta: 1000.00
  *                 motivoCancelacion: "devolución parcial de mercancía"
+ *                 clienteId: "KORE-CLI-00981"
+ *                 nombreCliente: "María López Hernández"
  *     responses:
  *       200:
  *         description: Cancelación procesada.

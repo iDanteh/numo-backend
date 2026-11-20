@@ -45,7 +45,7 @@ const router = express.Router();
  *                 nombre: "María López Hernández"
  *                 nivel: "Bronce"
  *             actualizacion:
- *               summary: Actualización de cliente
+ *               summary: Actualización de cliente (incluye tarjetaLegada opcional)
  *               value:
  *                 evento: "actualizacion"
  *                 koreClienteId: "KORE-CLI-00981"
@@ -53,6 +53,7 @@ const router = express.Router();
  *                 nombre: "María López Hernández"
  *                 activo: true
  *                 nivel: "Bronce"
+ *                 tarjetaLegada: "0012345678"
  *             baja:
  *               summary: Baja de cliente
  *               value:

@@ -58,6 +58,7 @@ const REFERENCIA_REGEX = /^[0-9a-fA-F]{24}$/;
  *             erpId: "5fbd63472ab0c60001c64692"
  *             serieExterna: "A0"
  *             folioExterno: "260605320"
+ *             referencia: "6aee0e1b2ff6fb0001f89db0"
  *             motivo: "Cancelación de factura"
  *             fecha: "2026-11-19T17:27:55.620246Z"
  *     responses:

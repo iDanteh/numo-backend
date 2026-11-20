@@ -134,7 +134,66 @@ router.get('/saldo', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
- *             description: Payload de venta de Kore.
+ *             required: [telefono, serieFolio, conceptoId, metodoPago, abonos]
+ *             properties:
+ *               telefono:
+ *                 type: string
+ *                 description: Teléfono del cliente (10 dígitos).
+ *                 example: "9511771923"
+ *               koreClienteId:
+ *                 type: string
+ *                 description: Opcional — ID del cliente en Kore, más estable que el teléfono para resolver la tarjeta.
+ *                 example: "1134"
+ *               serieFolio:
+ *                 type: string
+ *                 description: Serie-Folio de la venta/CxC en Kore.
+ *                 example: "A0-261100034"
+ *               conceptoId:
+ *                 type: string
+ *                 example: "5fbd63472ab0c60001c64692"
+ *               metodoPago:
+ *                 type: string
+ *                 enum: [PUE, PPD]
+ *                 example: "PUE"
+ *               abonos:
+ *                 type: array
+ *                 description: Uno o más pagos (abonos) contra esta CxC.
+ *                 items:
+ *                   type: object
+ *                   required: [idAbono, fecha, subtotal, total, formasPago, usuarioAplicaId]
+ *                   properties:
+ *                     idAbono:
+ *                       type: string
+ *                       description: ID del movimiento/abono en Kore — llave de idempotencia junto con serieFolio.
+ *                       example: "6aee0e1b2ff6fb0001f89db0"
+ *                     fecha:
+ *                       type: string
+ *                       example: "2026-11-06T17:27:55.620246Z"
+ *                     subtotal:
+ *                       type: number
+ *                       description: Subtotal (antes de impuesto) de ESTE abono.
+ *                       example: 579.3621
+ *                     total:
+ *                       type: number
+ *                       example: 672.06
+ *                     formasPago:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           formaPagoId:
+ *                             type: string
+ *                             example: "5f85d826acfcf300018a088a"
+ *                           importe:
+ *                             type: number
+ *                             example: 672.06
+ *                     usuarioAplicaId:
+ *                       type: string
+ *                       example: "auth0|6494db046ee6f0aa8795c14e"
+ *                     puntosAbonados:
+ *                       type: number
+ *                       description: Opcional — si Kore ya trae el cálculo de puntos de nivel de este abono, Numo lo usa directo en vez de recalcularlo.
+ *                       example: 8.69
  *           example:
  *             telefono: "9511771923"
  *             koreClienteId: "1134"
@@ -204,12 +263,68 @@ router.post('/venta', verifyKoreApiKey, asyncHandler(async (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
+ *             required: [ventas]
  *             properties:
  *               ventas:
  *                 type: array
+ *                 description: Hasta 100 ventas por request — mismo formato que el body de POST /venta, cada una independiente.
  *                 items:
  *                   type: object
- *                   description: Payload de venta de Kore (mismo formato que POST /venta).
+ *                   required: [telefono, serieFolio, conceptoId, metodoPago, abonos]
+ *                   properties:
+ *                     telefono:
+ *                       type: string
+ *                       example: "9511771923"
+ *                     koreClienteId:
+ *                       type: string
+ *                       description: Opcional — ID del cliente en Kore.
+ *                       example: "1134"
+ *                     serieFolio:
+ *                       type: string
+ *                       example: "A1-260605500"
+ *                     conceptoId:
+ *                       type: string
+ *                       example: "5fbbe696d6cdbf0001adde15"
+ *                     metodoPago:
+ *                       type: string
+ *                       enum: [PUE, PPD]
+ *                       example: "PUE"
+ *                     abonos:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         required: [idAbono, fecha, subtotal, total, formasPago, usuarioAplicaId]
+ *                         properties:
+ *                           idAbono:
+ *                             type: string
+ *                             example: "6aee0d412ff6fb0001f89d55"
+ *                           fecha:
+ *                             type: string
+ *                             example: "2026-10-27T12:00:00Z"
+ *                           subtotal:
+ *                             type: number
+ *                             example: 1000.00
+ *                           total:
+ *                             type: number
+ *                             example: 1160.00
+ *                           formasPago:
+ *                             type: array
+ *                             items:
+ *                               type: object
+ *                               properties:
+ *                                 formaPagoId:
+ *                                   type: string
+ *                                   example: "5f85d826acfcf300018a088a"
+ *                                 importe:
+ *                                   type: number
+ *                                   example: 1160.00
+ *                           usuarioAplicaId:
+ *                             type: string
+ *                             example: "auth0|6494db046ee6f0aa8795c14e"
+ *                           puntosAbonados:
+ *                             type: number
+ *                             description: Opcional — igual criterio que POST /venta.
+ *                             example: 15.00
  *           example:
  *             ventas:
  *               - telefono: "9511771923"

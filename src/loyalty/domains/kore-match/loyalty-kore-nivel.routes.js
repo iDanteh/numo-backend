@@ -33,7 +33,32 @@ const router = express.Router();
  *         application/json:
  *           schema:
  *             type: object
- *             description: Payload de alta/ajuste/baja de nivel.
+ *             required: [evento, koreId]
+ *             properties:
+ *               evento:
+ *                 type: string
+ *                 enum: [alta, actualizacion, baja]
+ *                 example: "alta"
+ *               koreId:
+ *                 type: string
+ *                 description: ID del nivel en el catálogo de Kore — siempre requerido.
+ *                 example: "n4"
+ *               nombre:
+ *                 type: string
+ *                 description: Requerido en alta. Opcional en actualizacion (si no viene, no se toca). No se lee en baja.
+ *                 example: "Platino"
+ *               porcentaje:
+ *                 type: number
+ *                 description: Requerido en alta (> 0). Opcional en actualizacion. No se lee en baja.
+ *                 example: 7.5
+ *               estatus:
+ *                 type: boolean
+ *                 description: Requerido en alta/actualizacion — define si el nivel queda activo. No se lee en baja (siempre desactiva).
+ *                 example: true
+ *               color:
+ *                 type: string
+ *                 description: Opcional y best-effort, hex de Kore. Si no viene, no se toca el valor existente.
+ *                 example: "#C0C0C0"
  *           examples:
  *             alta:
  *               summary: Alta de nivel (incluye color opcional, best-effort)

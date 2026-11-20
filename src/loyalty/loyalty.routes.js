@@ -106,10 +106,10 @@ router.get('/cards/:id/historial', authenticate, permit(PERMISSIONS.LOYALTY_READ
 // Ruta estática, agrupada junto al resto de rutas de /cards/:id/* de este dominio.
 router.get('/ledger/export', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   const {
-    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax, telefono,
   } = req.query;
   const movimientos = await ledgerService.listarMovimientosGlobal({
-    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax, telefono,
   });
   res.json({ movimientos });
 }));

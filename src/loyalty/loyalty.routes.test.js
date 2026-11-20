@@ -302,6 +302,19 @@ describe('wiring hacia los servicios (happy path)', () => {
     });
   });
 
+  // Filtro "Teléfono/tarjeta" (2026-11-20) — pasa el query param al servicio igual que el resto.
+  test('GET /ledger/export pasa telefono a listarMovimientosGlobal', async () => {
+    ledgerService.listarMovimientosGlobal.mockResolvedValue([]);
+
+    const res = await request(app).get('/ledger/export?telefono=5551234567')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(ledgerService.listarMovimientosGlobal).toHaveBeenCalledWith(
+      expect.objectContaining({ telefono: '5551234567' }),
+    );
+  });
+
   // Reporte "Tarjetas" (2026-10-29).
   test('GET /cards pasa exportar/fechaAlta/revisionPendiente al servicio', async () => {
     cardService.listar.mockResolvedValue({ total: 0, cards: [] });

@@ -3091,7 +3091,35 @@ async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, 
       if (serieTicket) claves.add(`${serieTicket}|${dr.Folio}`);
     }
   }
-  return claves;
+  return _ticketsConCobroYaContabilizado(claves, { rfc, fechaInicio });
+}
+
+// Solo cuenta como refacturación (cargo oculto) el ticket cuyo cobro YA está
+// en una póliza de Ingreso vigente de un día ANTERIOR (2026-11-20, pedido del
+// usuario: "¿no lo puede confundir?"). Kore re-liga el ticket a la factura
+// nueva y lo quita de la Factura Global original (verificado: O0-261100433 ya
+// no trae O0-261100672); si se regenerara el día de la FG, el cobro saldría de
+// ahí y, ocultándolo también aquí, desaparecería de ambos días. Con este
+// cruce, si el día anterior ya no lo tiene, el depósito sale el día de la
+// refactura. Cruce por `serie_venta_ticket`/`folio_venta_ticket` guardados
+// (ej. póliza 1749 Puerto Escondido 18-nov: O0|261100672 $8,220.49).
+async function _ticketsConCobroYaContabilizado(claves, { rfc, fechaInicio }) {
+  if (!claves.size || !fechaInicio) return new Set();
+  const pares = [...claves].map(k => k.split('|'));
+  const rows = await sequelize.query(
+    `SELECT DISTINCT UPPER(m.serie_venta_ticket) AS serie, m.folio_venta_ticket AS folio
+       FROM poliza_movimientos m
+       JOIN polizas p ON p.id = m.poliza_id
+      WHERE p.tipo = 'I'
+        AND p.estado <> 'cancelada'
+        AND p.fecha < :fechaInicio
+        ${rfc ? 'AND p.rfc = :rfc' : ''}
+        AND m.debe > 0
+        AND COALESCE(m.tipo_origen, '') NOT ILIKE 'refacturaci%'
+        AND (UPPER(m.serie_venta_ticket), m.folio_venta_ticket) IN (:pares)`,
+    { replacements: { fechaInicio, rfc, pares }, type: QueryTypes.SELECT },
+  );
+  return new Set(rows.map(r => `${r.serie}|${r.folio}`));
 }
 
 // Busca facturas tipo I canceladas en SAT (dentro del mismo rango de uuids
@@ -8259,7 +8287,7 @@ module.exports = {
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
-  _esFacturaGlobalRefacturacion,
+  _esFacturaGlobalRefacturacion, _ticketsConCobroYaContabilizado,
   _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
   _sfUsadoAntesDeFacturarPorCentro,
   _cobrosSinFacturaPorCentro, _cobroVaAlDiaDeFactura,

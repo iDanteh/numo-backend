@@ -163,8 +163,13 @@ const _remisionesCerradas = bancos => new Set(bancos.flatMap(b => (b.erpLinks ??
  * @returns {Promise<object[]>} una entrada por factura:
  *   { uuid, serie, folio, fechaFactura, esGlobal, totalFactura, totalAplicado,
  *     depositos: [{ fecha, descripcion, importe, aplicado, banco, remisiones, cliente, idNumo, estatus, ppdPorFacturar }] }
+ * @param {Map<string,string>} [p.uuidPorRemision]  'SERIE|FOLIO' → uuid: liga
+ *   también depósitos cuyo vínculo en Bancos todavía NO tiene el UUID de la
+ *   factura (lo llena "Recuperar folio fiscal" a las 7:00) por la remisión que
+ *   ampara la factura. Solo el reporte "Por facturar" (2026-11-20); la póliza
+ *   no lo pasa.
  */
-async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
+async function detectarMovimientosMostrador({ rfc, cfdis, movimientos, uuidPorRemision = null }) {
   const uuidsSinCobro = new Set(movimientos
     .filter(m => m.tipoOrigen === TIPO_ORIGEN_VENTA_SIN_COBRO && Number(m.debe) > 0 && m.cfdiUuid)
     .map(m => m.cfdiUuid.toUpperCase()));
@@ -172,14 +177,28 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
 
   const cfdiPorUuid = new Map(cfdis.filter(c => c.uuid).map(c => [c.uuid.toUpperCase(), c]));
   const variantes = [...uuidsSinCobro].flatMap(u => [u, u.toLowerCase()]);
-  const bancos = await BankMovement.find({ 'erpLinks.folioFiscal': { $in: variantes }, isActive: { $ne: false } }).lean();
+  const porRemision = uuidPorRemision?.size
+    ? new Map([...uuidPorRemision].filter(([, u]) => uuidsSinCobro.has(u)))
+    : new Map();
+  const foliosRem = [...new Set([...porRemision.keys()].map(k => k.split('|')[1]))];
+  const bancos = await BankMovement.find({
+    ...(foliosRem.length
+      ? { $or: [{ 'erpLinks.folioFiscal': { $in: variantes } }, { 'erpLinks.folioExterno': { $in: foliosRem } }] }
+      : { 'erpLinks.folioFiscal': { $in: variantes } }),
+    isActive: { $ne: false },
+  }).lean();
   if (!bancos.length) return [];
 
+  const uuidDeLink = l => {
+    const u = (l.folioFiscal ?? '').toUpperCase();
+    if (u) return u;
+    return porRemision.get(`${String(l.serie ?? '').trim().toUpperCase()}|${String(l.folioExterno ?? '').trim()}`) ?? '';
+  };
   const porFactura = new Map();
   for (const b of bancos) {
     const linksPorUuid = new Map();
     for (const l of b.erpLinks ?? []) {
-      const u = (l.folioFiscal ?? '').toUpperCase();
+      const u = uuidDeLink(l);
       if (!uuidsSinCobro.has(u)) continue;
       if (!linksPorUuid.has(u)) linksPorUuid.set(u, []);
       linksPorUuid.get(u).push(l);

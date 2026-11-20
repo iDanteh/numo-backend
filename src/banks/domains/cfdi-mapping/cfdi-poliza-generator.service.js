@@ -3060,6 +3060,13 @@ const SERIES_FUSION_NC = ['BCT', 'BON', 'DEV', 'DVE', 'CAC', 'CANCELACION', 'BEP
 // en casi cualquier factura del ERP (dato interno sin relación con
 // cancelaciones), confirmado con datos reales 2026-07-17 (8 de 9 facturas de
 // un día cualquiera lo tenían, falso positivo masivo).
+// Factura Global (o a PUBLICO EN GENERAL): nunca es una refacturación — ver
+// `esRefacturacion` (caso Atzompa 2026-08-03, FG diaria con tickets cancelados).
+function _esFacturaGlobalRefacturacion(cfdi, erp) {
+  if (erp?.informacionGlobal?.mes || cfdi?.informacionGlobal?.mes) return true;
+  return String(cfdi?.receptor?.rfc ?? '').trim().toUpperCase() === 'XAXX010101000';
+}
+
 async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin }) {
   if (!fechaInicio || !fechaFin) return new Set();
   const uuidsE = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
@@ -3068,14 +3075,23 @@ async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, 
     uuid:   { $in: [...uuidsE] },
     source: 'ERP',
     'documentosRelacionados.Serie': 'CANCELACION',
-  }).select('documentosRelacionados').lean();
-  const foliosRaw = new Set();
+  }).select('serie documentosRelacionados').lean();
+  // Claves "SERIE|FOLIO" del TICKET cancelado (2026-11-20): el folio solo se
+  // repite entre series (ej. ticket 261100132 existe en F0 y en A0), así que
+  // cruzar únicamente por folio confundía tickets de otra sucursal. La serie
+  // del ticket sale de la otra entrada del mismo docRel (ej. NC O0-261100471:
+  // [{CANCELACION,261100672},{O0,261100672}]); si no viene, la de la NC.
+  const claves = new Set();
   for (const d of docs) {
-    for (const dr of d.documentosRelacionados || []) {
-      if (dr.Serie === 'CANCELACION' && dr.Folio) foliosRaw.add(dr.Folio);
+    const rels = d.documentosRelacionados || [];
+    for (const dr of rels) {
+      if (dr.Serie !== 'CANCELACION' || !dr.Folio) continue;
+      const ticket = rels.find(x => x.Serie && x.Serie !== 'CANCELACION' && x.Folio === dr.Folio);
+      const serieTicket = String(ticket?.Serie ?? d.serie ?? '').trim().toUpperCase();
+      if (serieTicket) claves.add(`${serieTicket}|${dr.Folio}`);
     }
   }
-  return foliosRaw;
+  return claves;
 }
 
 // Busca facturas tipo I canceladas en SAT (dentro del mismo rango de uuids
@@ -4016,7 +4032,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const erpCfdis = await CFDI.find({
       uuid:   { $in: [...uuidsSinMeta] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados informacionGlobal').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
@@ -4046,9 +4062,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // marcando el FG entero como refacturación cuando en realidad es el FG
     // diario normal con tickets cancelados). Una refacturación real siempre
     // declara `tipoRelacion='04'` en el XML SAT; un FG con devoluciones no.
+    //
+    // CAMBIO 2026-11-20 (caso real Puerto Escondido O0-261100474, ticket
+    // O0-261100672): el prerequisito `tipoRelacion='04'` se reemplaza por
+    // "NO es Factura Global". Kore timbra la refactura SIN relación 04 (solo
+    // la NC CANCELACION trae relación 01 a la FG), así que nunca se detectaba
+    // y su cobro (transferencia 059361 $8,220.49, ya contado el 18-nov dentro
+    // de la FG O0-261100433) volvía a salir como depósito el 19-nov. Además,
+    // desde 2026-11-12 todo CFDI con 04 va a "CFDIs Sustitutos" y no se
+    // contabiliza, así que con el 04 la regla ya no aplicaba nunca. El falso
+    // positivo de Atzompa (FG diaria con tickets cancelados) sigue cubierto:
+    // la FG es global (InformacionGlobal / PUBLICO EN GENERAL).
     const esRefacturacion = !esBCT && !esBON &&
-      !!cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '04') &&
-      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionProp.has(d.Folio));
+      !_esFacturaGlobalRefacturacion(cfdi, erp) &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionProp.has(`${String(d.Serie).toUpperCase()}|${d.Folio}`));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
@@ -6459,7 +6486,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     const erpCfdisGuard = await CFDI.find({
       uuid:   { $in: [...uuidsSinMetaGuard] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados informacionGlobal').lean();
     erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
@@ -6476,10 +6503,10 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     // Refacturación — ver comentario en generarPropuesta (misma detección,
     // cruce exacto por Folio contra `foliosCancelacionGuard`, más prerequisito
-    // `tipoRelacion='04'` — ver comentario completo allá).
+    // "no es Factura Global" — ver comentario completo allá).
     const esRefacturacion = !esBCT && !esBON &&
-      !!cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '04') &&
-      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionGuard.has(d.Folio));
+      !_esFacturaGlobalRefacturacion(cfdi, erp) &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionGuard.has(`${String(d.Serie).toUpperCase()}|${d.Folio}`));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
@@ -8339,6 +8366,7 @@ module.exports = {
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
+  _esFacturaGlobalRefacturacion,
   _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
   _sfUsadoAntesDeFacturarPorCentro,
   _cobrosSinFacturaPorCentro, _cobroVaAlDiaDeFactura,

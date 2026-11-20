@@ -4454,6 +4454,16 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // que `/desgloses-salidas/caja` reporta con este tipoMovimiento) — por eso
   // se excluye explícitamente, aunque SÍ empiece con "RETIRO".
   const RETIRO_EXCLUIDO_DOBLE_CONTEO = 'RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA';
+  // "RETIRO DE DEPOSITO EN EFECTIVO" (RDPE) NUNCA se resta (confirmado con el
+  // usuario 2026-11-20, caso real Ferrocarril 18-nov: RDPE $100,000 en CAJA
+  // VENTAS 2 dejó "Depósitos consolidados (Efectivo)" en −$35,420.28 → salía
+  // como Abono). No es efectivo de ventas que salió de caja: saca dinero que
+  // entró como depósito, igual que "Salida por Transferencia"/"CIERRE CAJA".
+  const _esRetiroNoRestable = (s) => {
+    const abrev = (s.tipoMovimiento?.abreviatura || '').trim().toUpperCase();
+    const nombre = (s.tipoMovimiento?.nombre || '').trim().toUpperCase();
+    return abrev === 'RDPE' || nombre.startsWith('RETIRO DE DEPOSITO');
+  };
   if (poliza.tipo === 'I') {
     const fechaYMD = fechaFinal.toISOString().slice(0, 10);
     // `centroCosto`/`centroCostoObj.clave` (ej. "111") es la clave NUMÉRICA
@@ -4508,7 +4518,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
         const retiroEfectivo = salidas
           .filter(s => {
             const nombre = (s.tipoMovimiento?.nombre || '').trim().toUpperCase();
-            return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO;
+            return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO && !_esRetiroNoRestable(s);
           })
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
         const cobrosSinFacturaDisponibles = [...(cobrosSinFacturaPorCentro.get(claveCentro) ?? [])];

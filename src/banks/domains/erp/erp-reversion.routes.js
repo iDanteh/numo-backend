@@ -20,6 +20,62 @@ const REFERENCIA_REGEX = /^[0-9a-fA-F]{24}$/;
 // X-Api-Key (verifyKoreApiKey), NUNCA con authenticate/permit — Kore no tiene sesión Numo.
 // No debe filtrar detalle interno a un llamador externo: cualquier excepción no esperada se
 // atrapa aquí mismo y responde 500 genérico, con el detalle real solo en el log.
+/**
+ * @swagger
+ * /api/erp/cxc-reversiones:
+ *   post:
+ *     tags: [ERP - Reversiones]
+ *     summary: Avisa que Kore revirtió/canceló una CxC vinculada a un depósito bancario
+ *     description: >
+ *       Responde de inmediato con el conteo de movimientos afectados (ya se conoce sin
+ *       reconsultar Kore) y sigue el procesamiento real (reconsulta + ajuste + auditoría) en
+ *       segundo plano, sin mantener la conexión de Kore abierta.
+ *     security:
+ *       - apiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [erpId, serieExterna, folioExterno]
+ *             properties:
+ *               erpId:
+ *                 type: string
+ *                 description: ID de la CxC en Kore que se revirtió/canceló.
+ *               serieExterna:
+ *                 type: string
+ *               folioExterno:
+ *                 type: string
+ *               referencia:
+ *                 type: string
+ *                 description: ObjectId (24 hex) del movimiento bancario, si Kore lo conoce.
+ *               motivo:
+ *                 type: string
+ *               fecha:
+ *                 type: string
+ *           example:
+ *             erpId: "5fbd63472ab0c60001c64692"
+ *             serieExterna: "A0"
+ *             folioExterno: "260605320"
+ *             motivo: "Cancelación de factura"
+ *             fecha: "2026-11-19T17:27:55.620246Z"
+ *     responses:
+ *       200:
+ *         description: Reversión recibida — el procesamiento real continúa en segundo plano.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *             example:
+ *               ok: true
+ *               movimientosAfectados: 1
+ *               yaEstabaDesvinculada: false
+ *       400:
+ *         description: Falta erpId/serieExterna/folioExterno, o referencia no es un ObjectId válido.
+ *       401:
+ *         description: X-Api-Key inválida o faltante.
+ */
 router.post('/', verifyKoreApiKey, asyncHandler(async (req, res) => {
   // 2026-08-20 (pedido explícito del usuario): log crudo del body ANTES de cualquier
   // validación — sin esto no quedaba ningún rastro en consola de lo que Kore realmente

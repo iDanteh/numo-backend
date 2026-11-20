@@ -71,7 +71,7 @@ async function _facturasDelRango({ rfc, series, fechaInicio, fechaFin }) {
   if (!diaPorUuid.size) return [];
 
   const docs = await CFDI.find({ uuid: { $in: [...diaPorUuid.keys()] } })
-    .select('uuid serie folio fecha total receptor satStatus source').lean();
+    .select('uuid serie folio fecha total receptor satStatus source documentosRelacionados').lean();
   const seriesSet = new Set(series);
   const porUuid = new Map();
   for (const c of docs) {
@@ -83,33 +83,73 @@ async function _facturasDelRango({ rfc, series, fechaInicio, fechaFin }) {
   return [...porUuid.values()].filter(c => c.satStatus !== 'Cancelado');
 }
 
+// Series de `documentosRelacionados` que NO son remisiones (marcadores de NC).
+const SERIES_NO_REMISION = new Set(['CANCELACION', 'BCT', 'BON', 'DEV', 'DVE', 'CAC', 'BEP', 'BXC', 'BN', 'ANN', 'CES']);
+
+// 'SERIE|FOLIO' de remisión → uuid de la factura NO global que la ampara
+// (DocumentosRelacionados de la copia ERP). Las globales no: sus depósitos sin
+// UUID ya los agrega cobros-caja.js ("abonos anteriores").
+function _uuidPorRemision(facturas) {
+  const mapa = new Map();
+  for (const f of facturas) {
+    if ((f.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL) continue;
+    for (const d of f.documentosRelacionados ?? []) {
+      const serie = String(d.Serie ?? '').trim().toUpperCase();
+      const folio = String(d.Folio ?? '').trim();
+      if (!serie || !folio || SERIES_NO_REMISION.has(serie)) continue;
+      mapa.set(`${serie}|${folio}`, f.uuid);
+    }
+  }
+  return mapa;
+}
+
 /**
  * Facturas pagadas con depósitos de Bancos de días anteriores a la factura
  * (las "de mostrador") → mismas entradas que guarda la póliza en
  * `movimientosMostrador`.
+ *
+ * 2026-11-20 (pedido del usuario, remisiones
+ * A0-261002627/628/629/631 de octubre pagadas por SPEI y facturadas el MISMO
+ * día 20-nov, A0-261110105…111 — "sí deben salir porque de todas formas es una
+ * venta consignación"): si el vínculo es de una remisión PPD (consignación),
+ * entra aunque el depósito sea del mismo día que la factura. Y si el vínculo
+ * aún no trae el UUID, se liga por la remisión (`_uuidPorRemision`).
  */
 async function _movimientosMostradorSinPoliza({ rfc, facturas }) {
   if (!facturas.length) return [];
   const uuids = facturas.map(f => f.uuid);
+  const uuidPorRemision = _uuidPorRemision(facturas);
+  const foliosRem = [...new Set([...uuidPorRemision.keys()].map(k => k.split('|')[1]))];
+  const porUuid = { 'erpLinks.folioFiscal': { $in: [...uuids, ...uuids.map(u => u.toLowerCase())] } };
   const bancos = await BankMovement.find({
-    'erpLinks.folioFiscal': { $in: [...uuids, ...uuids.map(u => u.toLowerCase())] },
+    ...(foliosRem.length ? { $or: [porUuid, { 'erpLinks.folioExterno': { $in: foliosRem } }] } : porUuid),
     isActive: { $ne: false }, deposito: { $gt: 0 },
   }).select('fecha erpLinks').lean();
 
   const diaPorUuid = new Map(facturas.map(f => [f.uuid, f.dia]));
+  const uuidDeLink = l => (l.folioFiscal ?? '').toUpperCase()
+    || uuidPorRemision.get(`${String(l.serie ?? '').trim().toUpperCase()}|${String(l.folioExterno ?? '').trim()}`)
+    || '';
   const conDepositoAnterior = new Set();
   for (const b of bancos) {
     const diaDep = _diaDeposito(b.fecha);
     for (const l of b.erpLinks ?? []) {
-      const u = (l.folioFiscal ?? '').toUpperCase();
-      if (diaPorUuid.has(u) && diaDep && diaDep < diaPorUuid.get(u)) conDepositoAnterior.add(u);
+      const u = uuidDeLink(l);
+      if (!diaPorUuid.has(u) || !diaDep) continue;
+      // PPD del MISMO día (no después: un depósito posterior a la factura es
+      // cobranza de crédito, no "por facturar").
+      const diaFac = diaPorUuid.get(u);
+      if (diaDep < diaFac || (l.tipoPago === 'PPD' && diaDep === diaFac)) conDepositoAnterior.add(u);
     }
   }
   if (!conDepositoAnterior.size) return [];
 
   // Mismo formato que la póliza: una línea "Venta Sin Cobro" por factura.
   const movimientos = [...conDepositoAnterior].map(u => ({ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: u }));
-  return detectarMovimientosMostrador({ rfc, cfdis: facturas.filter(f => conDepositoAnterior.has(f.uuid)), movimientos });
+  return detectarMovimientosMostrador({
+    rfc, cfdis: facturas.filter(f => conDepositoAnterior.has(f.uuid)), movimientos,
+    ...(uuidPorRemision.size ? { uuidPorRemision } : {}),
+  });
 }
 
 /**

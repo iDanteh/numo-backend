@@ -298,3 +298,27 @@ test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo 
   expect(datos.depositosPendientesPago.map(d => d.idNumo)).toContain('053960');
   expect(advertencias.join(' ')).toMatch('Kore no respondió el saldo de 1 remisión');
 });
+
+// 2026-11-20 (pedido del usuario): remisión PPD (consignación) pagada y
+// facturada el MISMO día sí entra; el vínculo sin UUID se liga por remisión.
+// Un depósito PPD POSTERIOR a la factura (cobranza de crédito) no.
+test('consignación PPD del mismo día entra, ligada por remisión; PPD posterior no', async () => {
+  const FACT = '6C2D6D4C-DE8A-48A2-9AF1-DA9A7E3E5288';
+  const CREDITO = 'CCCCCCCC-0000-0000-0000-000000000003';
+  gen._uuidsPorFechaEfectiva.mockImplementation(async ({ fechaInicio }) => new Set(fechaInicio === '2026-11-20' ? [FACT, CREDITO] : []));
+  CFDI.find.mockReturnValue(lean([
+    { uuid: FACT, serie: 'A0', folio: '261110111', fecha: '2026-11-20T16:37:25Z', total: 9120.85, receptor: { rfc: 'XXXX010101XX1' }, source: 'ERP',
+      documentosRelacionados: [{ Serie: 'A0', Folio: '261002627' }] },
+    { uuid: CREDITO, serie: 'A0', folio: '261110200', fecha: '2026-11-20T18:00:00Z', total: 500, receptor: { rfc: 'XEXX010101000' }, source: 'ERP' },
+  ]));
+  BankMovement.find.mockReturnValue(lean([
+    { fecha: new Date('2026-11-20T00:00:00Z'), erpLinks: [{ folioFiscal: null, serie: 'A0', folioExterno: '261002627', tipoPago: 'PPD' }] },
+    { fecha: new Date('2026-11-21T00:00:00Z'), erpLinks: [{ folioFiscal: CREDITO, serie: 'A0', folioExterno: '261009999', tipoPago: 'PPD' }] },
+  ]));
+  mostrador.detectarMovimientosMostrador.mockResolvedValue([]);
+  await generarYEsperar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-11-20' }, { dbId: '5' });
+
+  const [arg] = mostrador.detectarMovimientosMostrador.mock.calls[0];
+  expect(arg.movimientos).toEqual([{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: FACT }]);
+  expect([...arg.uuidPorRemision]).toEqual([['A0|261002627', FACT]]);
+});

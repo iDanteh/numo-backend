@@ -201,17 +201,20 @@ describe('secciones y Excel por pestaña', () => {
     expect(a01.grupos[0].depositos.map(d => d.banco)).toEqual(['BBVA', 'EFECTIVO']);
     expect(s.mostrador[1].bloques[1].grupos.map(g => g.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
     expect(s.ref.map(a => [a.serie, a.bloques.length])).toEqual([['B0', 1]]);
-    expect(s.ref[0].bloques[0].grupos[0].depositos[0]).toMatchObject({ factura: 'B0-50', clienteFacturado: 'GRUPO CHILI GUAJILI S.A. DE C.V.' });
-    expect(s.especiales).toHaveLength(1);
-    expect(s.especiales[0].grupos[0].depositos[0]).toMatchObject({ cliente: 'MARIO VASQUEZ', clienteFacturado: 'CRISLA' });
+    // 2026-11-20: la especial (CRISLA) va en el mismo bloque de REF. B0, marcada.
+    const refB0 = s.ref[0].bloques[0].grupos.flatMap(g => g.depositos);
+    expect(refB0.find(d => d.factura === 'B0-50')).toMatchObject({ clienteFacturado: 'GRUPO CHILI GUAJILI S.A. DE C.V.' });
+    expect(refB0.find(d => d.factura === 'B0-50').especial).toBeUndefined();
+    expect(refB0.find(d => d.factura === 'B0-51')).toMatchObject({ cliente: 'MARIO VASQUEZ', clienteFacturado: 'CRISLA', especial: true });
+    expect(s.especiales).toEqual([]);
     expect(s.ficha.total).toBe(100);
     expect(s.efectivo).toHaveLength(1);
   });
 
-  // 2026-11-20 (usuario: "las facturas especiales y las REF A0 CEDIS estén
-  // juntas sin separación"): en A0 la especial va en REF. A0, mismo bloque del
-  // día; en otros almacenes sigue en FACT ESPECIALES.
-  test('A0: las especiales van mezcladas en REF. A0; B0 sigue en FACT ESPECIALES', async () => {
+  // 2026-11-20 (usuario: "las facturas especiales y las REF … juntas sin
+  // separación", en todos los almacenes): la especial va en su REF., mismo
+  // bloque del día, marcada `especial`.
+  test('A0: las especiales van mezcladas en REF. A0, marcadas', async () => {
     cargar();
     const base = (await ReportePorFacturar.findByPk()).toJSON();
     base.datos.movimientosMostrador.push(
@@ -222,15 +225,16 @@ describe('secciones y Excel por pestaña', () => {
     const s = (await service.obtener(3)).secciones;
     const refA0 = s.ref.find(a => a.serie === 'A0');
     expect(refA0.bloques).toHaveLength(1);
-    expect(refA0.bloques[0].grupos.flatMap(g => g.depositos.map(d => d.factura)).sort()).toEqual(['A0-70', 'A0-71']);
-    expect(s.especiales.flatMap(b => b.grupos.flatMap(g => g.depositos.map(d => d.factura)))).toEqual(['B0-51']);
+    const filas = refA0.bloques[0].grupos.flatMap(g => g.depositos);
+    expect(filas.map(d => [d.factura, !!d.especial]).sort()).toEqual([['A0-70', true], ['A0-71', false]]);
+    expect(s.especiales).toEqual([]);
   });
 
-  test('excel: hojas MOSTRADOR, REF. por almacén, FACT ESPECIALES, X FAC CON FICHA y efectivo', async () => {
+  test('excel: hojas MOSTRADOR, REF. por almacén (especiales en color), X FAC CON FICHA y efectivo', async () => {
     cargar();
     const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };
     const todo = await leer();
-    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO', 'RESUMEN POR FACTURAR']);
+    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0', 'REF. B0 - HIDALGO', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO', 'RESUMEN POR FACTURAR']);
     expect(todo.getWorksheet('MOSTRADOR I0').getColumn(2).values).toEqual(expect.arrayContaining(['PENDIENTE GENERAR FACTURA']));
     expect((await leer('mostrador')).worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0']);
     const ws = todo.getWorksheet('MOSTRADOR A0 - CEDIS');
@@ -249,8 +253,13 @@ describe('secciones y Excel por pestaña', () => {
     const ref = todo.getWorksheet('REF. B0 - HIDALGO').getRow(2).values.slice(1);
     expect(ref).toEqual(['FECHA', 'CTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'B0', 'B0 ORIGEN', 'CTE FACTURADO', 'ID DE PAGO']);
     expect((await leer('ficha')).worksheets.map(w => w.name)).toEqual(['X FAC CON FICHA DE DEP']);
-    const { filename } = await service.excel(3, 'especiales');
-    expect(filename).toBe('Por_facturar_FACT_ESPECIALES_Todas_2026-10-20_2026-10-22.xlsx');
+    // Renglón de la especial (B0-51, CRISLA) en color; el normal (B0-50) no.
+    const wsRef = todo.getWorksheet('REF. B0 - HIDALGO');
+    const filaDe = folio => wsRef.getRow(wsRef.getColumn(7).values.indexOf(folio));
+    expect(filaDe('B0-51').getCell(1).fill?.fgColor?.argb).toBe('FFFCE4D6');
+    expect(filaDe('B0-51').getCell(9).fill?.fgColor?.argb).toBe('FFFCE4D6');
+    expect(filaDe('B0-50').getCell(1).fill?.fgColor?.argb).toBeUndefined();
+    await expect(service.excel(3, 'especiales')).rejects.toThrow();
     await expect(service.excel(3, 'otra')).rejects.toThrow();
   });
 });

@@ -118,6 +118,11 @@ const _norm = s => String(s ?? '').toUpperCase().normalize('NFD').replace(/[̀-�
  * ninguno de los clientes de las remisiones. Sin receptor o sin cliente no
  * se puede saber → no es especial.
  */
+// Almacenes cuyas "FACT ESPECIALES" van mezcladas en su REF. (mismo bloque del
+// día, sin separación) — 2026-11-20, pedido del usuario: "las facturas
+// especiales y las REF A0 CEDIS estén juntas sin separación".
+const SERIES_ESPECIALES_EN_REF = new Set(['A0']);
+
 function esEspecial(cliente, receptor) {
   const r = _norm(receptor);
   const cs = String(cliente ?? '').split(' / ').map(_norm).filter(Boolean);
@@ -195,7 +200,7 @@ function armarSecciones(datosCompletos, sucursalDe = () => null, { fechaFin = nu
     for (const d of f.depositos) {
       const fila = { ...d, factura: _folio(f), clienteFacturado: f.receptorNombre ?? '' };
       const serie = _serieDeposito(d, f.serie);
-      if (esEspecial(d.cliente, f.receptorNombre)) {
+      if (!SERIES_ESPECIALES_EN_REF.has(serie) && esEspecial(d.cliente, f.receptorNombre)) {
         const k = `${dia}|${serie}`;
         if (!especiales.has(k)) especiales.set(k, { fecha: dia, serie, depositos: [] });
         especiales.get(k).depositos.push(fila);

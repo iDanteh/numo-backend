@@ -15,8 +15,9 @@
  *   ref         REF. <serie> — PPD ya facturado a nombre del cliente, una hoja
  *               por almacén (como "REF. HIDG1" / "REF. CONTRU."), un bloque
  *               por día: FACTURA, ORIGEN (remisiones), CTE, CTE FACTURADO.
- *   especiales  FACT ESPECIALES — igual que REF., cuando la factura salió a
- *               nombre de OTRO (CRISLA, PROEDISA…), no del cliente.
+ *               Las "especiales" (factura a nombre de OTRO: CRISLA, PROEDISA…)
+ *               van en la misma REF., renglón en color (2026-11-20; antes
+ *               pestaña FACT ESPECIALES aparte).
  *   ficha       X FAC CON FICHA DE DEP — depósitos identificados que solo
  *               abonan (las remisiones todavía deben saldo).
  *   efectivo    DEPÓSITOS EN EFECTIVO — sin asociar a ninguna venta.
@@ -33,7 +34,6 @@ const { agregarHojaResumen, estatusDe } = require('./reportes-por-facturar.resum
 const SECCIONES = {
   mostrador:  { titulo: 'MOSTRADOR',              hoja: 'MOSTRADOR' },
   ref:        { titulo: 'REF. — PPD YA FACTURADO A NOMBRE DEL CLIENTE', hoja: 'REF.' },
-  especiales: { titulo: 'FACT ESPECIALES',        hoja: 'FACT ESPECIALES' },
   ficha:      { titulo: 'X FAC CON FICHA DE DEP', hoja: 'X FAC CON FICHA DE DEP' },
   efectivo:   { titulo: 'DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA', hoja: 'DEPÓSITOS EN EFECTIVO' },
   otraCaja:   { titulo: 'COBRADAS EN OTRA CAJA',  hoja: 'COBRADAS EN' },
@@ -118,11 +118,6 @@ const _norm = s => String(s ?? '').toUpperCase().normalize('NFD').replace(/[̀-�
  * ninguno de los clientes de las remisiones. Sin receptor o sin cliente no
  * se puede saber → no es especial.
  */
-// Almacenes cuyas "FACT ESPECIALES" van mezcladas en su REF. (mismo bloque del
-// día, sin separación) — 2026-11-20, pedido del usuario: "las facturas
-// especiales y las REF A0 CEDIS estén juntas sin separación".
-const SERIES_ESPECIALES_EN_REF = new Set(['A0']);
-
 function esEspecial(cliente, receptor) {
   const r = _norm(receptor);
   const cs = String(cliente ?? '').split(' / ').map(_norm).filter(Boolean);
@@ -192,20 +187,18 @@ function armarSecciones(datosCompletos, sucursalDe = () => null, { fechaFin = nu
     return { serie, sucursal: sucursalDe(serie), bloques };
   });
 
-  // ── REF. (por almacén) y FACT ESPECIALES ──────────────────────────────────
+  // ── REF. (por almacén) ────────────────────────────────────────────────────
+  // 2026-11-20 (usuario: "las facturas especiales y las REF … juntas sin
+  // separación", "en todo" y "con color de renglón"): las especiales (factura
+  // a nombre de otro) van en el mismo bloque del día de su REF. con
+  // `especial: true` → renglón en color en pantalla y Excel.
   const refPorSerie = new Map();
-  const especiales = new Map();
   for (const f of t.ppdFacturadoCliente) {
     const dia = _diaMx(f.fechaFactura);
     for (const d of f.depositos) {
       const fila = { ...d, factura: _folio(f), clienteFacturado: f.receptorNombre ?? '' };
+      if (esEspecial(d.cliente, f.receptorNombre)) fila.especial = true;
       const serie = _serieDeposito(d, f.serie);
-      if (!SERIES_ESPECIALES_EN_REF.has(serie) && esEspecial(d.cliente, f.receptorNombre)) {
-        const k = `${dia}|${serie}`;
-        if (!especiales.has(k)) especiales.set(k, { fecha: dia, serie, depositos: [] });
-        especiales.get(k).depositos.push(fila);
-        continue;
-      }
       if (!refPorSerie.has(serie)) refPorSerie.set(serie, new Map());
       const porDia = refPorSerie.get(serie);
       if (!porDia.has(dia)) porDia.set(dia, []);
@@ -222,8 +215,8 @@ function armarSecciones(datosCompletos, sucursalDe = () => null, { fechaFin = nu
   return {
     mostrador,
     ref,
-    especiales: [...especiales.values()].sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)) || a.serie.localeCompare(b.serie))
-      .map(({ depositos, ...b }) => _bloque({ ...b, sucursal: sucursalDe(b.serie) }, depositos)),
+    // Ya no hay pestaña FACT ESPECIALES (van en REF.); vacío para pantallas viejas.
+    especiales: [],
     ficha: _bloque({}, datos?.depositosPendientesPago ?? []),
     efectivo: datos?.depositosEfectivoSinAsociar ?? [],
     otraCaja: _otraCaja(datos?.cobrosOtraCaja ?? [], sucursalDe),
@@ -408,6 +401,9 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
   return true;
 }
 
+// Renglón de factura especial en REF. (mismo tono que la pantalla).
+const COLOR_ESPECIAL = 'FFFCE4D6';
+
 // REF. y FACT ESPECIALES: mismo formato que las hojas "REF. HIDG1" / "FACT ESPECIALES" del usuario.
 function agregarHojaRef(workbook, bloques, nombre, etiquetaSerie) {
   if (!bloques.length) return false;
@@ -421,6 +417,8 @@ function agregarHojaRef(workbook, bloques, nombre, etiquetaSerie) {
       grupos: b.grupos,
       total: b.total,
       fila: d => [_fecha(d.fecha), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, d.factura ?? '', _rem(d), d.clienteFacturado ?? '', d.idNumo],
+      // Factura especial (a nombre de otro): renglón completo en color.
+      alEscribir: (row, d) => { if (d.especial) for (let i = 1; i <= 10; i++) row.getCell(i).fill = _relleno(COLOR_ESPECIAL); },
     });
   }
   _totalesFormaPago(ws, bloques);
@@ -481,7 +479,6 @@ function agregarHojasSeccion(workbook, secciones, seccion, meta = {}) {
         if (agregarHojaRef(workbook, a.bloques, nombreHoja(`REF. ${a.serie}`, a.sucursal))) hojas++;
       }
     }
-    if (s === 'especiales' && agregarHojaRef(workbook, secciones.especiales, SECCIONES.especiales.hoja, 'FACTURA')) hojas++;
     if (s === 'ficha' && agregarHojaFicha(workbook, secciones.ficha)) hojas++;
     if (s === 'efectivo' && agregarHojaDepositosEfectivo(workbook, secciones.efectivo, SECCIONES.efectivo.hoja)) hojas++;
     if (s === 'otraCaja') {

@@ -213,6 +213,24 @@ describe('secciones y Excel por pestaña', () => {
     expect(s.efectivo).toHaveLength(1);
   });
 
+  // 2026-11-20 (usuario: "las facturas especiales y las REF A0 CEDIS estén
+  // juntas sin separación"): en A0 la especial va en REF. A0, mismo bloque del
+  // día; en otros almacenes sigue en FACT ESPECIALES.
+  test('A0: las especiales van mezcladas en REF. A0; B0 sigue en FACT ESPECIALES', async () => {
+    cargar();
+    const base = (await ReportePorFacturar.findByPk()).toJSON();
+    base.datos.movimientosMostrador.push(
+      { uuid: 'C3', serie: 'A0', folio: '70', esGlobal: false, receptorNombre: 'NOMBRE FACTURA', fechaFactura: '2026-10-20T18:00:00Z', depositos: [dep('OTRO NOMBRE KORE', 60, 'A0-60')] },
+      { uuid: 'C4', serie: 'A0', folio: '71', esGlobal: false, receptorNombre: 'MISMO CLIENTE', fechaFactura: '2026-10-20T19:00:00Z', depositos: [dep('MISMO CLIENTE', 70, 'A0-61')] },
+    );
+    ReportePorFacturar.findByPk.mockResolvedValue({ id: 3, toJSON: () => base });
+    const s = (await service.obtener(3)).secciones;
+    const refA0 = s.ref.find(a => a.serie === 'A0');
+    expect(refA0.bloques).toHaveLength(1);
+    expect(refA0.bloques[0].grupos.flatMap(g => g.depositos.map(d => d.factura)).sort()).toEqual(['A0-70', 'A0-71']);
+    expect(s.especiales.flatMap(b => b.grupos.flatMap(g => g.depositos.map(d => d.factura)))).toEqual(['B0-51']);
+  });
+
   test('excel: hojas MOSTRADOR, REF. por almacén, FACT ESPECIALES, X FAC CON FICHA y efectivo', async () => {
     cargar();
     const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };

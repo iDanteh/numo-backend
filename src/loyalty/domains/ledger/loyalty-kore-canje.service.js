@@ -121,8 +121,12 @@ async function solicitarCodigoCanje(telefono) {
     canjeBloqueadaHasta: null,
   });
 
-  // El código NUNCA en el log, igual que el resto del módulo.
-  logger.info(`[loyalty-kore-canje] Código de canje generado tel=${_maskTelefono(telefonoStr)}`);
+  // El código NUNCA en el log EN PRODUCCIÓN (igual que el resto del módulo). Fuera de producción
+  // SÍ se incluye a propósito (pedido explícito del usuario, 2026-11-23): mientras no hay canal de
+  // mensajería real conectado (WhatsApp), es la única forma de leer el código generado sin tocar
+  // la base — mismo gate exacto que `codigoDev` más abajo. Remover cuando el envío real esté activo.
+  const sufijoCodigoDebug = process.env.NODE_ENV !== 'production' ? ` codigo=${codigo}` : '';
+  logger.info(`[loyalty-kore-canje] Código de canje generado tel=${_maskTelefono(telefonoStr)}${sufijoCodigoDebug}`);
   _registrarEvento('solicitud_codigo_canje', 'exito', null, telefonoStr);
 
   const respuesta = { mensaje: 'Código enviado' };

@@ -59,6 +59,12 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   guardarSesionConsultaUsosMax: jest.fn(),
   obtenerPermitirSaldoNegativoCanje: jest.fn(),
   guardarPermitirSaldoNegativoCanje: jest.fn(),
+  obtenerOtpEnvioModo: jest.fn(),
+  guardarOtpEnvioModo: jest.fn(),
+  obtenerOtpEnvioProveedor: jest.fn(),
+  guardarOtpEnvioProveedor: jest.fn(),
+  obtenerOtpWhatsappConfig: jest.fn(),
+  guardarOtpWhatsappConfig: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -107,6 +113,15 @@ beforeEach(() => {
   // mockeadas (que solo hacen res.json(await ...), inofensivo con undefined), GET /cards/:id/foto
   // desestructura { data, mimetype } del resultado.
   cardService.obtenerFoto.mockResolvedValue({ data: Buffer.from('img'), mimetype: 'image/png' });
+  // Default sano para la matriz de permisos genérica de abajo — a diferencia del resto de mocks
+  // de configService (inofensivos con undefined, solo se envuelven en res.json), las rutas de
+  // GET/PUT /config/otp-whatsapp desestructuran campos del resultado para enmascarar los secretos.
+  const otpWhatsappDefault = {
+    phoneNumberId: null, wabaId: null, token: null, appSecret: null,
+    templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+  };
+  configService.obtenerOtpWhatsappConfig.mockResolvedValue(otpWhatsappDefault);
+  configService.guardarOtpWhatsappConfig.mockResolvedValue(otpWhatsappDefault);
   app = express();
   app.use(express.json());
   app.use('/', router);
@@ -142,6 +157,12 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'put',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 3 } },
     { metodo: 'get',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { habilitado: true } },
+    { metodo: 'get',   ruta: '/config/otp-envio-modo',       permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-envio-modo',       permiso: PERMISSIONS.LOYALTY_CONFIG, body: { modo: 'simulado' } },
+    { metodo: 'get',   ruta: '/config/otp-envio-proveedor',  permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-envio-proveedor',  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { proveedor: 'whatsapp' } },
+    { metodo: 'get',   ruta: '/config/otp-whatsapp',         permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-whatsapp',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { phoneNumberId: '123' } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -438,6 +459,119 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ habilitado: true });
     expect(configService.guardarPermitirSaldoNegativoCanje).toHaveBeenCalledWith(true, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-envio-modo llama a obtenerOtpEnvioModo', async () => {
+    configService.obtenerOtpEnvioModo.mockResolvedValue('simulado');
+    const res = await request(app).get('/config/otp-envio-modo').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ modo: 'simulado' });
+    expect(configService.obtenerOtpEnvioModo).toHaveBeenCalled();
+  });
+
+  test('PUT /config/otp-envio-modo llama a guardarOtpEnvioModo con modo y el usuario', async () => {
+    configService.guardarOtpEnvioModo.mockResolvedValue('real');
+    const res = await request(app).put('/config/otp-envio-modo')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ modo: 'real' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ modo: 'real' });
+    expect(configService.guardarOtpEnvioModo).toHaveBeenCalledWith('real', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('PUT /config/otp-envio-modo propaga el BadRequestError de un modo inválido', async () => {
+    const { BadRequestError } = require('../shared/errors/AppError');
+    configService.guardarOtpEnvioModo.mockRejectedValue(new BadRequestError('El modo de envío de código debe ser uno de: simulado, real.'));
+    const res = await request(app).put('/config/otp-envio-modo')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ modo: 'telepatia' });
+    expect(res.status).toBe(400);
+    expect(configService.guardarOtpEnvioModo).toHaveBeenCalledWith('telepatia', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-envio-proveedor llama a obtenerOtpEnvioProveedor', async () => {
+    configService.obtenerOtpEnvioProveedor.mockResolvedValue('whatsapp');
+    const res = await request(app).get('/config/otp-envio-proveedor').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ proveedor: 'whatsapp' });
+    expect(configService.obtenerOtpEnvioProveedor).toHaveBeenCalled();
+  });
+
+  test('PUT /config/otp-envio-proveedor llama a guardarOtpEnvioProveedor con proveedor y el usuario', async () => {
+    configService.guardarOtpEnvioProveedor.mockResolvedValue('otro-proveedor');
+    const res = await request(app).put('/config/otp-envio-proveedor')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ proveedor: 'otro-proveedor' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ proveedor: 'otro-proveedor' });
+    expect(configService.guardarOtpEnvioProveedor).toHaveBeenCalledWith('otro-proveedor', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-whatsapp llama a obtenerOtpWhatsappConfig y enmascara token/appSecret', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: '999', token: 'token-real-super-secreto',
+      appSecret: 'app-secret-real', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      phoneNumberId: '1234567890', wabaId: '999', token: '••••••••',
+      appSecret: '••••••••', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    expect(configService.obtenerOtpWhatsappConfig).toHaveBeenCalled();
+  });
+
+  test('GET /config/otp-whatsapp nunca filtra el valor real de token/appSecret en el response', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: '999', token: 'token-real-super-secreto',
+      appSecret: 'app-secret-real', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    const crudo = JSON.stringify(res.body);
+    expect(crudo).not.toContain('token-real-super-secreto');
+    expect(crudo).not.toContain('app-secret-real');
+  });
+
+  test('GET /config/otp-whatsapp devuelve null (no enmascarado) para token/appSecret aún no configurados', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: null, wabaId: null, token: null, appSecret: null,
+      templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeNull();
+    expect(res.body.appSecret).toBeNull();
+  });
+
+  test('PUT /config/otp-whatsapp llama a guardarOtpWhatsappConfig con el payload y el usuario, y enmascara la respuesta', async () => {
+    configService.guardarOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: null, token: 'token-nuevo',
+      appSecret: null, templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).put('/config/otp-whatsapp')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ phoneNumberId: '1234567890', token: 'token-nuevo' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      phoneNumberId: '1234567890', wabaId: null, token: '••••••••',
+      appSecret: null, templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    expect(configService.guardarOtpWhatsappConfig).toHaveBeenCalledWith(
+      {
+        phoneNumberId: '1234567890', wabaId: undefined, token: 'token-nuevo',
+        appSecret: undefined, templateNombre: undefined, templateIdioma: undefined,
+      },
+      expect.objectContaining({ dbId: '1' }),
+    );
+  });
+
+  test('PUT /config/otp-envio-proveedor propaga el BadRequestError de un proveedor vacío', async () => {
+    const { BadRequestError } = require('../shared/errors/AppError');
+    configService.guardarOtpEnvioProveedor.mockRejectedValue(new BadRequestError('proveedor es requerido.'));
+    const res = await request(app).put('/config/otp-envio-proveedor')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ proveedor: '' });
+    expect(res.status).toBe(400);
   });
 
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {

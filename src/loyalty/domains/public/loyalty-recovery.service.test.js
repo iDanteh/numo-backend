@@ -30,6 +30,12 @@ jest.mock('../../shared/nip.util', () => ({
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
+// Envío del código OTP (2026-11-23) — se mockea completo, cubierto aparte en
+// otp-envio.adapter.test.js; acá solo se verifica QUÉ se le pasa (telefono/codigo) y que su
+// resultado nunca afecta la respuesta de solicitarCodigo (el adapter garantiza no lanzar).
+jest.mock('../../shared/otp-envio.adapter', () => ({
+  enviarCodigo: jest.fn(),
+}));
 // Historial de movimientos (2026-11-03) — se mockea completo, cubierto aparte en
 // loyalty-ledger.service.test.js; acá solo se verifica que se agrega al payload de éxito.
 jest.mock('../ledger/loyalty-ledger.service', () => ({
@@ -54,6 +60,7 @@ const {
   generarSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+const otpEnvioAdapter = require('../../shared/otp-envio.adapter');
 const ledgerService = require('../ledger/loyalty-ledger.service');
 const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
 const configService = require('../config/loyalty-config.service');
@@ -110,6 +117,9 @@ beforeEach(() => {
   process.env.NODE_ENV = 'test';
   ledgerService.listarMovimientosPublicos.mockResolvedValue([]);
   generarSesionToken.mockReturnValue(SESION_TOKEN);
+  // Default: envío "exitoso" simulado — ningún test de solicitarCodigo necesita ejercitar el
+  // resultado del adapter salvo el describe dedicado más abajo.
+  otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: true, simulado: true });
   // Default: sin límite configurado (preserva el comportamiento de todos los tests que no
   // ejercitan el límite mensual explícitamente) — ver describe dedicado más abajo.
   configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(null);
@@ -224,6 +234,39 @@ describe('solicitarCodigo — teléfono existente genera y persiste un código n
     const loggedFullPhone = logger.info.mock.calls.some((call) =>
       call.some((arg) => typeof arg === 'string' && arg.includes(TELEFONO)));
     expect(loggedFullPhone).toBe(false);
+  });
+});
+
+describe('solicitarCodigo — envío del código vía otp-envio.adapter.js (2026-11-23)', () => {
+  test('llama a enviarCodigo con el teléfono y el código real recién generado (en texto plano, SOLO al adapter)', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(otpEnvioAdapter.enviarCodigo).toHaveBeenCalledWith({ telefono: TELEFONO, codigo: CODIGO_REAL });
+  });
+
+  test('NO llama a enviarCodigo si el teléfono no existe (nunca se generó un código real)', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(otpEnvioAdapter.enviarCodigo).not.toHaveBeenCalled();
+  });
+
+  test('un fallo del adapter (enviado:false) nunca rompe solicitarCodigo ni afecta su respuesta', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+    otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: false, motivo: 'credenciales_no_configuradas' });
+
+    const resultado = await solicitarCodigo(TELEFONO);
+
+    expect(resultado).toEqual({ mensaje: expect.any(String), codigoDev: CODIGO_REAL });
   });
 });
 

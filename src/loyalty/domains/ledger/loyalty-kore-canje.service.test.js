@@ -151,7 +151,8 @@ describe('solicitarCodigoCanje — a diferencia de la consulta pública, SÍ lan
     expect(resultado.codigoDev).toBeUndefined();
   });
 
-  test('loguea que se generó un código, enmascarando el teléfono y sin exponer el código', async () => {
+  test('en producción, loguea que se generó un código, enmascarando el teléfono y sin exponer el código', async () => {
+    process.env.NODE_ENV = 'production';
     const card = makeCard();
     LoyaltyCard.findOne.mockResolvedValue(card);
     generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
@@ -166,6 +167,23 @@ describe('solicitarCodigoCanje — a diferencia de la consulta pública, SÍ lan
         expect(serialized).not.toContain(CODIGO_REAL);
       }
     }
+    const loggedFullPhone = logger.info.mock.calls.some((call) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes(TELEFONO)));
+    expect(loggedFullPhone).toBe(false);
+  });
+
+  test('fuera de producción, SÍ incluye el código en el log a propósito (sin canal real de envío todavía)', async () => {
+    process.env.NODE_ENV = 'development';
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigoCanje(TELEFONO);
+
+    const loggedCode = logger.info.mock.calls.some((call) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes(CODIGO_REAL)));
+    expect(loggedCode).toBe(true);
     const loggedFullPhone = logger.info.mock.calls.some((call) =>
       call.some((arg) => typeof arg === 'string' && arg.includes(TELEFONO)));
     expect(loggedFullPhone).toBe(false);

@@ -22,8 +22,20 @@
  * historial. Fuera de alcance a propósito: `nivel` (ya tiene su propio
  * `LoyaltyTierHistory`, no se duplica acá), `nipHash` (decisión explícita del
  * usuario 2026-10-19 de NO loguear valores de un secreto, solo quién/cuándo —
- * ver `cambiarNip`), `fotoUrl`/`revisionPendiente` (ya tienen sus propias
- * columnas de quién/cuándo en `LoyaltyCard`, menor criticidad que identidad).
+ * ver `cambiarNip`), `fotoUrl`/`revisionPendiente` cuando el cambio viene del
+ * staff vía `PATCH/POST /cards/:id` (ya tienen sus propias columnas de
+ * quién/cuándo en `LoyaltyCard`, menor criticidad que identidad) — y el campo
+ * legado `fechaNacimiento` (texto libre sin formato garantizado del import de
+ * clientes.csv, nunca usado para lógica de negocio, ver LoyaltyCard.js).
+ *
+ * Ampliado 2026-11-23 (pedido explícito del usuario, consulta pública): la
+ * fecha de nacimiento NUEVA que el cliente certifica él mismo
+ * (`fechaNacimientoCliente`, distinta de la legada) y la foto que el cliente
+ * sube él mismo (`fotoUrl`/`fotoDriveFileId`/`fotoMimeType`, mismas columnas
+ * que el staff pero con `origen: 'cliente'`) SÍ se auditan acá — ver
+ * `guardarFechaNacimientoConsulta`/`guardarFotoConsulta` en
+ * `loyalty-recovery.service.js`. La exclusión de `fotoUrl` de arriba aplica
+ * solo al camino de staff (`subirFoto`), que sigue sin pasar por acá.
  */
 
 const { LoyaltyCardAuditLog } = require('../../../shared/models/postgres');

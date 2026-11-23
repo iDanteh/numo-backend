@@ -21,12 +21,28 @@
  * nueva, sin contaminar contadores entre casos.
  */
 const express = require('express');
+const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
 const redisClient = require('../shared/utils/redis-client');
 const { asyncHandler } = require('../shared/middleware/error-handler');
+const { BadRequestError } = require('../shared/errors/AppError');
 const publicService = require('./domains/public/loyalty-public.service');
 const recoveryService = require('./domains/public/loyalty-recovery.service');
+
+// Multer dedicado a la foto PÚBLICA del cliente (2026-11-23) — mismo filtro de tipo que
+// uploadFotoCliente de staff (loyalty.routes.js), límite de tamaño MÁS ESTRICTO (5MB, no 15MB):
+// el de staff asume una cámara supervisada por un empleado; este es tráfico anónimo de un
+// cliente subiendo desde su propio celular, donde conviene un presupuesto de abuso más chico
+// (menos superficie de ataque de denegación de servicio/consumo de Drive vía uploads masivos).
+const uploadFotoClientePublico = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|png|webp)$/.test(file.mimetype);
+    cb(ok ? null : new Error('Solo se aceptan imágenes (jpg/png/webp)'), ok);
+  },
+});
 
 function crearLimitersConsulta() {
   const handler = (_req, res) => res.status(429).json({
@@ -101,6 +117,13 @@ function crearLimitersRecuperacion() {
 // secreto es el token de sesión en vez del código OTP. `email` es más laxo (20/15min): no es un
 // vector de fuerza bruta por sí solo (ya exige una sesión vigente, que ya pasó por el limiter de
 // `confirmar` para existir), solo evita spam de formato.
+//
+// `fechaNacimiento` (2026-11-23) reusa exactamente el presupuesto de `email` (20/15min): mismo
+// criterio — campo de texto simple, sin binario, ya protegido por la sesión vigente, el límite
+// solo evita spam de formato. `foto` es más estricta (10/15min, mismo presupuesto que `ver`/
+// `confirmar`): a diferencia de los campos de texto, cada request exitoso dispara una subida real
+// a Drive (googleapis) — un presupuesto más laxo abriría una vía barata de agotar cuota de la
+// cuenta de servicio o de bandwidth del servidor con uploads repetidos de binarios.
 function crearLimitersSesion() {
   const handler = (_req, res) => res.status(429).json({
     success: false,
@@ -113,8 +136,10 @@ function crearLimitersSesion() {
     standardHeaders: true, legacyHeaders: false, handler, passOnStoreError: true,
   };
   return {
-    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10), store: _redisStore('rl:loyalty-ver:') }),
-    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20), store: _redisStore('rl:loyalty-email:') }),
+    ver:             rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10), store: _redisStore('rl:loyalty-ver:') }),
+    email:           rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20), store: _redisStore('rl:loyalty-email:') }),
+    fechaNacimiento: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_FECHA_NACIMIENTO_MAX', 20), store: _redisStore('rl:loyalty-fecha-nacimiento:') }),
+    foto:            rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_FOTO_MAX', 10), store: _redisStore('rl:loyalty-foto:') }),
   };
 }
 
@@ -168,6 +193,31 @@ router.post('/consulta/email', limitersSesion.email, asyncHandler(async (req, re
   const resultado = await recoveryService.guardarEmailConsulta(telefono, token, email, { ip: req.ip });
   res.json(resultado);
 }));
+
+// Deja o actualiza la fecha de nacimiento que el cliente certifica él mismo (2026-11-23) —
+// requiere la misma sesión vigente que /consulta/email, sin consumir un uso. Opcional: el
+// cliente puede ignorar este campo. Columna NUEVA (fechaNacimientoCliente), nunca la legada
+// fechaNacimiento del import de clientes.csv — ver loyalty-recovery.service.js.
+router.post('/consulta/fecha-nacimiento', limitersSesion.fechaNacimiento, asyncHandler(async (req, res) => {
+  const { telefono, token, fechaNacimiento } = req.body ?? {};
+  const resultado = await recoveryService.guardarFechaNacimientoConsulta(telefono, token, fechaNacimiento, { ip: req.ip });
+  res.json(resultado);
+}));
+
+// Sube/reemplaza la foto propia del cliente (2026-11-23) — requiere la misma sesión vigente que
+// /consulta/email, sin consumir un uso. Multipart (campo 'foto'), límite 5MB (ver
+// uploadFotoClientePublico arriba, más estricto que el upload de staff de 15MB). 400 explícito si
+// no llega ningún archivo, mismo criterio que POST /cards/:id/foto de staff (loyalty.routes.js).
+router.post('/consulta/foto', limitersSesion.foto, uploadFotoClientePublico.single('foto'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw new BadRequestError('No se recibió ningún archivo.');
+    const { telefono, token } = req.body ?? {};
+    const resultado = await recoveryService.guardarFotoConsulta(
+      telefono, token, req.file.buffer, req.file.mimetype, { ip: req.ip },
+    );
+    res.json(resultado);
+  }),
+);
 
 module.exports = router;
 module.exports.crearLimitersConsulta = crearLimitersConsulta;

@@ -359,6 +359,148 @@ describe('obtenerPermitirSaldoNegativoCanje / guardarPermitirSaldoNegativoCanje 
   );
 });
 
+describe('obtenerOtpEnvioModo / guardarOtpEnvioModo (envío de código OTP, 2026-11-23)', () => {
+  test('obtenerOtpEnvioModo devuelve "simulado" cuando getValue tira (nunca configurado, default preserva el comportamiento actual)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('simulado');
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_MODO');
+  });
+
+  test('obtenerOtpEnvioModo devuelve "real" cuando está configurado explícitamente', async () => {
+    globalConfigService.getValue.mockResolvedValue('real');
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('real');
+  });
+
+  test('obtenerOtpEnvioModo devuelve el default "simulado" si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('algo-invalido');
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('simulado');
+  });
+
+  test('guardarOtpEnvioModo("real") llama a setValue con tipo:"texto" y devuelve "real"', async () => {
+    const resultado = await configService.guardarOtpEnvioModo('real', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_ENVIO_MODO', 'real',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe('real');
+  });
+
+  test('guardarOtpEnvioModo acepta mayúsculas/espacios ("  REAL  ") normalizando a "real"', async () => {
+    const resultado = await configService.guardarOtpEnvioModo('  REAL  ', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_MODO', 'real', expect.anything());
+    expect(resultado).toBe('real');
+  });
+
+  test.each([['sms'], [''], [null], [undefined]])(
+    'guardarOtpEnvioModo(%p) inválido → 400, no llama a setValue',
+    async (valor) => {
+      await expect(configService.guardarOtpEnvioModo(valor, USER)).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerOtpEnvioProveedor / guardarOtpEnvioProveedor', () => {
+  test('obtenerOtpEnvioProveedor devuelve "whatsapp" cuando getValue tira (default, único proveedor real hoy)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerOtpEnvioProveedor()).resolves.toBe('whatsapp');
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_PROVEEDOR');
+  });
+
+  test('obtenerOtpEnvioProveedor devuelve el valor configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('otro-canal');
+    await expect(configService.obtenerOtpEnvioProveedor()).resolves.toBe('otro-canal');
+  });
+
+  test('guardarOtpEnvioProveedor("whatsapp") llama a setValue con tipo:"texto"', async () => {
+    const resultado = await configService.guardarOtpEnvioProveedor('whatsapp', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_ENVIO_PROVEEDOR', 'whatsapp',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe('whatsapp');
+  });
+
+  test.each([[''], [null], [undefined]])('guardarOtpEnvioProveedor(%p) vacío → 400, no llama a setValue', async (valor) => {
+    await expect(configService.guardarOtpEnvioProveedor(valor, USER)).rejects.toMatchObject({ statusCode: 400 });
+    expect(globalConfigService.setValue).not.toHaveBeenCalled();
+  });
+});
+
+describe('obtenerOtpWhatsappConfig / guardarOtpWhatsappConfig (credenciales WhatsApp Cloud API, 2026-11-23)', () => {
+  test('obtenerOtpWhatsappConfig devuelve todo null/default cuando ninguna clave está configurada (alta en Meta todavía pendiente)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await expect(configService.obtenerOtpWhatsappConfig()).resolves.toEqual({
+      phoneNumberId: null,
+      wabaId: null,
+      token: null,
+      appSecret: null,
+      templateNombre: 'verificacion_codigo',
+      templateIdioma: 'es_MX',
+    });
+  });
+
+  test('obtenerOtpWhatsappConfig lee cada clave de la sección lealtad', async () => {
+    globalConfigService.getValue.mockImplementation(async (section, clave) => {
+      const valores = {
+        OTP_WHATSAPP_PHONE_NUMBER_ID: '1234567890',
+        OTP_WHATSAPP_WABA_ID: 'waba-1',
+        OTP_WHATSAPP_TOKEN: 'tok-real',
+        OTP_WHATSAPP_APP_SECRET: 'secreto-real',
+        OTP_WHATSAPP_TEMPLATE_NOMBRE: 'otra_plantilla',
+        OTP_WHATSAPP_TEMPLATE_IDIOMA: 'es',
+      };
+      if (section !== 'lealtad' || !(clave in valores)) throw new Error(`no mockeada: ${section}.${clave}`);
+      return valores[clave];
+    });
+
+    await expect(configService.obtenerOtpWhatsappConfig()).resolves.toEqual({
+      phoneNumberId: '1234567890',
+      wabaId: 'waba-1',
+      token: 'tok-real',
+      appSecret: 'secreto-real',
+      templateNombre: 'otra_plantilla',
+      templateIdioma: 'es',
+    });
+  });
+
+  test('guardarOtpWhatsappConfig solo escribe las llaves presentes (patch parcial, ej. solo phoneNumberId)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({ phoneNumberId: '1234567890' }, USER);
+
+    expect(globalConfigService.setValue).toHaveBeenCalledTimes(1);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_PHONE_NUMBER_ID', '1234567890',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+  });
+
+  test('guardarOtpWhatsappConfig marca token/appSecret con esSecreto:true (nunca en texto plano en el audit log)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({ token: 'tok-nuevo', appSecret: 'secreto-nuevo' }, USER);
+
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_TOKEN', 'tok-nuevo',
+      expect.objectContaining({ tipo: 'texto', esSecreto: true }),
+    );
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_APP_SECRET', 'secreto-nuevo',
+      expect.objectContaining({ tipo: 'texto', esSecreto: true }),
+    );
+  });
+
+  test('guardarOtpWhatsappConfig({}) no escribe nada (ninguna llave presente)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({}, USER);
+
+    expect(globalConfigService.setValue).not.toHaveBeenCalled();
+  });
+});
+
 describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
   test('obtenerFotoFolderId lee lealtad.FOTO_CLIENTE_FOLDER_ID y recorta espacios', async () => {
     globalConfigService.getValue.mockResolvedValue('  abc123  ');

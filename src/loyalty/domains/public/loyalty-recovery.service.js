@@ -12,12 +12,15 @@
  * código de 6 dígitos con vencimiento de 10 min. Nunca revela si el teléfono
  * existe o no — misma respuesta genérica en ambos casos (anti-enumeración,
  * igual que consultaPublica nunca distingue "teléfono desconocido" de "NIP
- * incorrecto"). El "envío" del código está SIMULADO: no hay proveedor de
- * mensajería elegido todavía (pendiente real del proyecto, Brevo/WhatsApp
- * API) — el código se loguea (nunca en texto plano hacia afuera) y, fuera de
- * producción, se incluye en la respuesta bajo `codigoDev` para poder probar el
- * flujo completo. Buscar `codigoDev` cuando se conecte el proveedor real: hay
- * que borrar esa rama.
+ * incorrecto"). El envío del código (2026-11-23, ver
+ * `loyalty/shared/otp-envio.adapter.js`) es 100% config-driven (Configuraciones
+ * Globales, sección `lealtad` — `obtenerOtpEnvioModo`/`obtenerOtpEnvioProveedor`
+ * en loyalty-config.service.js): modo 'simulado' (default hoy, mientras el
+ * usuario termina de dar de alta WhatsApp Business Cloud API en Meta) o 'real'
+ * (WhatsApp, plantilla Authentication). El adapter nunca lanza — una falla del
+ * proveedor nunca debe romper este flujo. Fuera de producción, el código sigue
+ * viajando en la respuesta bajo `codigoDev` para poder probar el flujo
+ * completo sin depender de que el envío real haya funcionado.
  *
  * Paso 2 (`confirmarCodigoConsulta`, 2026-10-26 — reemplazo del NIP estático en
  * la ruta pública de consulta de puntos, ver memoria
@@ -90,6 +93,8 @@ const {
   generarSesionToken, hashSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+// Envío del código OTP (2026-11-23) — ver docstring del archivo y otp-envio.adapter.js.
+const otpEnvioAdapter = require('../../shared/otp-envio.adapter');
 // Historial de movimientos (2026-11-03) — mismo criterio que loyalty-public.service.js#consultaPublica.
 const ledgerService = require('../ledger/loyalty-ledger.service');
 // Historial de cambios de catálogo (2026-11-09) — reusa la MISMA infraestructura que ya usa
@@ -240,11 +245,13 @@ async function solicitarCodigo(telefono, { ip } = {}) {
   logger.info(`[loyalty-recovery] Código generado tel=${_maskTelefono(telefonoStr)}`);
   _registrarEvento('solicitud_codigo', 'exito', null, telefonoStr, ip);
 
+  // Envío del código (ver docstring del archivo y otp-envio.adapter.js) — nunca lanza, una falla
+  // del proveedor real (o del simulado, que no debería fallar nunca) no debe romper este flujo.
+  await otpEnvioAdapter.enviarCodigo({ telefono: telefonoStr, codigo });
+
   const respuesta = { mensaje: MENSAJE_SOLICITUD_GENERICO };
-  // SIMULACIÓN TEMPORAL — no hay proveedor de mensajería elegido todavía
-  // (Brevo/WhatsApp API, pendiente real del proyecto). Remover esta rama
-  // cuando se conecte el envío real; hasta entonces, fuera de producción,
-  // el código viaja en la respuesta para poder probar el flujo completo.
+  // Fuera de producción, el código viaja en la respuesta para poder probar el flujo completo sin
+  // depender de que el envío (simulado o real) haya efectivamente funcionado.
   if (process.env.NODE_ENV !== 'production') {
     respuesta.codigoDev = codigo;
   }

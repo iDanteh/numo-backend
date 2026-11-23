@@ -306,6 +306,127 @@ async function guardarPermitirSaldoNegativoCanje(valor, user) {
 }
 
 /**
+ * ENVÍO DE CÓDIGO OTP (2026-11-23, pedido explícito del usuario) — config-driven del canal de
+ * envío que consume `loyalty/shared/otp-envio.adapter.js` (reemplaza la simulación inline que
+ * antes vivía hardcodeada en `loyalty-recovery.service.js#solicitarCodigo`). Mismo mecanismo que
+ * el resto (`GlobalConfig` sección `lealtad`, `tipo:'texto'`); las credenciales de WhatsApp
+ * (Phone Number ID, token, App Secret) son `esSecreto:true` (mismo criterio que `bancos.TOKEN`).
+ *
+ * `OTP_ENVIO_MODO` ('simulado' | 'real', default 'simulado') y `OTP_ENVIO_PROVEEDOR` (hoy solo
+ * 'whatsapp' es una implementación real) son el único acoplamiento entre el adapter y esta config
+ * — el usuario de Meta (developers.facebook.com) todavía está tramitando el alta (Phone Number ID/
+ * token pendientes), así que el default 'simulado' preserva el comportamiento actual (código
+ * logueado/`codigoDev`) sin requerir cargar nada.
+ */
+const OTP_ENVIO_MODOS = ['simulado', 'real'];
+const OTP_ENVIO_MODO_DEFAULT = 'simulado';
+const OTP_ENVIO_PROVEEDOR_DEFAULT = 'whatsapp';
+const OTP_WHATSAPP_TEMPLATE_NOMBRE_DEFAULT = 'verificacion_codigo';
+const OTP_WHATSAPP_TEMPLATE_IDIOMA_DEFAULT = 'es_MX';
+
+function _validarOtpEnvioModo(valor) {
+  const str = String(valor ?? '').trim().toLowerCase();
+  if (!OTP_ENVIO_MODOS.includes(str)) {
+    throw new BadRequestError(`El modo de envío de código debe ser uno de: ${OTP_ENVIO_MODOS.join(', ')}.`);
+  }
+  return str;
+}
+
+/** 'simulado' si nunca se configuró (D11-like: el único modo real soportado hoy requiere
+ *  credenciales que todavía no existen) — nunca lanza. */
+async function obtenerOtpEnvioModo() {
+  const valor = await globalConfigService.getValue(SECTION, 'OTP_ENVIO_MODO').catch(() => null);
+  return valor && OTP_ENVIO_MODOS.includes(valor) ? valor : OTP_ENVIO_MODO_DEFAULT;
+}
+
+async function guardarOtpEnvioModo(modo, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const valido = _validarOtpEnvioModo(modo);
+  await globalConfigService.setValue(SECTION, 'OTP_ENVIO_MODO', valido, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return valido;
+}
+
+/** 'whatsapp' si nunca se configuró — hoy es el único proveedor real soportado por el adapter
+ *  (ver `PROVEEDORES` en otp-envio.adapter.js), pero esta config existe desde ya para que un
+ *  cambio de canal futuro no requiera tocar código, solo esta clave. */
+async function obtenerOtpEnvioProveedor() {
+  const valor = await globalConfigService.getValue(SECTION, 'OTP_ENVIO_PROVEEDOR').catch(() => null);
+  return valor ? String(valor).trim() : OTP_ENVIO_PROVEEDOR_DEFAULT;
+}
+
+async function guardarOtpEnvioProveedor(proveedor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const str = String(proveedor ?? '').trim();
+  if (!str) {
+    throw new BadRequestError('proveedor es requerido.');
+  }
+  await globalConfigService.setValue(SECTION, 'OTP_ENVIO_PROVEEDOR', str, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return str;
+}
+
+/**
+ * Credenciales/ajustes del proveedor WhatsApp Business Cloud API — todas opcionales hoy (el
+ * usuario todavía está tramitando el alta en Meta): cualquier campo no configurado vuelve `null`
+ * (o su default, para los dos campos de plantilla), nunca lanza. `token`/`appSecret` son
+ * `esSecreto:true` — nunca quedan en texto plano en `global_configs.valor` ni en el valor
+ * anterior/nuevo del audit log (`ConfigAuditLog`, ver `global-config.service.js#setValue`).
+ * `wabaId` se guarda por completitud (uno de los 4 datos que el usuario está esperando de Meta)
+ * aunque el adapter hoy no lo necesita para enviar mensajes (solo Phone Number ID + token).
+ */
+async function obtenerOtpWhatsappConfig() {
+  const claves = [
+    'OTP_WHATSAPP_PHONE_NUMBER_ID', 'OTP_WHATSAPP_WABA_ID', 'OTP_WHATSAPP_TOKEN',
+    'OTP_WHATSAPP_APP_SECRET', 'OTP_WHATSAPP_TEMPLATE_NOMBRE', 'OTP_WHATSAPP_TEMPLATE_IDIOMA',
+  ];
+  const [phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma] = await Promise.all(
+    claves.map((clave) => globalConfigService.getValue(SECTION, clave).catch(() => null)),
+  );
+  return {
+    phoneNumberId: phoneNumberId || null,
+    wabaId: wabaId || null,
+    token: token || null,
+    appSecret: appSecret || null,
+    templateNombre: templateNombre || OTP_WHATSAPP_TEMPLATE_NOMBRE_DEFAULT,
+    templateIdioma: templateIdioma || OTP_WHATSAPP_TEMPLATE_IDIOMA_DEFAULT,
+  };
+}
+
+/** Patch parcial — mismo criterio que `editarReason`/`editarPromocion`: solo escribe las llaves
+ *  presentes (`undefined` se omite), para poder cargar un dato a la vez a medida que Meta los
+ *  vaya liberando (ej. hoy solo Phone Number ID, después el token, etc.). */
+async function guardarOtpWhatsappConfig({
+  phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma,
+} = {}, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const base = { usuarioId, usuarioNombre };
+
+  if (phoneNumberId !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_PHONE_NUMBER_ID', String(phoneNumberId ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (wabaId !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_WABA_ID', String(wabaId ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (token !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TOKEN', String(token ?? '').trim(), { tipo: 'texto', esSecreto: true, ...base });
+  }
+  if (appSecret !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_APP_SECRET', String(appSecret ?? '').trim(), { tipo: 'texto', esSecreto: true, ...base });
+  }
+  if (templateNombre !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TEMPLATE_NOMBRE', String(templateNombre ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (templateIdioma !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TEMPLATE_IDIOMA', String(templateIdioma ?? '').trim(), { tipo: 'texto', ...base });
+  }
+
+  return obtenerOtpWhatsappConfig();
+}
+
+/**
  * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
  * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
  * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
@@ -886,6 +1007,12 @@ module.exports = {
   guardarCanjeCodigoVigenciaMin,
   obtenerPermitirSaldoNegativoCanje,
   guardarPermitirSaldoNegativoCanje,
+  obtenerOtpEnvioModo,
+  guardarOtpEnvioModo,
+  obtenerOtpEnvioProveedor,
+  guardarOtpEnvioProveedor,
+  obtenerOtpWhatsappConfig,
+  guardarOtpWhatsappConfig,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

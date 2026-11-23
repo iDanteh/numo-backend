@@ -271,6 +271,58 @@ router.put('/config/permitir-saldo-negativo-canje', authenticate, permit(PERMISS
   res.json({ habilitado: await configService.guardarPermitirSaldoNegativoCanje(req.body?.habilitado, req.user) });
 }));
 
+// Envío de código OTP (2026-11-23, pedido explícito del usuario) — config-driven del canal de
+// envío consumido por `loyalty/shared/otp-envio.adapter.js` (ver loyalty-config.service.js para el
+// detalle completo). Mismo criterio de permisos/contrato que el resto de esta pantalla
+// (LOYALTY_READ/LOYALTY_CONFIG). `modo`/`proveedor` son 2 claves independientes (no un grupo) —
+// mismo criterio que CONGELAMIENTO/CONSULTA_CODIGO_MAX_MES arriba: cada una vive en su propia
+// ruta porque el servicio ya las expone como 2 pares obtener/guardar separados.
+router.get('/config/otp-envio-modo', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ modo: await configService.obtenerOtpEnvioModo() });
+}));
+
+router.put('/config/otp-envio-modo', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ modo: await configService.guardarOtpEnvioModo(req.body?.modo, req.user) });
+}));
+
+router.get('/config/otp-envio-proveedor', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ proveedor: await configService.obtenerOtpEnvioProveedor() });
+}));
+
+router.put('/config/otp-envio-proveedor', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ proveedor: await configService.guardarOtpEnvioProveedor(req.body?.proveedor, req.user) });
+}));
+
+// Credenciales/ajustes de WhatsApp Business Cloud API — acá SÍ es un único endpoint de grupo (a
+// diferencia de modo/proveedor arriba): el servicio ya las expone como UN solo par
+// obtener/guardar (`obtenerOtpWhatsappConfig`/`guardarOtpWhatsappConfig`, patch parcial — ver
+// loyalty-config.service.js), así que replicar eso con 6 rutas individuales sería inventar una
+// convención nueva en vez de seguir la que ya existe. `token`/`appSecret` son `esSecreto:true`
+// (nunca se descifran para esta pantalla): se enmascaran acá con el MISMO placeholder fijo que ya
+// usa el enmascarado genérico de Configuraciones Globales para cualquier config esSecreto (ver
+// `global-config.service.js#listConfigsBySection`) — nunca el valor real, ni en el GET ni en la
+// confirmación del PUT.
+const _OTP_WHATSAPP_SECRET_MASK = '••••••••';
+function _enmascararOtpWhatsapp(config) {
+  return {
+    ...config,
+    token:     config.token ? _OTP_WHATSAPP_SECRET_MASK : null,
+    appSecret: config.appSecret ? _OTP_WHATSAPP_SECRET_MASK : null,
+  };
+}
+
+router.get('/config/otp-whatsapp', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(_enmascararOtpWhatsapp(await configService.obtenerOtpWhatsappConfig()));
+}));
+
+router.put('/config/otp-whatsapp', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  const { phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma } = req.body ?? {};
+  const config = await configService.guardarOtpWhatsappConfig(
+    { phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma }, req.user,
+  );
+  res.json(_enmascararOtpWhatsapp(config));
+}));
+
 // Auditoría de eventos OTP (2026-11-13, pedido explícito del usuario) — quién pidió/validó un
 // código, cuándo y con qué resultado, para la consulta pública Y el canje con Kore (mismo tabla,
 // `tipo` distingue el flujo). Permiso dedicado LOYALTY_AUDITORIA (pedido explícito del usuario,

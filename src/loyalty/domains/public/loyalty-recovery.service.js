@@ -673,7 +673,8 @@ async function guardarFotoConsulta(telefono, token, buffer, mimetype, ctx = {}) 
     throw new FotoInvalidaError();
   }
 
-  const nombreArchivo = `foto-cliente-publico-${card.telefono}-${Date.now()}`;
+  // Formato pedido explícito del usuario (2026-11-23): "Teléfono - Nombre - Registro público".
+  const nombreArchivo = `${card.telefono} - ${card.nombre} - Registro público`;
   const { driveFileId, driveWebViewLink } = await subirFotoCliente(buffer, mimetype, nombreArchivo);
 
   const antes = {

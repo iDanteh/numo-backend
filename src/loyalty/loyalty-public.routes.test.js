@@ -13,6 +13,14 @@
 // que `error-handler.js` ahora propaga desde `err.code`.
 jest.mock('./domains/public/loyalty-public.service');
 jest.mock('./domains/public/loyalty-recovery.service');
+// Automock de loyalty-recovery.service.js arriba igual ejecuta su require() real de
+// drive-loyalty-foto.service.js (Jest necesita cargar el módulo real para derivar la forma del
+// mock) — y ese, a su vez, el de 'googleapis' (dependencia pesada). Mockearlo también evita
+// transformar/cargar 'googleapis' entero en cada test de este archivo (freshApp() hace
+// jest.resetModules() + require() fresco por test): sin esto, el PRIMER test de la corrida paga
+// el costo de compilación en frío de 'googleapis' y puede exceder el timeout default de Jest
+// (hallazgo real 2026-11-23, al agregar guardarFotoConsulta).
+jest.mock('./domains/cards/drive-loyalty-foto.service');
 
 // Store en Redis de los 4 limiters dedicados (solicitar/confirmar/ver/email,
 // consultoría de desempeño 2026-11-11: cluster nativo + Redis) — mockea
@@ -59,6 +67,13 @@ jest.mock('rate-limit-redis', () => {
 const express = require('express');
 const request = require('supertest');
 const errorHandler = require('../shared/middleware/error-handler');
+
+// Foto pública (2026-11-23) trae `multer` a este router (antes solo lo usaba el router de
+// staff) — freshApp() hace jest.resetModules() + require() fresco en CADA test de este archivo,
+// así que el primer test paga el costo de transformar/cargar multer+busboy en frío (hallazgo
+// real: excedía el default de 5s de Jest la primera vez). Mismo criterio que
+// receipt.service.test.js (OCR real) — no es un test lento de verdad, es el costo de arranque.
+jest.setTimeout(20000);
 
 /** Re-requiere el router (y sus services mockeados) en un registro de módulos
  * limpio, para que cada test tenga su propia `MemoryStore` de rate limiting. */
@@ -348,6 +363,135 @@ describe('sesión de consulta post-código (2026-11-09) — "ver de nuevo" + ema
     expect(res.body.code).toBe('LOYALTY_EMAIL_INVALIDO');
   });
 
+  test('POST /consulta/fecha-nacimiento llega al service sin Authorization y devuelve el valor guardado', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.guardarFechaNacimientoConsulta.mockResolvedValue({
+      mensaje: 'Listo, guardamos tu fecha de nacimiento.', fechaNacimientoCliente: '2000-01-15',
+    });
+
+    const res = await request(app).post('/api/loyalty/public/consulta/fecha-nacimiento')
+      .send({ telefono: '5512345678', token: 'token-real', fechaNacimiento: '2000-01-15' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ mensaje: 'Listo, guardamos tu fecha de nacimiento.', fechaNacimientoCliente: '2000-01-15' });
+    expect(recoveryService.guardarFechaNacimientoConsulta).toHaveBeenCalledWith(
+      '5512345678', 'token-real', '2000-01-15', expect.objectContaining({ ip: expect.anything() }),
+    );
+  });
+
+  test('GET /consulta/fecha-nacimiento no existe (solo POST)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/consulta/fecha-nacimiento').query({ telefono: '5512345678' });
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio (422 LOYALTY_FECHA_NACIMIENTO_INVALIDA) se propaga con su propio código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('Ingresá una fecha de nacimiento válida.'), {
+      statusCode: 422, code: 'LOYALTY_FECHA_NACIMIENTO_INVALIDA',
+    });
+    recoveryService.guardarFechaNacimientoConsulta.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/consulta/fecha-nacimiento')
+      .send({ telefono: '5512345678', token: 'token-real', fechaNacimiento: 'no-es-una-fecha' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_FECHA_NACIMIENTO_INVALIDA');
+  });
+
+  test('el 21vo request a /consulta/fecha-nacimiento en 15min → 429 (mismo presupuesto que /consulta/email)', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.guardarFechaNacimientoConsulta.mockResolvedValue({ mensaje: 'ok', fechaNacimientoCliente: '2000-01-15' });
+
+    for (let i = 0; i < 20; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await request(app).post('/api/loyalty/public/consulta/fecha-nacimiento').send({ telefono: '5512345678', token: 'token-real', fechaNacimiento: '2000-01-15' });
+      expect(r.status).toBe(200);
+    }
+    const veintiuno = await request(app).post('/api/loyalty/public/consulta/fecha-nacimiento').send({ telefono: '5512345678', token: 'token-real', fechaNacimiento: '2000-01-15' });
+    expect(veintiuno.status).toBe(429);
+    expect(recoveryService.guardarFechaNacimientoConsulta).toHaveBeenCalledTimes(20);
+  });
+
+  test('POST /consulta/foto llega al service sin Authorization y devuelve el mensaje', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.guardarFotoConsulta.mockResolvedValue({ mensaje: 'Listo, guardamos tu foto.' });
+
+    const res = await request(app).post('/api/loyalty/public/consulta/foto')
+      .field('telefono', '5512345678')
+      .field('token', 'token-real')
+      .attach('foto', Buffer.from('fake-image-bytes'), { filename: 'foto.jpg', contentType: 'image/jpeg' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ mensaje: 'Listo, guardamos tu foto.' });
+    expect(recoveryService.guardarFotoConsulta).toHaveBeenCalledWith(
+      '5512345678', 'token-real', expect.any(Buffer), 'image/jpeg', expect.objectContaining({ ip: expect.anything() }),
+    );
+  });
+
+  test('POST /consulta/foto sin archivo → 400, nunca llega al service', async () => {
+    const { app, recoveryService } = freshApp();
+
+    const res = await request(app).post('/api/loyalty/public/consulta/foto')
+      .field('telefono', '5512345678')
+      .field('token', 'token-real');
+
+    expect(res.status).toBe(400);
+    expect(recoveryService.guardarFotoConsulta).not.toHaveBeenCalled();
+  });
+
+  test('POST /consulta/foto con un tipo no soportado (pdf) → rechazado por el multer de la ruta, nunca llega al service', async () => {
+    const { app, recoveryService } = freshApp();
+
+    const res = await request(app).post('/api/loyalty/public/consulta/foto')
+      .field('telefono', '5512345678')
+      .field('token', 'token-real')
+      .attach('foto', Buffer.from('%PDF-1.4'), { filename: 'archivo.pdf', contentType: 'application/pdf' });
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(recoveryService.guardarFotoConsulta).not.toHaveBeenCalled();
+  });
+
+  test('GET /consulta/foto no existe (solo POST)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/consulta/foto');
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio (422 LOYALTY_FOTO_INVALIDA) se propaga con su propio código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('La foto debe ser JPG, PNG o WEBP.'), {
+      statusCode: 422, code: 'LOYALTY_FOTO_INVALIDA',
+    });
+    recoveryService.guardarFotoConsulta.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/consulta/foto')
+      .field('telefono', '5512345678')
+      .field('token', 'token-real')
+      .attach('foto', Buffer.from('fake-image-bytes'), { filename: 'foto.jpg', contentType: 'image/jpeg' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_FOTO_INVALIDA');
+  });
+
+  test('el 11vo request a /consulta/foto en 15min → 429 (presupuesto más estricto que texto, por ser upload de binario)', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.guardarFotoConsulta.mockResolvedValue({ mensaje: 'ok' });
+
+    for (let i = 0; i < 10; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await request(app).post('/api/loyalty/public/consulta/foto')
+        .field('telefono', '5512345678').field('token', 'token-real')
+        .attach('foto', Buffer.from('fake-image-bytes'), { filename: 'foto.jpg', contentType: 'image/jpeg' });
+      expect(r.status).toBe(200);
+    }
+    const onceavo = await request(app).post('/api/loyalty/public/consulta/foto')
+      .field('telefono', '5512345678').field('token', 'token-real')
+      .attach('foto', Buffer.from('fake-image-bytes'), { filename: 'foto.jpg', contentType: 'image/jpeg' });
+    expect(onceavo.status).toBe(429);
+    expect(recoveryService.guardarFotoConsulta).toHaveBeenCalledTimes(10);
+  });
+
   test('crearLimitersSesion() exporta una factory (MemoryStore fresca por llamada, no singleton)', () => {
     const { loyaltyPublicRoutes } = freshApp();
     const { crearLimitersSesion } = loyaltyPublicRoutes;
@@ -356,23 +500,26 @@ describe('sesión de consulta post-código (2026-11-09) — "ver de nuevo" + ema
     const par2 = crearLimitersSesion();
     expect(par1.ver).not.toBe(par2.ver);
     expect(par1.email).not.toBe(par2.email);
+    expect(par1.fechaNacimiento).not.toBe(par2.fechaNacimiento);
+    expect(par1.foto).not.toBe(par2.foto);
   });
 });
 
-describe('store en Redis de los 4 limiters dedicados (cluster nativo + Redis, 2026-11-11)', () => {
-  test('cargar el router construye 4 RedisStore — uno por limiter, cada uno con su propio prefix (nunca un store compartido)', () => {
+describe('store en Redis de los 6 limiters dedicados (cluster nativo + Redis, 2026-11-11, ampliado 2026-11-23)', () => {
+  test('cargar el router construye 6 RedisStore — uno por limiter, cada uno con su propio prefix (nunca un store compartido)', () => {
     const { RedisStore } = freshApp();
 
     // app.js también usa RedisStore (limiter global, prefix 'rl:global:'), pero ese vive
-    // en otro módulo (app.js no se requiere en este test) — acá solo cargan los 4 de
+    // en otro módulo (app.js no se requiere en este test) — acá solo cargan los 6 de
     // loyalty-public.routes.js: solicitar/confirmar (crearLimitersRecuperacion, ya
-    // instanciados a nivel de módulo) + ver/email (crearLimitersSesion, ídem).
-    expect(RedisStore).toHaveBeenCalledTimes(4);
+    // instanciados a nivel de módulo) + ver/email/fechaNacimiento/foto (crearLimitersSesion, ídem).
+    expect(RedisStore).toHaveBeenCalledTimes(6);
 
     const prefixes = RedisStore.mock.calls.map(([options]) => options.prefix);
-    expect(new Set(prefixes).size).toBe(4); // los 4 prefixes son distintos entre sí
+    expect(new Set(prefixes).size).toBe(6); // los 6 prefixes son distintos entre sí
     expect(prefixes).toEqual(expect.arrayContaining([
       'rl:loyalty-solicitar:', 'rl:loyalty-confirmar:', 'rl:loyalty-ver:', 'rl:loyalty-email:',
+      'rl:loyalty-fecha-nacimiento:', 'rl:loyalty-foto:',
     ]));
 
     // Cada llamada recibe un `sendCommand` propio que delega al redisClient compartido —
@@ -381,10 +528,10 @@ describe('store en Redis de los 4 limiters dedicados (cluster nativo + Redis, 20
       expect(typeof options.sendCommand).toBe('function');
     });
 
-    // 4 instancias distintas (cada `new RedisStore(...)` arma su propio Map interno) —
+    // 6 instancias distintas (cada `new RedisStore(...)` arma su propio Map interno) —
     // es justo lo que evita que, p. ej., /recuperacion/solicitar y /recuperacion/confirmar
-    // (o /consulta/ver y /consulta/email) pisen el contador del otro en Redis.
+    // (o /consulta/ver y /consulta/email/fecha-nacimiento/foto) pisen el contador del otro en Redis.
     const instancias = new Set(RedisStore.mock.instances);
-    expect(instancias.size).toBe(4);
+    expect(instancias.size).toBe(6);
   });
 });

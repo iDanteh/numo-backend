@@ -907,6 +907,15 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS total_consultas                INTEGER NOT NULL DEFAULT 0
   `).catch(e => console.warn('[syncModels] ADD COLUMN consulta_sesion_*/email_contacto/ultima_consulta_at/total_consultas (loyalty_cards):', e.message));
 
+  // Fecha de nacimiento certificada por el cliente (2026-11-23, consulta pública) — columna
+  // nueva sobre loyalty_cards, que YA existía con datos reales: idempotente, mismo patrón que el
+  // resto de este archivo. Ver LoyaltyCard.js (deliberadamente separada de fecha_nacimiento,
+  // legado) y loyalty-recovery.service.js#guardarFechaNacimientoConsulta.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS fecha_nacimiento_cliente DATE
+  `).catch(e => console.warn('[syncModels] ADD COLUMN fecha_nacimiento_cliente (loyalty_cards):', e.message));
+
   // Límite mensual de consultas CON CÓDIGO (2026-11-09, consulta pública) — ver LoyaltyCard.js y
   // loyalty-recovery.service.js. Mismo patrón idempotente que el bloque anterior.
   await LoyaltyCard.sequelize.query(`

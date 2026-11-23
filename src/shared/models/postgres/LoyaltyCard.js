@@ -281,6 +281,19 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     allowNull: true,
     comment:   'Email que el cliente deja desde la consulta pública para contacto futuro. Sin flujo de verificación — se persiste tal cual, validado solo en formato.',
   },
+  // Fecha de nacimiento CERTIFICADA por el propio cliente desde la consulta pública (2026-11-23,
+  // pedido explícito del usuario) — columna NUEVA, deliberadamente separada de `fechaNacimiento`
+  // (legado, STRING(50) sin formato garantizado, importado de clientes.csv, ver comentario
+  // arriba): mezclar ambas perdería la garantía de que ESTA es una fecha real, validada, con fin
+  // operativo (ej. promociones de cumpleaños). DATEONLY real (no texto libre) — formato
+  // "YYYY-MM-DD", validado en guardarFechaNacimientoConsulta (loyalty-recovery.service.js): fecha
+  // real, no futura, no mayor a ~120 años. Visible en el defaultScope (a diferencia del campo
+  // legado): es un dato que el cliente certifica él mismo, mismo criterio que emailContacto.
+  fechaNacimientoCliente: {
+    type:      DataTypes.DATEONLY,
+    allowNull: true,
+    comment:   'Fecha de nacimiento certificada por el propio cliente desde la consulta pública (2026-11-23) — distinta de fechaNacimiento (legado, texto libre sin formato garantizado). Validada (fecha real, no futura, no > ~120 años) en guardarFechaNacimientoConsulta.',
+  },
   ultimaConsultaAt: {
     type:      DataTypes.DATE,
     allowNull: true,

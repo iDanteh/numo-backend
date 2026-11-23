@@ -76,6 +76,11 @@ async function _facturasDelRango({ rfc, series, fechaInicio, fechaFin }) {
   const porUuid = new Map();
   for (const c of docs) {
     const u = c.uuid.toUpperCase();
+    // Copia ERP sin timbrar (uuid sintético "SINUUID-…"): no es factura todavía.
+    // 2026-11-23, global A0-261110712 del 21-nov: el reporte la trajo de Kore a
+    // las 19:32 sin timbrar y a las 19:37 llegó la timbrada (otro uuid) → salía
+    // el bloque dos veces con los mismos depósitos.
+    if (u.startsWith('SINUUID-')) continue;
     if (!seriesSet.has(String(c.serie ?? '').trim().toUpperCase())) continue;
     // Una por UUID; la copia ERP manda (es la que trae la fecha real).
     if (!porUuid.has(u) || c.source === 'ERP') porUuid.set(u, { ...c, uuid: u, dia: diaPorUuid.get(u) });

@@ -349,3 +349,25 @@ test('consignación PPD del mismo día entra, ligada por remisión; PPD posterio
   expect(arg.movimientos).toEqual([{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: FACT }]);
   expect([...arg.uuidPorRemision]).toEqual([['A0|261002627', FACT]]);
 });
+
+// 2026-11-23: copia ERP sin timbrar ("SINUUID-…") de la misma global que la
+// timbrada → antes salía el bloque dos veces; ahora solo la timbrada.
+test('una copia SINUUID (sin timbrar) no entra como factura', async () => {
+  const REAL = '29DCF225-861C-4639-97D0-94F50A2EE69C';
+  const SIN = 'SINUUID-CCO011113663-A0-261110712-18598.4254';
+  gen._uuidsPorFechaEfectiva.mockImplementation(async ({ fechaInicio }) => new Set(fechaInicio === '2026-11-21' ? [REAL, SIN] : []));
+  CFDI.find.mockReturnValue(lean([
+    { uuid: SIN, serie: 'A0', folio: '261110712', fecha: '2026-11-21T13:26:42Z', total: 18598.4254, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
+    { uuid: REAL, serie: 'A0', folio: '261110712', fecha: '2026-11-21T13:26:42Z', total: 18598.42, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
+  ]));
+  BankMovement.find.mockReturnValue(lean([
+    { fecha: new Date('2026-11-18T00:00:00Z'), erpLinks: [{ folioFiscal: REAL }] },
+    { fecha: new Date('2026-11-18T00:00:00Z'), erpLinks: [{ folioFiscal: SIN }] },
+  ]));
+  mostrador.detectarMovimientosMostrador.mockResolvedValue([]);
+  await generarYEsperar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-11-21' }, { dbId: '6' });
+
+  const [arg] = mostrador.detectarMovimientosMostrador.mock.calls[0];
+  expect(arg.cfdis.map(c => c.uuid)).toEqual([REAL]);
+  expect(arg.movimientos.map(m => m.cfdiUuid)).toEqual([REAL]);
+});

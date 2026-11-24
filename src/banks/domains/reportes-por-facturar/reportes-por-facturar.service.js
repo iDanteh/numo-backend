@@ -330,18 +330,42 @@ function _enSegundoPlano(id, calcular) {
 /** Espera a que termine el cálculo en curso de un reporte (pruebas). */
 const _esperar = id => _enCurso.get(Number(id)) ?? Promise.resolve();
 
+// Sin duplicados (2026-11-24): los reportes 87 y 88 (21-oct, Todas) se crearon
+// con 0.2 s de diferencia desde el mismo navegador y los dos consultaban Kore
+// a la vez (429, más lento). Mientras uno igual (empresa + sucursal + fechas)
+// se está creando o calculando, "Generar" devuelve ese mismo en vez de otro.
+// Se registra antes del primer await para que dos peticiones simultáneas no
+// pasen las dos.
+const _generando = new Map(); // clave → promesa con el id del reporte
+
 async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
-  const { sucursal, fechaFin: fin } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
-  const reporte = await ReportePorFacturar.create({
-    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
-    datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
-    creadoPorId: _userId(user),
-  });
-  _enSegundoPlano(reporte.id, async avance => {
-    const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
-    return { sucursal: suc, datos, resumen, advertencias };
-  });
-  return obtener(reporte.id);
+  const clave = [rfc, centroCostoId ? Number(centroCostoId) : '', fechaInicio, fechaFin || fechaInicio].join('|');
+  const previo = _generando.get(clave);
+  if (previo) {
+    const idPrevio = await previo.catch(() => null);
+    // Si ya lo eliminaron (obtener → NotFound) se crea uno nuevo.
+    if (idPrevio != null) {
+      const r = await obtener(idPrevio).catch(err => (err instanceof NotFoundError ? null : Promise.reject(err)));
+      if (r) return r;
+    }
+  }
+  const creado = (async () => {
+    const { sucursal, fechaFin: fin } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
+    const reporte = await ReportePorFacturar.create({
+      rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
+      datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
+      creadoPorId: _userId(user),
+    });
+    _enSegundoPlano(reporte.id, async avance => {
+      const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
+      return { sucursal: suc, datos, resumen, advertencias };
+    }).finally(() => { if (_generando.get(clave) === creado) _generando.delete(clave); });
+    return reporte.id;
+  })();
+  _generando.set(clave, creado);
+  // Si falla la validación o el guardado no se queda bloqueada la clave.
+  creado.catch(() => { if (_generando.get(clave) === creado) _generando.delete(clave); });
+  return obtener(await creado);
 }
 
 /**

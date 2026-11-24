@@ -103,6 +103,19 @@ const ReportePorFacturar = sequelize.define('ReportePorFacturar', {
     type:      DataTypes.TEXT,
     allowNull: true,
   },
+  /**
+   * Tiempo del último cálculo (2026-11-24, pedido del usuario): inicio al
+   * Generar / ↻ Actualizar y fin al quedar listo o con error. Aparte de
+   * `updated_at`, que al eliminar el reporte se pisa con la hora del borrado.
+   */
+  calculoInicio: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
+  calculoFin: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'reportes_por_facturar',
   underscored: true,

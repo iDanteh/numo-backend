@@ -234,6 +234,16 @@ async function _validar({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 const ESTATUS_POR_FACTURAR_K = 'CONSIGNACION';
 const _serieK = v => String(v ?? '').trim().toUpperCase();
 
+// Remisión cuyos cobros reales (monto < 0, sin retiros RET) son TODOS de la caja
+// al momento de la venta (serieOrigen CBT) → venta de contado (PUE), nunca PPD
+// por facturar. Se descarta antes de preguntar a Kore (2026-11-24: ~80% de las
+// consultas; en kore_remisiones 7,227 de 7,228 así eran PUE y la otra no era
+// por facturar). Sin cobros reales no se descarta.
+function _soloCobroCaja(c) {
+  const reales = (c?.cobros ?? []).filter(x => Number(x?.monto) < 0 && _serieK(x?.serieOrigen) !== 'RET');
+  return reales.length > 0 && reales.every(x => _serieK(x.serieOrigen) === 'CBT');
+}
+
 /**
  * Remisiones PPD/POR FACTURAR de Kore con cobros en el rango que NO tienen
  * depósito identificado en Bancos → "PENDIENTE GENERAR FACTURA" con idNumo S/R.
@@ -254,6 +264,7 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
       if (c.serieFactura) continue; // ya facturada
       const rem = `${s}-${f}`;
       if (remisionesBancos.has(rem)) continue; // ya aparece vía Bancos
+      if (_soloCobroCaja(c)) continue; // venta de contado: no es PPD por facturar
       const k = `${s}|${f}`;
       if (!candidatasPorClave.has(k)) candidatasPorClave.set(k, c);
     }
@@ -268,8 +279,11 @@ async function _pendientesKore({ rfc, series, fechaInicio, fechaFin, remisionesB
       folio: String(c.folioVenta ?? '').trim(),
       fechaCreacion: c.fechaCreacion,
     })),
-    // Saldo fresco de Kore salvo las que ya quedaron liquidadas en la memoria.
-    necesitaSaldo: (k, g) => !g?.liquidadaEl,
+    // Saldo fresco de Kore salvo las que ya quedaron liquidadas en la memoria
+    // o las que ya se sabe que no son PPD (el tipo de pago no cambia; solo las
+    // PPD se usan abajo) — 2026-11-24, reporte tardaba minutos re-preguntando
+    // cada corrida las ventas de contado.
+    necesitaSaldo: (k, g) => !g?.liquidadaEl && !(g?.tipoPago && g.tipoPago !== 'PPD'),
   });
 
   const saldadas = [];

@@ -303,7 +303,9 @@ test('refacturada: encabezado con las otras facturas de sus mismas remisiones', 
 // (sin depósito en Bancos) se reparten por saldo, igual que las de Bancos.
 test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo de Kore → CON PENDIENTES DE PAGO', async () => {
   const cuenta = (folio, monto) => ({ serieVenta: 'A0', folioVenta: folio, fechaCreacion: '2026-10-28T16:00:00Z', cobros: [{ monto, fecha: '2026-11-12T17:00:00Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto }] }] });
-  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ centro }) => (centro === 'A0' ? [cuenta('1', 500), cuenta('2', 200), cuenta('3', 80), cuenta('4', 90)] : []));
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ centro }) => (centro === 'A0' ? [cuenta('1', 500), cuenta('2', 200), cuenta('3', 80), cuenta('4', 90), conOrigen(cuenta('5', 70), 'CBT'), conOrigen(cuenta('6', 60), 'CBT', 'ABO')] : []));
+  // Solo cobro de caja (CBT) = contado: ni se pregunta a Kore (2026-11-24); CBT + ABO sí.
+  const conOrigen = (c, ...origenes) => ({ ...c, cobros: origenes.map(o => ({ ...c.cobros[0], monto: -c.cobros[0].monto, serieOrigen: o })) });
   koreRem.infoRemisiones.mockResolvedValue({ sinRespuesta: 1, consultadas: 4, info: new Map([
     ['A0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', nombre: 'SALDADA', saldoActual: 0 }],
     ['A0|2', { tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', nombre: 'DEBE', saldoActual: 300 }],
@@ -315,6 +317,9 @@ test('S/R de Kore: saldada → PENDIENTE GENERAR FACTURA; con saldo o sin saldo 
   // Pide saldo fresco salvo a las ya liquidadas en la memoria.
   const { necesitaSaldo } = koreRem.infoRemisiones.mock.calls[0][0];
   expect([necesitaSaldo('A0|1', { liquidadaEl: new Date() }), necesitaSaldo('A0|2', {})]).toEqual([false, true]);
+  // Ya guardada como no PPD (contado): no se vuelve a preguntar (2026-11-24).
+  expect([necesitaSaldo('A0|4', { tipoPago: 'PUE' }), necesitaSaldo('A0|2', { tipoPago: 'PPD' }), necesitaSaldo('A0|9', undefined)]).toEqual([false, true, true]);
+  expect(koreRem.infoRemisiones.mock.calls[0][0].remisiones.map(r => r.folio)).toEqual(['1', '2', '3', '4', '6']);
   const sr = arr => arr.filter(d => d.idNumo === 'S/R').map(d => [d.cliente, d.importe, d.saldo]);
   expect(sr(datos.depositosPendientesFactura)).toEqual([['SALDADA', 500, 0]]);
   // Fecha = la del cobro (12-nov), no la de creación de la remisión (28-oct).

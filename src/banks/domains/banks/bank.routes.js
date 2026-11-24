@@ -307,6 +307,15 @@ router.get('/cortes/antiguedad-por-dia', authenticate, permit(PERMISSIONS.BANKS_
   res.json(await indicadoresService.getAntiguedadPorDiaMesActual({ banco: banco || null }));
 }));
 
+// GET /api/banks/cortes/tiempo-identificacion — mediana y percentil 90 (en días, tiempo de
+// reloj) del tiempo que tarda un depósito en identificarse, sobre TODOS los depósitos
+// identificados HISTÓRICAMENTE del banco (2026-11-24, pedido explícito del usuario — no es por
+// mes/día de ningún corte en particular). Mismo permiso que el resto de /cortes.
+router.get('/cortes/tiempo-identificacion', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  res.json(await indicadoresService.getTiempoIdentificacionGlobal(banco || null));
+}));
+
 // GET /api/banks/cortes/descargar — Excel de TODO el panel de Cortes (Mensual/Diario/Antigüedad
 // en 3 hojas, 2026-11-06, pedido explícito del usuario: un solo botón de exportar, no uno por
 // tab). Cada llamada deja un registro en el historial de descargas (ver

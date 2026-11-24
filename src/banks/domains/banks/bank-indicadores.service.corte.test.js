@@ -32,6 +32,7 @@ const {
   getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
   getUltimosMovimientos,
   getAntiguedadDepositos, getAntiguedadDepositosPorAnio, getAntiguedadPorDiaMesActual, _rangoAntiguedad,
+  getTiempoIdentificacionGlobal,
   buildReporteCortes, listarDescargasCorte, descargarReporteCorteHistorico,
 } = require('./bank-indicadores.service');
 
@@ -1414,6 +1415,58 @@ describe('getAntiguedadDepositos', () => {
     const { total } = await getAntiguedadDepositos({ fecha: '2026-09-10' });
 
     expect(total).toEqual({ count: 0, saldo: 0 });
+  });
+});
+
+// getTiempoIdentificacionGlobal (2026-11-24, decisión explícita del usuario: mediana/p90 sobre
+// TODOS los depósitos identificados HISTÓRICAMENTE del banco, en días de reloj desde `fecha`
+// hasta _primeraIdentificacionEfectiva — nunca horas hábiles como el dashboard de Cobranza).
+describe('getTiempoIdentificacionGlobal', () => {
+  test('calcula medianaDias/p90Dias/count sobre los 3 fallbacks de fecha efectiva', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // fecha 2026-09-27 -> primeraIdentificacionAt 2026-10-01T12:00Z: 4 días.
+      { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') },
+      // fecha 2026-09-20 -> primeraIdentificacionAt 2026-10-01T06:00Z (medianoche exacta): 11 días.
+      { fecha: new Date('2026-09-20T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T06:00:00.000Z') },
+      // fecha 2026-09-01, sin primeraIdentificacionAt -> fallback a identificadoPor[].fechaId (mínimo): 35 días.
+      { fecha: new Date('2026-09-01T12:00:00.000Z'), identificadoPor: [{ fechaId: new Date('2026-10-06T06:00:00.000Z') }] },
+      // fecha 2026-08-01, sin primeraIdentificacionAt ni identificadoPor -> fallback a fichaAt: 61 días.
+      { fecha: new Date('2026-08-01T12:00:00.000Z'), fichaAt: new Date('2026-10-01T06:00:00.000Z') },
+    ]) }) });
+
+    const result = await getTiempoIdentificacionGlobal();
+
+    // dias = [4, 11, 35, 61] -> mediana = (11+35)/2 = 23; p90 (rango más cercano, ceil(0.9*4)-1=3) = 61.
+    expect(result).toEqual({ medianaDias: 23, p90Dias: 61, count: 4 });
+  });
+
+  test('descarta un movimiento identificado sin ninguna fecha efectiva (defensivo) y sin `fecha`', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // 4 días, cuenta
+      { fecha: new Date('2026-09-27T12:00:00.000Z') }, // sin ninguna fecha efectiva -> descartado
+      { primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // sin `fecha` -> descartado
+    ]) }) });
+
+    const result = await getTiempoIdentificacionGlobal();
+
+    expect(result).toEqual({ medianaDias: 4, p90Dias: 4, count: 1 });
+  });
+
+  test('sin identificados: medianaDias/p90Dias null, count 0', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+
+    const result = await getTiempoIdentificacionGlobal();
+
+    expect(result).toEqual({ medianaDias: null, p90Dias: null, count: 0 });
+  });
+
+  test('filtra status:"identificado" directo en Mongo, acotado al banco pedido', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getTiempoIdentificacionGlobal('BBVA');
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.status).toBe('identificado');
+    expect(filtro.banco).toBe('BBVA');
   });
 });
 

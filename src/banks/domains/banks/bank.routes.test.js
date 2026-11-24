@@ -61,6 +61,7 @@ jest.mock('./bank-indicadores.service', () => ({
   getAntiguedadDepositos: jest.fn(),
   getAntiguedadDepositosPorAnio: jest.fn(),
   getAntiguedadPorDiaMesActual: jest.fn(),
+  getTiempoIdentificacionGlobal: jest.fn(),
   buildReporteCortes: jest.fn(),
   listarDescargasCorte: jest.fn(),
   descargarReporteCorteHistorico: jest.fn(),
@@ -885,6 +886,46 @@ describe('GET /cortes/antiguedad-por-dia (2026-11-12: serie diaria del mes en cu
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getAntiguedadPorDiaMesActual).toHaveBeenCalledWith({ banco: null });
+  });
+});
+
+describe('GET /cortes/tiempo-identificacion (2026-11-24: mediana/percentil 90 global)', () => {
+  let app;
+  const FAKE_TIEMPO = { medianaDias: 23, p90Dias: 61, count: 4 };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getTiempoIdentificacionGlobal.mockResolvedValue(FAKE_TIEMPO);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getTiempoIdentificacionGlobal).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service y devuelve mediana/p90/count', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_TIEMPO);
+    expect(indicadoresService.getTiempoIdentificacionGlobal).toHaveBeenCalledWith('BBVA');
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/tiempo-identificacion')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getTiempoIdentificacionGlobal).toHaveBeenCalledWith(null);
   });
 });
 

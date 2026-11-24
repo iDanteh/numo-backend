@@ -284,6 +284,15 @@ function mediana(valores) {
     : ordenados[mid];
 }
 
+// Percentil genérico (método del rango más cercano — mismo espíritu simple que mediana() de
+// arriba, sin interpolación): ordena y toma el índice `ceil(p/100 * n) - 1`. `p` en [0,100].
+function percentil(valores, p) {
+  if (!valores.length) return null;
+  const ordenados = [...valores].sort((a, b) => a - b);
+  const idx = Math.min(ordenados.length - 1, Math.max(0, Math.ceil((p / 100) * ordenados.length) - 1));
+  return ordenados[idx];
+}
+
 /**
  * Arma el $match completo de "tiempo/porUsuario" (find() sobre BankMovement) — extraído
  * 2026-09-18 para que getIndicadoresIdentificacion() Y el reporte descargable
@@ -1663,6 +1672,44 @@ async function getAntiguedadDepositos({ banco = null, fecha = null } = {}) {
 }
 
 /**
+ * Mediana y percentil 90 del tiempo (en DÍAS, tiempo de RELOJ — mismo criterio que la
+ * Antigüedad de Cortes de arriba, nunca horas hábiles como el dashboard de Cobranza, ver
+ * horasHabilesEntre()) que tarda un depósito identificado en resolverse, medido desde su
+ * `fecha` (fecha real del depósito en el banco) hasta `_primeraIdentificacionEfectiva()`.
+ *
+ * Decisión explícita del usuario (2026-11-24): sobre TODOS los depósitos identificados
+ * HISTÓRICAMENTE para el banco — no por mes/día de ningún corte en particular (calcularlo
+ * dentro de `_calcularLedgerBacklog` repetiría el mismo número en cada fila del ledger, no
+ * tiene sentido ahí). Mismo criterio de "identificado" que el resto de Cortes en vivo:
+ * `status: 'identificado'` directo (equivalente al camino "en vivo" de `_estadoAlCierre`, sin
+ * reconstrucción histórica — acá se quiere el estado actual, no uno de un corte pasado).
+ *
+ * @param {string} [banco]
+ */
+async function getTiempoIdentificacionGlobal(banco = null) {
+  const unDiaMs = 24 * MS_PER_HOUR;
+  const depositos = await BankMovement.find({
+    ...buildBaseMatch({ banco }),
+    status: 'identificado',
+  }).select('fecha primeraIdentificacionAt identificadoPor fichaAt').lean();
+
+  const dias = [];
+  for (const dep of depositos) {
+    if (!dep.fecha) continue;
+    const pid = _primeraIdentificacionEfectiva(dep);
+    if (!pid) continue;
+    const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
+    dias.push(Math.max(0, Math.round((pid.getTime() - inicioDiaDeposito.getTime()) / unDiaMs)));
+  }
+
+  return {
+    medianaDias: mediana(dias),
+    p90Dias: percentil(dias, 90),
+    count: dias.length,
+  };
+}
+
+/**
  * Antigüedad del backlog ACTUAL (depósitos que siguen sin identificar y completamente vacíos HOY
  * MISMO — NUNCA una reconstrucción histórica), agrupado por el MES DE ORIGEN del depósito (su
  * `fecha`, no un corte de fin de mes artificial) dentro de `anio`.
@@ -2206,6 +2253,7 @@ module.exports = {
   horasHabilesEntre,
   promedio,
   mediana,
+  percentil,
   _matchScopeUserId,
   // Tolerancia de saldo restante bajo (2026-09-21, dashboard de Cobranza) — exportadas para
   // poder testearlas directo, mismo criterio que el resto de funciones puras de este archivo.
@@ -2241,6 +2289,8 @@ module.exports = {
   getLedgerPorHora,
   _enumerarHorasDelDia,
   getUltimosMovimientos,
+  // Mediana/percentil 90 global del tiempo de identificación (2026-11-24, hero de Cortes).
+  getTiempoIdentificacionGlobal,
   // Antigüedad del backlog vacío (2026-11-06) — exportadas para testearlas directo.
   getAntiguedadDepositos,
   getAntiguedadDepositosPorAnio,

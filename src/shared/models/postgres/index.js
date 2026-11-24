@@ -208,6 +208,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS error  TEXT,
       ALTER COLUMN datos DROP NOT NULL
   `).catch(e => console.warn('[syncModels] ADD COLUMN estado (reportes_por_facturar):', e.message));
+  // Tiempo del cálculo (2026-11-24): inicio / fin, no se pierde al eliminar.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS calculo_inicio TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS calculo_fin    TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN calculo_inicio/fin (reportes_por_facturar):', e.message));
   // Un cálculo que quedó a medias por un reinicio ya no va a terminar.
   await ReportePorFacturar.sequelize.query(`
     UPDATE reportes_por_facturar

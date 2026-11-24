@@ -2485,6 +2485,15 @@ async function exportMovements(filters) {
   for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla', 'fechaImportacion']) {
     if (colSet.has(key)) activeCols.push(addlColDefs[key]);
   }
+  // 'puntos' activa 2 columnas con un solo checkbox (detalle por CxC + total
+  // numérico) — no entra en el loop genérico de arriba porque ese mapea 1
+  // key -> 1 columna.
+  if (colSet.has('puntos')) {
+    activeCols.push(
+      { header: 'Puntos usados', key: 'puntosDetalleCol', width: 30 },
+      { header: 'Total puntos',  key: 'puntosTotalCol',   width: 14 },
+    );
+  }
   sheet.columns = activeCols;
 
   // ── Helpers ──────────────────────────────────────────────────────────────
@@ -2575,12 +2584,28 @@ async function exportMovements(filters) {
       rowData.reglaCol = m.status === 'reclasificado' ? 'Manual' : (m.categoria ? 'Automática' : null);
     if (colSet.has('fechaImportacion'))
       rowData.fechaImportacionCol = formatFechaHoraMx(m.createdAt);
+    if (colSet.has('puntos')) {
+      const detalles = [];
+      let totalPuntos = 0;
+      for (const l of links) {
+        const montoPuntos = (l.desglosePorFormaPago || [])
+          .filter(d => /puntos/i.test(d.formaPagoDescripcion || ''))
+          .reduce((sum, d) => sum + (d.monto || 0), 0);
+        if (montoPuntos > 0) {
+          const folioLabel = (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId);
+          detalles.push(`${folioLabel}: $${montoPuntos.toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+          totalPuntos += montoPuntos;
+        }
+      }
+      rowData.puntosDetalleCol = detalles.join(', ') || null;
+      rowData.puntosTotalCol   = totalPuntos > 0 ? totalPuntos : null;
+    }
 
     sheet.addRow(rowData);
   }
 
   // ── Estilos ──────────────────────────────────────────────────────────────
-  const numColKeys = new Set(['deposito', 'retiro', 'saldoErp', 'diferencia']);
+  const numColKeys = new Set(['deposito', 'retiro', 'saldoErp', 'diferencia', 'puntosTotalCol']);
   const numFmt     = '#,##0.00';
 
   const STATUS_COLORS = {

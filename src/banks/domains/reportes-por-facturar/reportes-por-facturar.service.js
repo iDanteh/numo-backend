@@ -20,6 +20,7 @@
  */
 
 const ExcelJS = require('exceljs');
+const { Op } = require('sequelize');
 const { ReportePorFacturar, User } = require('../../../shared/models/postgres');
 const CFDI         = require('../../../visor/models/CFDI');
 const BankMovement = require('../banks/BankMovement.model');
@@ -557,6 +558,39 @@ const _esperar = id => _enCurso.get(Number(id)) ?? Promise.resolve();
 // pasen las dos.
 const _generando = new Map(); // clave → promesa con el id del reporte
 
+// Con varios procesos (cluster, como testnumo con 2 workers) la memoria de
+// arriba no se comparte: el 24-nov en testnumo 2, 5 y 10 peticiones iguales
+// crearon 2 reportes (uno por proceso). Por eso además se revisa en Postgres,
+// con un candado por empresa + sucursal + fechas: dentro de la transacción,
+// si ya hay uno igual calculando (empezado hace menos de 3 h — uno más viejo
+// se da por atorado) se devuelve ese; si no, se crea.
+const VENTANA_CALCULANDO_MS = 3 * 60 * 60 * 1000;
+
+async function _buscarOCrear({ rfc, centroCostoId, sucursal, fechaInicio, fechaFin }, user) {
+  const centro = centroCostoId ? Number(centroCostoId) : null;
+  const seq = ReportePorFacturar.sequelize;
+  return seq.transaction(async transaction => {
+    await seq.query('SELECT pg_advisory_xact_lock(hashtext(:clave))', {
+      replacements: { clave: `reportes_por_facturar|${rfc}|${centro ?? ''}|${fechaInicio}|${fechaFin}` }, transaction,
+    });
+    const existente = await ReportePorFacturar.findOne({
+      where: {
+        rfc, centroCostoId: centro, fechaInicio, fechaFin, estado: 'calculando', eliminadoEn: null,
+        calculoInicio: { [Op.gte]: new Date(Date.now() - VENTANA_CALCULANDO_MS) },
+      },
+      order: [['id', 'DESC']],
+      transaction,
+    });
+    if (existente) return { reporte: existente, nuevo: false };
+    const reporte = await ReportePorFacturar.create({
+      rfc, centroCostoId: centro, sucursal, fechaInicio, fechaFin,
+      datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
+      creadoPorId: _userId(user), calculoInicio: new Date(), calculoFin: null,
+    }, { transaction });
+    return { reporte, nuevo: true };
+  });
+}
+
 async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
   const clave = [rfc, centroCostoId ? Number(centroCostoId) : '', fechaInicio, fechaFin || fechaInicio].join('|');
   const previo = _generando.get(clave);
@@ -570,11 +604,9 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
   }
   const creado = (async () => {
     const { sucursal, fechaFin: fin } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
-    const reporte = await ReportePorFacturar.create({
-      rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
-      datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
-      creadoPorId: _userId(user), calculoInicio: new Date(), calculoFin: null,
-    });
+    const { reporte, nuevo } = await _buscarOCrear({ rfc, centroCostoId, sucursal, fechaInicio, fechaFin: fin }, user);
+    // Ya lo está calculando otro proceso del cluster: se devuelve ese.
+    if (!nuevo) return reporte.id;
     _enSegundoPlano(reporte.id, async avance => {
       const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
       return { sucursal: suc, datos, resumen, advertencias };

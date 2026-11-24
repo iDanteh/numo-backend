@@ -266,8 +266,9 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
 
   // Cobros en EFECTIVO / SALDO A FAVOR de Kore de cada global (2026-10-29).
   const globales = facturas.filter(f => (f.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL);
-  await onAvance(`Cobros en efectivo / saldo a favor de ${globales.length} global(es) — consultando Kore…`);
-  const cobrosCaja = await cobrosCajaDeGlobales({ rfc, facturas: globales });
+  const textoCobrosCaja = `Cobros en efectivo / saldo a favor de ${globales.length} global(es) — consultando Kore…`;
+  await onAvance(textoCobrosCaja);
+  const cobrosCaja = await _conRondas(() => cobrosCajaDeGlobales({ rfc, facturas: globales }), onAvance, textoCobrosCaja);
   if (cobrosCaja.sinRespuesta) {
     advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
   }
@@ -284,8 +285,9 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   };
 
   // Remisiones cobradas en la caja de otro almacén (2026-10-30, "A0 COBRADAS EN PUERTO").
-  await onAvance('Cobros en la caja de otro almacén — consultando Kore…');
-  const otraCaja = await cobrosEnOtraCaja({ rfc, datos });
+  const textoOtraCaja = 'Cobros en la caja de otro almacén — consultando Kore…';
+  await onAvance(textoOtraCaja);
+  const otraCaja = await _conRondas(() => cobrosEnOtraCaja({ rfc, datos }), onAvance, textoOtraCaja);
   datos.cobrosOtraCaja = otraCaja.cobros;
   datos.remisionesSoloOtraCaja = otraCaja.soloOtraCaja ?? [];
   if (otraCaja.sinRespuesta) {
@@ -302,6 +304,31 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
 }
 
 const _userId = user => (user?.dbId ? parseInt(user.dbId, 10) : null);
+
+// ── Reintento por rondas cuando Kore responde 429 (2026-11-24) ───────────────
+// Reporte 93 (30-sep): Kore saturado ("Too many requests") rechazó 1 remisión
+// en sus 3 intentos y el reporte salió con aviso. Si un paso deja consultas
+// sin respuesta, se espera lo que pide Kore (~10 s) y se repite el paso, hasta
+// 2 rondas; el aviso solo sale si siguen faltando. Solo en pasos que al
+// repetirse vuelven a Kore únicamente por lo que falló (lo demás está en la
+// caché de 20 min de erp-sync o en kore_remisiones): cobros de caja de las
+// globales y cobros en otra caja. El historial de abonos NO: volvería a
+// preguntar todas las remisiones no liquidadas. Sin 429 no agrega tiempo.
+const RONDAS_REINTENTO = 2;
+let _esperaRondaMs = 11000; // "retry after" típico de Kore (10.8 s el 24-nov) + 1 s
+const _dormir = ms => new Promise(r => setTimeout(r, ms));
+
+async function _conRondas(paso, onAvance, texto) {
+  let r = await paso();
+  for (let ronda = 1; r.sinRespuesta && ronda <= RONDAS_REINTENTO; ronda++) {
+    await onAvance(`${texto.replace(/…$/, "")} (Kore no respondió ${r.sinRespuesta}, reintentando ${ronda}/${RONDAS_REINTENTO} en unos segundos…)`);
+    await _dormir(_esperaRondaMs);
+    r = await paso();
+  }
+  return r;
+}
+/** Pruebas: sin esperar 11 s por ronda. */
+const _setEsperaRonda = ms => { _esperaRondaMs = ms; };
 
 // ── Cálculo en segundo plano (2026-10-29) ─────────────────────────────────────
 // Con cientos de remisiones Kore responde 429 y el cálculo tarda minutos: la
@@ -457,4 +484,4 @@ async function excel(id, seccion) {
   return { buffer: aplicarCombinadas(await workbook.xlsx.writeBuffer(), workbook), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _esperar };
+module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _esperar, _setEsperaRonda };

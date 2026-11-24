@@ -3,7 +3,8 @@
 // Reporte "Por facturar" (2026-10-22): facturas pagadas con depósitos de días
 // anteriores (equivalente sin póliza de "Venta Sin Cobro") + depósitos
 // pendientes de generar factura, con historial.
-jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findAndCountAll: jest.fn(), update: jest.fn(async () => [1]) }, User: {} }));
+// 2026-11-24: generar revisa en Postgres (candado + findOne) — sin uno igual calculando, por default.
+jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findOne: jest.fn(async () => null), findAndCountAll: jest.fn(), update: jest.fn(async () => [1]), sequelize: { transaction: jest.fn(async fn => fn({})), query: jest.fn(async () => []) } }, User: {} }));
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
@@ -223,6 +224,20 @@ test('generar dos veces el mismo reporte a la vez → un solo reporte; ya termin
   await service.generar(params, { dbId: '8' });
   expect(ReportePorFacturar.create).toHaveBeenCalledTimes(3);
   await service._esperar(7);
+});
+
+// 2026-11-24 testnumo (cluster, 2 procesos): otro proceso ya lo está calculando → se devuelve ese, sin crear ni calcular.
+test('cluster: si en la base ya hay uno igual calculando, generar devuelve ese', async () => {
+  ReportePorFacturar.findOne.mockResolvedValueOnce({ id: 31, estado: 'calculando' });
+  const params = { rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-09-04', fechaFin: '2026-09-04' };
+  const r = await service.generar(params, { dbId: '8' });
+  expect(ReportePorFacturar.create).not.toHaveBeenCalled();
+  expect(mostrador.detectarDepositosPendientesFactura).not.toHaveBeenCalled();
+  expect(ReportePorFacturar.findByPk.mock.calls[0][0]).toBe(31);
+  // Candado por empresa + sucursal + fechas, y búsqueda solo de los que siguen calculando.
+  expect(ReportePorFacturar.sequelize.query.mock.calls[0][1].replacements.clave).toBe('reportes_por_facturar|CCO011113663|1|2026-09-04|2026-09-04');
+  expect(ReportePorFacturar.findOne.mock.calls[0][0].where).toMatchObject({ rfc: 'CCO011113663', centroCostoId: 1, estado: 'calculando', eliminadoEn: null });
+  expect(r.id).toBe(7); // obtener del mock
 });
 
 test('si el que se calculaba ya fue eliminado, generar crea uno nuevo', async () => {

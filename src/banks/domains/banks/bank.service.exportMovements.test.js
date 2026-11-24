@@ -127,3 +127,93 @@ describe('exportMovements — columna opcional "fechaImportacion" (fecha+hora de
     expect(valorCelda).toMatch(/\d{2}:\d{2}/);            // parte de hora
   });
 });
+
+describe('exportMovements — columnas opcionales "Puntos usados"/"Total puntos" (desglosePorFormaPago de erpLinks, un solo checkbox "puntos")', () => {
+  test('1 CxC con puntos: detalle "{serie-folio}: ${monto}" y total = ese monto', async () => {
+    BankMovement.find.mockReturnValue(fakeFindQuery([
+      fakeMov({ erpLinks: [
+        { serie: 'A0', folioExterno: '123456', desglosePorFormaPago: [
+          { formaPagoDescripcion: 'Puntos', monto: 500 },
+        ] },
+      ] }),
+    ]));
+
+    const buffer = await exportMovements({ columnas: 'puntos' });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Movimientos');
+
+    const headerRow = ws.getRow(1);
+    const totalCols = headerRow.actualCellCount;
+    expect(headerRow.getCell(totalCols - 1).value).toBe('Puntos usados');
+    expect(headerRow.getCell(totalCols).value).toBe('Total puntos');
+
+    const dataRow = ws.getRow(2);
+    expect(dataRow.getCell(totalCols - 1).value).toBe('A0-123456: $500.00');
+    expect(dataRow.getCell(totalCols).value).toBe(500);
+  });
+
+  test('2 CxC con puntos: detalle junta ambas con ", " y el total es la suma', async () => {
+    BankMovement.find.mockReturnValue(fakeFindQuery([
+      fakeMov({ erpLinks: [
+        { serie: 'A0', folioExterno: '111111', desglosePorFormaPago: [
+          { formaPagoDescripcion: 'Puntos', monto: 500 },
+        ] },
+        { serie: 'A0', folioExterno: '222222', desglosePorFormaPago: [
+          { formaPagoDescripcion: 'Puntos', monto: 1250.75 },
+        ] },
+      ] }),
+    ]));
+
+    const buffer = await exportMovements({ columnas: 'puntos' });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Movimientos');
+    const totalCols = ws.getRow(1).actualCellCount;
+    const dataRow = ws.getRow(2);
+
+    expect(dataRow.getCell(totalCols - 1).value).toBe('A0-111111: $500.00, A0-222222: $1,250.75');
+    expect(dataRow.getCell(totalCols).value).toBe(1750.75);
+  });
+
+  test('sin ninguna porción de puntos (desglosePorFormaPago solo con otras formas, o vacío): ambas columnas quedan null', async () => {
+    BankMovement.find.mockReturnValue(fakeFindQuery([
+      fakeMov({ erpLinks: [
+        { serie: 'A0', folioExterno: '333333', desglosePorFormaPago: [
+          { formaPagoDescripcion: 'Transferencia', monto: 900 },
+        ] },
+      ] }),
+    ]));
+
+    const buffer = await exportMovements({ columnas: 'puntos' });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Movimientos');
+    const totalCols = ws.getRow(1).actualCellCount;
+    const dataRow = ws.getRow(2);
+
+    expect(dataRow.getCell(totalCols - 1).value).toBeNull();
+    expect(dataRow.getCell(totalCols).value).toBeNull();
+  });
+
+  test('sin pedir la columna "puntos" en columnas: ninguna de las 2 columnas aparece (opt-in real)', async () => {
+    BankMovement.find.mockReturnValue(fakeFindQuery([
+      fakeMov({ erpLinks: [
+        { serie: 'A0', folioExterno: '123456', desglosePorFormaPago: [
+          { formaPagoDescripcion: 'Puntos', monto: 500 },
+        ] },
+      ] }),
+    ]));
+
+    const buffer = await exportMovements({ columnas: 'folioFiscal' });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Movimientos');
+    const headerRow = ws.getRow(1);
+    const headers = [];
+    headerRow.eachCell(c => headers.push(c.value));
+
+    expect(headers).not.toContain('Puntos usados');
+    expect(headers).not.toContain('Total puntos');
+  });
+});

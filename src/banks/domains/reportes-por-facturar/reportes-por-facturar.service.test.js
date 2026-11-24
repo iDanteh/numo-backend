@@ -161,6 +161,39 @@ test('actualizar un reporte eliminado → 404', async () => {
   await expect(service.actualizar(7, {})).rejects.toThrow();
 });
 
+// 2026-11-24: reportes 87 y 88 creados con 0.2 s de diferencia (mismo día y sucursal).
+test('generar dos veces el mismo reporte a la vez → un solo reporte; ya terminado → uno nuevo', async () => {
+  const params = { rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20', fechaFin: '2026-10-20' };
+  const [a, b] = await Promise.all([service.generar(params, { dbId: '8' }), service.generar({ ...params }, { dbId: '8' })]);
+  expect(ReportePorFacturar.create).toHaveBeenCalledTimes(1);
+  expect(a.id).toBe(7);
+  expect(b.id).toBe(7);
+  // Mientras se calcula, otro "Generar" igual devuelve el mismo.
+  await service.generar(params, { dbId: '4' });
+  expect(ReportePorFacturar.create).toHaveBeenCalledTimes(1);
+  // Otra fecha sí crea otro.
+  ReportePorFacturar.create.mockResolvedValueOnce({ id: 8 });
+  await service.generar({ ...params, fechaInicio: '2026-10-21', fechaFin: '2026-10-21' }, { dbId: '8' });
+  expect(ReportePorFacturar.create).toHaveBeenCalledTimes(2);
+  await service._esperar(7);
+  await service._esperar(8);
+  // Ya terminado → "Generar" crea uno nuevo.
+  await service.generar(params, { dbId: '8' });
+  expect(ReportePorFacturar.create).toHaveBeenCalledTimes(3);
+  await service._esperar(7);
+});
+
+test('si el que se calculaba ya fue eliminado, generar crea uno nuevo', async () => {
+  const params = { rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-22', fechaFin: '2026-10-22' };
+  await service.generar(params, {});
+  ReportePorFacturar.findByPk.mockResolvedValueOnce({ eliminadoEn: new Date() });
+  ReportePorFacturar.create.mockResolvedValueOnce({ id: 9 });
+  await service.generar(params, {});
+  expect(ReportePorFacturar.create).toHaveBeenCalledTimes(2);
+  await service._esperar(7);
+  await service._esperar(9);
+});
+
 // 2026-10-29: formato del Excel "MOSTRADOR 2026" del usuario — MOSTRADOR (un
 // bloque por global + pendientes), REF. por almacén, FACT ESPECIALES, X FAC
 // CON FICHA DE DEP y DEPÓSITOS EN EFECTIVO, agrupados por cliente.

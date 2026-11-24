@@ -61,7 +61,10 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
   const inicial = await service.generar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' }, { dbId: '5' });
   // Se guarda de inmediato, sin datos, calculando.
   expect(ReportePorFacturar.create.mock.calls[0][0]).toMatchObject({ estado: 'calculando', datos: null, sucursal: 'CEDIS', fechaFin: '2026-10-20', creadoPorId: 5 });
+  expect(ReportePorFacturar.create.mock.calls[0][0].calculoInicio).toBeInstanceOf(Date);
   await service._esperar(7);
+  // Hora de fin guardada aparte (2026-11-24): updated_at se pisa al eliminar.
+  expect(terminado().calculoFin).toBeInstanceOf(Date);
   const r = await service.obtener(7);
   expect(inicial.id).toBe(7);
 
@@ -138,7 +141,8 @@ test('actualizar: recalcula con la misma sucursal y fechas y reemplaza los datos
     .mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: terminado()?.datos ?? null }) }));
   const r = await service.actualizar(7, { dbId: '9' });
   // Primero se marca "calculando" (los datos anteriores se siguen viendo).
-  expect(update.mock.calls[0][0]).toMatchObject({ estado: 'calculando', error: null });
+  expect(update.mock.calls[0][0]).toMatchObject({ estado: 'calculando', error: null, calculoFin: null });
+  expect(update.mock.calls[0][0].calculoInicio).toBeInstanceOf(Date);
   await service._esperar(7);
   expect(ReportePorFacturar.create).not.toHaveBeenCalled();
   expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });

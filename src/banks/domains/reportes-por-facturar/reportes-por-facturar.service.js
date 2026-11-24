@@ -508,9 +508,9 @@ function _enSegundoPlano(id, calcular) {
   const p = (async () => {
     try {
       const cambios = await calcular(avance);
-      await ReportePorFacturar.update({ ...cambios, estado: 'listo', avance: null, error: null }, { where: { id } });
+      await ReportePorFacturar.update({ ...cambios, estado: 'listo', avance: null, error: null, calculoFin: new Date() }, { where: { id } });
     } catch (err) {
-      await ReportePorFacturar.update({ estado: 'error', avance: null, error: err?.message ?? String(err) }, { where: { id } }).catch(() => {});
+      await ReportePorFacturar.update({ estado: 'error', avance: null, error: err?.message ?? String(err), calculoFin: new Date() }, { where: { id } }).catch(() => {});
     } finally {
       _enCurso.delete(id);
     }
@@ -546,7 +546,7 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
     const reporte = await ReportePorFacturar.create({
       rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
       datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
-      creadoPorId: _userId(user),
+      creadoPorId: _userId(user), calculoInicio: new Date(), calculoFin: null,
     });
     _enSegundoPlano(reporte.id, async avance => {
       const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
@@ -570,7 +570,7 @@ async function actualizar(id, user) {
   const r = await ReportePorFacturar.findByPk(id);
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
   if (r.estado === 'calculando') throw new ConflictError('El reporte ya se está calculando');
-  await r.update({ estado: 'calculando', avance: 'Iniciando…', error: null });
+  await r.update({ estado: 'calculando', avance: 'Iniciando…', error: null, calculoInicio: new Date(), calculoFin: null });
   const params = { rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin };
   _enSegundoPlano(r.id, async avance => {
     const { sucursal, datos, resumen, advertencias } = await _calcular(params, avance);

@@ -102,6 +102,49 @@ test('si Kore no respondió remisiones, queda advertencia en el reporte', async 
   expect(terminado().advertencias[0]).toMatch('no respondió 3');
 });
 
+// 2026-11-24 (reporte 93): Kore 429 → se espera y se repite el paso, hasta 2 rondas.
+describe('rondas de reintento cuando Kore no responde', () => {
+  const cobrosCaja = require('./reportes-por-facturar.cobros-caja');
+  const otraCaja = require('./reportes-por-facturar.otra-caja');
+  const abonos = require('./reportes-por-facturar.abonos');
+  const params = { rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' };
+  beforeAll(() => service._setEsperaRonda(0));
+  afterAll(() => service._setEsperaRonda(11000));
+
+  test('sin consultas fallidas no repite ningún paso', async () => {
+    await generarYEsperar(params, null);
+    expect(cobrosCaja.cobrosCajaDeGlobales).toHaveBeenCalledTimes(1);
+    expect(otraCaja.cobrosEnOtraCaja).toHaveBeenCalledTimes(1);
+    expect(terminado().advertencias).toBeNull();
+  });
+
+  test('cobros de caja: falla 1 y a la 1ª ronda responde → sin advertencia', async () => {
+    cobrosCaja.cobrosCajaDeGlobales
+      .mockResolvedValueOnce({ porFactura: [], sinRespuesta: 1 })
+      .mockResolvedValueOnce({ porFactura: [], sinRespuesta: 0 });
+    await generarYEsperar(params, null);
+    expect(cobrosCaja.cobrosCajaDeGlobales).toHaveBeenCalledTimes(2);
+    expect(terminado().advertencias).toBeNull();
+    // Se avisa en el avance que está reintentando.
+    expect(ReportePorFacturar.update.mock.calls.map(c => c[0].avance).filter(Boolean).join(' | ')).toMatch('reintentando 1/2');
+  });
+
+  test('otra caja: sigue fallando tras 2 rondas → 3 intentos en total y queda la advertencia', async () => {
+    otraCaja.cobrosEnOtraCaja.mockResolvedValue({ cobros: [], soloOtraCaja: [], sinRespuesta: 2 });
+    await generarYEsperar(params, null);
+    expect(otraCaja.cobrosEnOtraCaja).toHaveBeenCalledTimes(3);
+    expect(terminado().advertencias.join(' ')).toMatch('no respondió 2 remisión(es) al buscar cobros en la caja de otro almacén');
+    otraCaja.cobrosEnOtraCaja.mockResolvedValue({ cobros: [], sinRespuesta: 0 });
+  });
+
+  test('historial de abonos no se repite (volvería a preguntar todo a Kore)', async () => {
+    abonos.agregarHistorialAbonos.mockResolvedValueOnce({ sinRespuesta: 4 });
+    await generarYEsperar(params, null);
+    expect(abonos.agregarHistorialAbonos).toHaveBeenCalledTimes(1);
+    expect(terminado().advertencias.join(' ')).toMatch('historial de abonos de 4');
+  });
+});
+
 test('si el cálculo truena, el reporte queda en error con el mensaje', async () => {
   mostrador.detectarDepositosPendientesFactura.mockRejectedValue(new Error('Kore caído'));
   await generarYEsperar({ rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' }, null);

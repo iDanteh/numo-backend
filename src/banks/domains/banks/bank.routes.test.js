@@ -62,6 +62,9 @@ jest.mock('./bank-indicadores.service', () => ({
   getAntiguedadDepositosPorAnio: jest.fn(),
   getAntiguedadPorDiaMesActual: jest.fn(),
   getTiempoIdentificacionGlobal: jest.fn(),
+  getTiempoIdentificacionPorPeriodo: jest.fn(),
+  getTiempoIdentificacionCobranzaGlobal: jest.fn(),
+  getTiempoIdentificacionCobranzaPorPeriodo: jest.fn(),
   buildReporteCortes: jest.fn(),
   listarDescargasCorte: jest.fn(),
   descargarReporteCorteHistorico: jest.fn(),
@@ -69,6 +72,18 @@ jest.mock('./bank-indicadores.service', () => ({
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
+}));
+// /clientes-codigo/* (2026-11-25): catálogo + matches persistidos — mismo criterio de mock
+// completo que bank-indicadores.service.js de arriba (bank.routes.js importa por destructuring).
+jest.mock('../clientes-codigo/clientes-codigo.service', () => ({
+  importarCatalogo: jest.fn(),
+  actualizarMatches: jest.fn(),
+  listarMatchesPersistidos: jest.fn(),
+  buscarMatches: jest.fn(),
+  buildReporteMatches: jest.fn(),
+}));
+jest.mock('../clientes-codigo/clientes-codigo.parser', () => ({
+  parseClientesIdsXlsx: jest.fn(),
 }));
 // GET /auxiliar/movimientos y /auxiliar/clientes (2026-10-14, fix de permiso + filtros de
 // ocultamiento): bank.routes.js importa estas funciones por DESTRUCTURING, así que hace falta
@@ -88,6 +103,7 @@ const service = require('./bank.service');
 const CFDI    = require('../../../visor/models/CFDI');
 const rbacStore = require('../../../shared/services/rbac-store');
 const indicadoresService = require('./bank-indicadores.service');
+const clientesCodigoService = require('../clientes-codigo/clientes-codigo.service');
 const auxiliaryParser = require('./bank-auxiliary.parser');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const { PERMISSIONS, MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
@@ -889,9 +905,9 @@ describe('GET /cortes/antiguedad-por-dia (2026-11-12: serie diaria del mes en cu
   });
 });
 
-describe('GET /cortes/tiempo-identificacion (2026-11-24: mediana/percentil 90 global)', () => {
+describe('GET /cortes/tiempo-identificacion (2026-11-24: mediana/percentil 90 global, en horas hábiles desde 2026-11-25)', () => {
   let app;
-  const FAKE_TIEMPO = { medianaDias: 23, p90Dias: 61, count: 4 };
+  const FAKE_TIEMPO = { medianaHoras: 219, p90Horas: 579, count: 4 };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -926,6 +942,186 @@ describe('GET /cortes/tiempo-identificacion (2026-11-24: mediana/percentil 90 gl
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getTiempoIdentificacionGlobal).toHaveBeenCalledWith(null);
+  });
+});
+
+describe('GET /cortes/tiempo-identificacion/periodo (2026-11-25: serie mensual/semanal, en horas hábiles)', () => {
+  let app;
+  const FAKE_SERIE = [{ periodo: '2026-01', medianaHoras: 36, p90Horas: 90, count: 5 }];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getTiempoIdentificacionPorPeriodo.mockResolvedValue(FAKE_SERIE);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion/periodo')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getTiempoIdentificacionPorPeriodo).not.toHaveBeenCalled();
+  });
+
+  test('default sin ?granularidad: pasa "mensual"', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion/periodo')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_SERIE);
+    expect(indicadoresService.getTiempoIdentificacionPorPeriodo).toHaveBeenCalledWith({ banco: 'BBVA', granularidad: 'mensual' });
+  });
+
+  test('?granularidad=semanal se respeta; cualquier otro valor cae a "mensual"', async () => {
+    await request(app)
+      .get('/cortes/tiempo-identificacion/periodo')
+      .query({ granularidad: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+    expect(indicadoresService.getTiempoIdentificacionPorPeriodo).toHaveBeenCalledWith({ banco: null, granularidad: 'semanal' });
+
+    await request(app)
+      .get('/cortes/tiempo-identificacion/periodo')
+      .query({ granularidad: 'diaria-invalida' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+    expect(indicadoresService.getTiempoIdentificacionPorPeriodo).toHaveBeenCalledWith({ banco: null, granularidad: 'mensual' });
+  });
+});
+
+describe('GET /cortes/tiempo-identificacion-cobranza (2026-11-25: escenario Cobranza, sin filtro de código de cliente)', () => {
+  let app;
+  const FAKE_TIEMPO = { medianaHoras: 69.5, p90Horas: 103, count: 2 };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getTiempoIdentificacionCobranzaGlobal.mockResolvedValue(FAKE_TIEMPO);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getTiempoIdentificacionCobranzaGlobal).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service y devuelve mediana/p90/count', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_TIEMPO);
+    expect(indicadoresService.getTiempoIdentificacionCobranzaGlobal).toHaveBeenCalledWith('BBVA');
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getTiempoIdentificacionCobranzaGlobal).toHaveBeenCalledWith(null);
+  });
+});
+
+describe('GET /cortes/tiempo-identificacion-cobranza/periodo (2026-11-25: serie mensual/semanal, escenario Cobranza)', () => {
+  let app;
+  const FAKE_SERIE = [{ periodo: '2026-01', medianaHoras: 36, p90Horas: 90, count: 5 }];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo.mockResolvedValue(FAKE_SERIE);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza/periodo')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo).not.toHaveBeenCalled();
+  });
+
+  test('default sin ?granularidad: pasa "mensual"', async () => {
+    const res = await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza/periodo')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_SERIE);
+    expect(indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo).toHaveBeenCalledWith({ banco: 'BBVA', granularidad: 'mensual' });
+  });
+
+  test('?granularidad=semanal se respeta; cualquier otro valor cae a "mensual"', async () => {
+    await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza/periodo')
+      .query({ granularidad: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+    expect(indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo).toHaveBeenCalledWith({ banco: null, granularidad: 'semanal' });
+
+    await request(app)
+      .get('/cortes/tiempo-identificacion-cobranza/periodo')
+      .query({ granularidad: 'diaria-invalida' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+    expect(indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo).toHaveBeenCalledWith({ banco: null, granularidad: 'mensual' });
+  });
+});
+
+describe('/clientes-codigo (2026-11-25: importación de catálogo + reporte de matches persistidos)', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('POST /clientes-codigo/importar — sin archivo: 400', async () => {
+    const res = await request(app)
+      .post('/clientes-codigo/importar')
+      .set('x-test-permissions', JSON.stringify(['banks:import']));
+    expect(res.status).toBe(400);
+  });
+
+  test('POST /clientes-codigo/importar — 403 sin banks:import', async () => {
+    const res = await request(app)
+      .post('/clientes-codigo/importar')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+  });
+
+  test('GET /clientes-codigo/reporte-matches — lee de listarMatchesPersistidos (NO buscarMatches) y arma el Excel', async () => {
+    clientesCodigoService.listarMatchesPersistidos.mockResolvedValue([{ codigo: 24788, confianza: 'media' }]);
+    clientesCodigoService.buildReporteMatches.mockResolvedValue(Buffer.from('xlsx-fake'));
+
+    const res = await request(app)
+      .get('/clientes-codigo/reporte-matches')
+      .query({ banco: 'Banamex' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(clientesCodigoService.listarMatchesPersistidos).toHaveBeenCalledWith({ fechaInicio: undefined, fechaFin: undefined, banco: 'Banamex' });
+    expect(clientesCodigoService.buscarMatches).not.toHaveBeenCalled();
+    expect(clientesCodigoService.buildReporteMatches).toHaveBeenCalledWith([{ codigo: 24788, confianza: 'media' }]);
+  });
+
+  test('GET /clientes-codigo/reporte-matches — 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/clientes-codigo/reporte-matches')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(clientesCodigoService.listarMatchesPersistidos).not.toHaveBeenCalled();
   });
 });
 

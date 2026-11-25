@@ -6,6 +6,7 @@
 // para reusar _rangoAnioMesMexico/_inicioDiaMx/_finDiaMx).
 jest.mock('./BankMovement.model');
 jest.mock('./CorteDescarga.model');
+jest.mock('../clientes-codigo/BankMovementClienteCodigoMatch.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
 jest.mock('./drive-cortes.service');
@@ -19,6 +20,7 @@ jest.mock('../../../shared/models/postgres', () => ({
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const CorteDescarga = require('./CorteDescarga.model');
+const BankMovementClienteCodigoMatch = require('../clientes-codigo/BankMovementClienteCodigoMatch.model');
 const { subirReporteCorte, descargarReporteCorte } = require('./drive-cortes.service');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
@@ -32,7 +34,8 @@ const {
   getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
   getUltimosMovimientos,
   getAntiguedadDepositos, getAntiguedadDepositosPorAnio, getAntiguedadPorDiaMesActual, _rangoAntiguedad,
-  getTiempoIdentificacionGlobal,
+  getTiempoIdentificacionGlobal, getTiempoIdentificacionPorPeriodo, _claveSemanaIso,
+  getTiempoIdentificacionCobranzaGlobal, getTiempoIdentificacionCobranzaPorPeriodo,
   buildReporteCortes, listarDescargasCorte, descargarReporteCorteHistorico,
 } = require('./bank-indicadores.service');
 
@@ -1418,55 +1421,193 @@ describe('getAntiguedadDepositos', () => {
   });
 });
 
-// getTiempoIdentificacionGlobal (2026-11-24, decisión explícita del usuario: mediana/p90 sobre
-// TODOS los depósitos identificados HISTÓRICAMENTE del banco, en días de reloj desde `fecha`
-// hasta _primeraIdentificacionEfectiva — nunca horas hábiles como el dashboard de Cobranza).
+// getTiempoIdentificacionGlobal (2026-11-24: mediana/p90 desde `fecha` hasta
+// _primeraIdentificacionEfectiva. REESCOPEADO 2026-11-25, decisión explícita del usuario: la
+// población ya NO es "todos los identificados del banco" — es solo los bankMovementId que tengan
+// un match persistido en BankMovementClienteCodigoMatch, ver
+// clientes-codigo.service.js#actualizarMatches. REESCALADO el mismo día de días de reloj a HORAS
+// HÁBILES (ver horasHabilesEntre()), para ser comparable con getTiempoIdentificacionCobranzaGlobal
+// en el mismo modal — valores de horas obtenidos corriendo horasHabilesEntre() real contra estos
+// mismos fixtures, no calculados a mano.
 describe('getTiempoIdentificacionGlobal', () => {
-  test('calcula medianaDias/p90Dias/count sobre los 3 fallbacks de fecha efectiva', async () => {
+  test('calcula medianaHoras/p90Horas/count sobre los 3 fallbacks de fecha efectiva, acotado a los movimientos con match persistido', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce(['m1', 'm2', 'm3', 'm4']);
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
-      // fecha 2026-09-27 -> primeraIdentificacionAt 2026-10-01T12:00Z: 4 días.
+      // fecha 2026-09-27 -> primeraIdentificacionAt 2026-10-01T12:00Z.
       { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') },
-      // fecha 2026-09-20 -> primeraIdentificacionAt 2026-10-01T06:00Z (medianoche exacta): 11 días.
+      // fecha 2026-09-20 -> primeraIdentificacionAt 2026-10-01T06:00Z.
       { fecha: new Date('2026-09-20T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T06:00:00.000Z') },
-      // fecha 2026-09-01, sin primeraIdentificacionAt -> fallback a identificadoPor[].fechaId (mínimo): 35 días.
+      // fecha 2026-09-01, sin primeraIdentificacionAt -> fallback a identificadoPor[].fechaId (mínimo).
       { fecha: new Date('2026-09-01T12:00:00.000Z'), identificadoPor: [{ fechaId: new Date('2026-10-06T06:00:00.000Z') }] },
-      // fecha 2026-08-01, sin primeraIdentificacionAt ni identificadoPor -> fallback a fichaAt: 61 días.
+      // fecha 2026-08-01, sin primeraIdentificacionAt ni identificadoPor -> fallback a fichaAt.
       { fecha: new Date('2026-08-01T12:00:00.000Z'), fichaAt: new Date('2026-10-01T06:00:00.000Z') },
     ]) }) });
 
     const result = await getTiempoIdentificacionGlobal();
 
-    // dias = [4, 11, 35, 61] -> mediana = (11+35)/2 = 23; p90 (rango más cercano, ceil(0.9*4)-1=3) = 61.
-    expect(result).toEqual({ medianaDias: 23, p90Dias: 61, count: 4 });
+    // Valores obtenidos corriendo horasHabilesEntre() real contra estos fixtures (no calculados
+    // a mano) — ver el bloque de comentario arriba del describe.
+    expect(result).toEqual({ medianaHoras: 219, p90Horas: 579, count: 4 });
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro._id.$in).toEqual(['m1', 'm2', 'm3', 'm4']);
   });
 
   test('descarta un movimiento identificado sin ninguna fecha efectiva (defensivo) y sin `fecha`', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce(['m1', 'm2', 'm3']);
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
-      { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // 4 días, cuenta
+      { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // cuenta, 36h hábiles
       { fecha: new Date('2026-09-27T12:00:00.000Z') }, // sin ninguna fecha efectiva -> descartado
       { primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // sin `fecha` -> descartado
     ]) }) });
 
     const result = await getTiempoIdentificacionGlobal();
 
-    expect(result).toEqual({ medianaDias: 4, p90Dias: 4, count: 1 });
+    expect(result).toEqual({ medianaHoras: 36, p90Horas: 36, count: 1 });
   });
 
-  test('sin identificados: medianaDias/p90Dias null, count 0', async () => {
-    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+  test('sin ningún match persistido: medianaHoras/p90Horas null, count 0, ni siquiera consulta BankMovement', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce([]);
 
     const result = await getTiempoIdentificacionGlobal();
 
-    expect(result).toEqual({ medianaDias: null, p90Dias: null, count: 0 });
+    expect(result).toEqual({ medianaHoras: null, p90Horas: null, count: 0 });
+    expect(BankMovement.find).not.toHaveBeenCalled();
   });
 
-  test('filtra status:"identificado" directo en Mongo, acotado al banco pedido', async () => {
-    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+  test('acota BankMovementClienteCodigoMatch.distinct al banco pedido', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce([]);
     await getTiempoIdentificacionGlobal('BBVA');
 
+    expect(BankMovementClienteCodigoMatch.distinct).toHaveBeenCalledWith('bankMovementId', { banco: 'BBVA' });
+  });
+
+  test('sin banco: no filtra por banco en BankMovementClienteCodigoMatch', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce([]);
+    await getTiempoIdentificacionGlobal();
+
+    expect(BankMovementClienteCodigoMatch.distinct).toHaveBeenCalledWith('bankMovementId', {});
+  });
+});
+
+describe('_claveSemanaIso', () => {
+  test('jueves 2026-01-01 cae en la semana ISO 1 de 2026', () => {
+    expect(_claveSemanaIso(new Date('2026-01-01T12:00:00.000Z'))).toBe('2026-W01');
+  });
+
+  test('lunes 2025-12-29 (misma semana ISO que el jueves 2026-01-01) también es 2026-W01', () => {
+    expect(_claveSemanaIso(new Date('2025-12-29T12:00:00.000Z'))).toBe('2026-W01');
+  });
+});
+
+describe('getTiempoIdentificacionPorPeriodo', () => {
+  test('agrupa por mes de ORIGEN del depósito (no de identificación), mismos 3 fallbacks de fecha efectiva, en horas hábiles', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce(['m1', 'm2']);
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { fecha: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') }, // sep
+      { fecha: new Date('2026-10-02T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-04T12:00:00.000Z') }, // oct
+    ]) }) });
+
+    const serie = await getTiempoIdentificacionPorPeriodo({});
+
+    expect(serie).toEqual([
+      { periodo: '2026-09', medianaHoras: 36, p90Horas: 36, count: 1 },
+      { periodo: '2026-10', medianaHoras: 19, p90Horas: 19, count: 1 },
+    ]);
+  });
+
+  test('granularidad "semanal" agrupa por semana ISO del depósito, en horas hábiles', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce(['m1']);
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { fecha: new Date('2026-01-01T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-01-03T12:00:00.000Z') },
+    ]) }) });
+
+    const serie = await getTiempoIdentificacionPorPeriodo({ granularidad: 'semanal' });
+
+    expect(serie).toEqual([{ periodo: '2026-W01', medianaHoras: 24, p90Horas: 24, count: 1 }]);
+  });
+
+  test('sin ningún match persistido: array vacío, ni siquiera consulta BankMovement', async () => {
+    BankMovementClienteCodigoMatch.distinct.mockResolvedValueOnce([]);
+
+    const serie = await getTiempoIdentificacionPorPeriodo({ banco: 'BBVA' });
+
+    expect(serie).toEqual([]);
+    expect(BankMovement.find).not.toHaveBeenCalled();
+  });
+});
+
+// getTiempoIdentificacionCobranzaGlobal/PorPeriodo (2026-11-25): escenario hermano SIN filtro de
+// código de cliente — toma TODOS los `status:'identificado'` del banco, ancla en `createdAt` (no
+// en `fecha`), misma unidad horas hábiles. A diferencia de los tests de arriba, acá NO se usa
+// BankMovementClienteCodigoMatch en absoluto — es la prueba de que la población es distinta.
+describe('getTiempoIdentificacionCobranzaGlobal', () => {
+  test('calcula medianaHoras/p90Horas/count sobre createdAt->primeraIdentificacionAt, sin filtrar por código de cliente', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { createdAt: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') },
+      { createdAt: new Date('2026-09-20T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T06:00:00.000Z') },
+    ]) }) });
+
+    const result = await getTiempoIdentificacionCobranzaGlobal();
+
+    expect(result).toEqual({ medianaHoras: 69.5, p90Horas: 103, count: 2 });
+    expect(BankMovementClienteCodigoMatch.distinct).not.toHaveBeenCalled();
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.status).toBe('identificado');
+    expect(filtro.primeraIdentificacionAt).toEqual({ $ne: null });
+  });
+
+  test('acota por banco vía buildBaseMatch', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+
+    await getTiempoIdentificacionCobranzaGlobal('BBVA');
+
+    const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.banco).toBe('BBVA');
+  });
+
+  test('sin depósitos: medianaHoras/p90Horas null, count 0', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+
+    const result = await getTiempoIdentificacionCobranzaGlobal();
+
+    expect(result).toEqual({ medianaHoras: null, p90Horas: null, count: 0 });
+  });
+});
+
+describe('getTiempoIdentificacionCobranzaPorPeriodo', () => {
+  test('agrupa por mes de ORIGEN de `fecha` (no por createdAt ni por identificación), horas desde createdAt', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { fecha: new Date('2026-09-15T12:00:00.000Z'), createdAt: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') },
+      { fecha: new Date('2026-10-20T12:00:00.000Z'), createdAt: new Date('2026-10-02T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-04T12:00:00.000Z') },
+    ]) }) });
+
+    const serie = await getTiempoIdentificacionCobranzaPorPeriodo({});
+
+    expect(serie).toEqual([
+      { periodo: '2026-09', medianaHoras: 36, p90Horas: 36, count: 1 },
+      { periodo: '2026-10', medianaHoras: 19, p90Horas: 19, count: 1 },
+    ]);
+    expect(BankMovementClienteCodigoMatch.distinct).not.toHaveBeenCalled();
+  });
+
+  test('descarta un depósito sin `fecha` (no se puede ubicar en ningún periodo)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { createdAt: new Date('2026-09-27T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-10-01T12:00:00.000Z') },
+    ]) }) });
+
+    const serie = await getTiempoIdentificacionCobranzaPorPeriodo({});
+
+    expect(serie).toEqual([]);
+  });
+
+  test('granularidad "semanal" agrupa por semana ISO de `fecha`', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { fecha: new Date('2026-01-01T12:00:00.000Z'), createdAt: new Date('2026-01-01T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-01-03T12:00:00.000Z') },
+    ]) }) });
+
+    const serie = await getTiempoIdentificacionCobranzaPorPeriodo({ granularidad: 'semanal' });
+
+    expect(serie).toEqual([{ periodo: '2026-W01', medianaHoras: 24, p90Horas: 24, count: 1 }]);
   });
 });
 

@@ -3,6 +3,7 @@
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const CorteDescarga = require('./CorteDescarga.model');
+const BankMovementClienteCodigoMatch = require('../clientes-codigo/BankMovementClienteCodigoMatch.model');
 const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
@@ -1672,41 +1673,199 @@ async function getAntiguedadDepositos({ banco = null, fecha = null } = {}) {
 }
 
 /**
- * Mediana y percentil 90 del tiempo (en DÍAS, tiempo de RELOJ — mismo criterio que la
- * Antigüedad de Cortes de arriba, nunca horas hábiles como el dashboard de Cobranza, ver
- * horasHabilesEntre()) que tarda un depósito identificado en resolverse, medido desde su
- * `fecha` (fecha real del depósito en el banco) hasta `_primeraIdentificacionEfectiva()`.
+ * Mediana y percentil 90 del tiempo (en HORAS HÁBILES — ver horasHabilesEntre(), L-V 8-20h,
+ * sábado 8-15h, hora de México) que tarda un depósito identificado en resolverse, medido desde
+ * el inicio del día de su `fecha` (fecha real del depósito en el banco) hasta
+ * `_primeraIdentificacionEfectiva()`.
  *
- * Decisión explícita del usuario (2026-11-24): sobre TODOS los depósitos identificados
- * HISTÓRICAMENTE para el banco — no por mes/día de ningún corte en particular (calcularlo
- * dentro de `_calcularLedgerBacklog` repetiría el mismo número en cada fila del ledger, no
- * tiene sentido ahí). Mismo criterio de "identificado" que el resto de Cortes en vivo:
- * `status: 'identificado'` directo (equivalente al camino "en vivo" de `_estadoAlCierre`, sin
- * reconstrucción histórica — acá se quiere el estado actual, no uno de un corte pasado).
+ * REESCALADO 2026-11-25 (decisión explícita del usuario: los dos escenarios del modal de tiempo
+ * de identificación — este, "por código de cliente", y el hermano
+ * getTiempoIdentificacionCobranzaGlobal() de abajo — deben reportarse en la MISMA unidad para
+ * poder compararse en el mismo modal). Antes medía en días de reloj redondeados; la población,
+ * el ancla (`fecha`, no `createdAt`) y el fallback (`_primeraIdentificacionEfectiva`) NO
+ * cambiaron, solo la unidad de medida (reusa `horasHabilesEntre()`, no reimplementa el cálculo).
+ *
+ * REDISEÑADO 2026-11-25 (decisión explícita del usuario, revirtiendo la de 2026-11-24 de abajo):
+ * ya NO es sobre todos los depósitos identificados del banco — es SOLO sobre los depósitos
+ * donde se detectó el código del cliente en el concepto (cualquier nivel de confianza, incluida
+ * 'baja' — el usuario lo pidió así explícitamente, informado del ruido conocido tipo "WD-40"/
+ * "40 acrílicos", ver [[project_cortes_ajustes_tablas_apiladas]]/clientes-codigo.service.js).
+ * La población sale de `BankMovementClienteCodigoMatch` (persistida, ver
+ * clientes-codigo.service.js#actualizarMatches), no de un `$match` directo sobre BankMovement.
+ *
+ * Decisión de 2026-11-24 que SIGUE aplicando sin cambios: sobre TODOS los HISTÓRICAMENTE
+ * detectados (no por mes/día de ningún corte en particular — eso lo cubre
+ * getTiempoIdentificacionPorPeriodo() de abajo, nueva en este mismo rediseño).
  *
  * @param {string} [banco]
  */
 async function getTiempoIdentificacionGlobal(banco = null) {
-  const unDiaMs = 24 * MS_PER_HOUR;
-  const depositos = await BankMovement.find({
-    ...buildBaseMatch({ banco }),
-    status: 'identificado',
-  }).select('fecha primeraIdentificacionAt identificadoPor fichaAt').lean();
+  const matchQuery = {};
+  if (banco) matchQuery.banco = banco;
+  const bankMovementIds = await BankMovementClienteCodigoMatch.distinct('bankMovementId', matchQuery);
+  if (!bankMovementIds.length) return { medianaHoras: null, p90Horas: null, count: 0 };
 
-  const dias = [];
+  const depositos = await BankMovement.find({ _id: { $in: bankMovementIds } })
+    .select('fecha primeraIdentificacionAt identificadoPor fichaAt').lean();
+
+  const horas = [];
   for (const dep of depositos) {
     if (!dep.fecha) continue;
     const pid = _primeraIdentificacionEfectiva(dep);
     if (!pid) continue;
     const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
-    dias.push(Math.max(0, Math.round((pid.getTime() - inicioDiaDeposito.getTime()) / unDiaMs)));
+    horas.push(horasHabilesEntre(inicioDiaDeposito, pid));
   }
 
   return {
-    medianaDias: mediana(dias),
-    p90Dias: percentil(dias, 90),
-    count: dias.length,
+    medianaHoras: mediana(horas),
+    p90Horas: percentil(horas, 90),
+    count: horas.length,
   };
+}
+
+// Semana ISO-8601 de una fecha (lunes a domingo, semana 1 = la que contiene el primer jueves
+// del año) — no existía ningún helper de semana en este archivo (el resto de Cortes agrupa por
+// mes/día de origen, nunca por semana calendario); implementación standard, acotada a esta
+// función nueva.
+function _claveSemanaIso(fechaReal) {
+  const mx = _comoRelojMexico(fechaReal);
+  const d = new Date(Date.UTC(mx.getUTCFullYear(), mx.getUTCMonth(), mx.getUTCDate()));
+  const diaIso = d.getUTCDay() || 7; // domingo (0) -> 7
+  d.setUTCDate(d.getUTCDate() + 4 - diaIso); // jueves de esta semana ISO
+  const inicioAnio = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const semana = Math.ceil((((d - inicioAnio) / MS_PER_HOUR / 24) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(semana).padStart(2, '0')}`;
+}
+
+/**
+ * Tiempo de identificación (mismos criterios que getTiempoIdentificacionGlobal: HORAS HÁBILES —
+ * ver horasHabilesEntre() —, SOLO depósitos con código de cliente detectado) agrupado por MES DE
+ * ORIGEN o SEMANA ISO del depósito (nunca por fecha de identificación — mismo criterio que el
+ * resto de Cortes agrupa por periodo de origen, ver `mesOrigen` en
+ * getAntiguedadDepositosPorAnio/getLedgerMensual).
+ * Tercera métrica del modal de tiempo de identificación (2026-11-25, pedido explícito del
+ * usuario: "qué tanto demoran por mes/semana en identificar un depósito que el cliente anexó
+ * su código" — reusa mediana()/percentil() ya existentes, no los reimplementa). Reescalado a
+ * horas hábiles el mismo día (ver JSDoc de getTiempoIdentificacionGlobal) para ser comparable
+ * contra getTiempoIdentificacionCobranzaPorPeriodo() en el mismo modal.
+ *
+ * @param {object} opts
+ * @param {string} [opts.banco]
+ * @param {'mensual'|'semanal'} [opts.granularidad]
+ */
+async function getTiempoIdentificacionPorPeriodo({ banco = null, granularidad = 'mensual' } = {}) {
+  const claveDePeriodo = granularidad === 'semanal'
+    ? (fecha) => _claveSemanaIso(fecha)
+    : (fecha) => _fechaMexicoStr(fecha).slice(0, 7);
+
+  const matchQuery = {};
+  if (banco) matchQuery.banco = banco;
+  const bankMovementIds = await BankMovementClienteCodigoMatch.distinct('bankMovementId', matchQuery);
+  if (!bankMovementIds.length) return [];
+
+  const depositos = await BankMovement.find({ _id: { $in: bankMovementIds } })
+    .select('fecha primeraIdentificacionAt identificadoPor fichaAt').lean();
+
+  const horasPorPeriodo = new Map();
+  for (const dep of depositos) {
+    if (!dep.fecha) continue;
+    const pid = _primeraIdentificacionEfectiva(dep);
+    if (!pid) continue;
+    const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
+    const horas = horasHabilesEntre(inicioDiaDeposito, pid);
+    const periodo = claveDePeriodo(dep.fecha);
+    if (!horasPorPeriodo.has(periodo)) horasPorPeriodo.set(periodo, []);
+    horasPorPeriodo.get(periodo).push(horas);
+  }
+
+  return [...horasPorPeriodo.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([periodo, horas]) => ({
+      periodo,
+      medianaHoras: mediana(horas),
+      p90Horas: percentil(horas, 90),
+      count: horas.length,
+    }));
+}
+
+/**
+ * Escenario "Cobranza" del modal de tiempo de identificación de Cortes (2026-11-25): mediana y
+ * percentil 90, en HORAS HÁBILES (ver horasHabilesEntre()), de TODOS los depósitos identificados
+ * del banco — SIN filtro de código de cliente, a diferencia de getTiempoIdentificacionGlobal() de
+ * arriba. Ancla en `createdAt` (cuándo el depósito entró a Numo), no en `fecha` (fecha bancaria),
+ * porque este escenario mide la operación de cobranza (cuánto tarda el equipo en cerrarlo desde
+ * que lo tiene disponible), no el origen del depósito.
+ *
+ * Deliberadamente NO reusa getIndicadoresIdentificacion() (dashboard "Cobranza", módulo
+ * collections): esa función trae scoping propio que no aplica acá (default "hoy" si no hay
+ * year/month, scopeUserId por integrante del equipo, backlog, "casi identificados por saldo
+ * bajo") — comparte únicamente horasHabilesEntre(), sin arrastrar ese scoping. Agregado histórico
+ * completo (mismo criterio que getTiempoIdentificacionGlobal: todo lo identificado desde
+ * INDICADORES_DESDE, no solo "hoy").
+ *
+ * @param {string} [banco]
+ */
+async function getTiempoIdentificacionCobranzaGlobal(banco = null) {
+  const matchTiempo = {
+    ...buildBaseMatch({ banco }),
+    status: 'identificado',
+    primeraIdentificacionAt: { $ne: null },
+    createdAt: { $gte: INDICADORES_DESDE },
+  };
+  const depositos = await BankMovement.find(matchTiempo)
+    .select('createdAt primeraIdentificacionAt').lean();
+
+  const horas = depositos.map(d => horasHabilesEntre(d.createdAt, d.primeraIdentificacionAt));
+
+  return {
+    medianaHoras: mediana(horas),
+    p90Horas: percentil(horas, 90),
+    count: horas.length,
+  };
+}
+
+/**
+ * Versión por periodo (mes/semana ISO) de getTiempoIdentificacionCobranzaGlobal() — mismo
+ * criterio de agrupación por MES/SEMANA DE ORIGEN de `fecha` que getTiempoIdentificacionPorPeriodo()
+ * (nunca por fecha de identificación), para que ambos escenarios del modal compartan el mismo
+ * eje de periodos en el gráfico.
+ *
+ * @param {object} opts
+ * @param {string} [opts.banco]
+ * @param {'mensual'|'semanal'} [opts.granularidad]
+ */
+async function getTiempoIdentificacionCobranzaPorPeriodo({ banco = null, granularidad = 'mensual' } = {}) {
+  const claveDePeriodo = granularidad === 'semanal'
+    ? (fecha) => _claveSemanaIso(fecha)
+    : (fecha) => _fechaMexicoStr(fecha).slice(0, 7);
+
+  const matchTiempo = {
+    ...buildBaseMatch({ banco }),
+    status: 'identificado',
+    primeraIdentificacionAt: { $ne: null },
+    createdAt: { $gte: INDICADORES_DESDE },
+  };
+  const depositos = await BankMovement.find(matchTiempo)
+    .select('fecha createdAt primeraIdentificacionAt').lean();
+
+  const horasPorPeriodo = new Map();
+  for (const dep of depositos) {
+    if (!dep.fecha) continue;
+    const horas = horasHabilesEntre(dep.createdAt, dep.primeraIdentificacionAt);
+    const periodo = claveDePeriodo(dep.fecha);
+    if (!horasPorPeriodo.has(periodo)) horasPorPeriodo.set(periodo, []);
+    horasPorPeriodo.get(periodo).push(horas);
+  }
+
+  return [...horasPorPeriodo.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([periodo, horas]) => ({
+      periodo,
+      medianaHoras: mediana(horas),
+      p90Horas: percentil(horas, 90),
+      count: horas.length,
+    }));
 }
 
 /**
@@ -2289,8 +2448,17 @@ module.exports = {
   getLedgerPorHora,
   _enumerarHorasDelDia,
   getUltimosMovimientos,
-  // Mediana/percentil 90 global del tiempo de identificación (2026-11-24, hero de Cortes).
+  // Mediana/percentil 90 del tiempo de identificación (2026-11-24, hero de Cortes; rescopeado
+  // 2026-11-25 a solo depósitos con código de cliente detectado, en horas hábiles) + serie por
+  // mes/semana (nueva).
   getTiempoIdentificacionGlobal,
+  getTiempoIdentificacionPorPeriodo,
+  // Escenario "Cobranza" hermano de los dos de arriba (2026-11-25): mismas horas hábiles, sin
+  // filtro de código de cliente, ancla en createdAt — ver JSDoc de
+  // getTiempoIdentificacionCobranzaGlobal.
+  getTiempoIdentificacionCobranzaGlobal,
+  getTiempoIdentificacionCobranzaPorPeriodo,
+  _claveSemanaIso,
   // Antigüedad del backlog vacío (2026-11-06) — exportadas para testearlas directo.
   getAntiguedadDepositos,
   getAntiguedadDepositosPorAnio,

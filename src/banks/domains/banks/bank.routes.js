@@ -16,6 +16,8 @@ const {
 const rulesService          = require('./bank-rules.service');
 const indicadoresService    = require('./bank-indicadores.service');
 const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
+const clientesCodigoService = require('../clientes-codigo/clientes-codigo.service');
+const { parseClientesIdsXlsx } = require('../clientes-codigo/clientes-codigo.parser');
 const {
   matchTraspasosInternos,
   revertirTraspasosInternos,
@@ -307,13 +309,47 @@ router.get('/cortes/antiguedad-por-dia', authenticate, permit(PERMISSIONS.BANKS_
   res.json(await indicadoresService.getAntiguedadPorDiaMesActual({ banco: banco || null }));
 }));
 
-// GET /api/banks/cortes/tiempo-identificacion — mediana y percentil 90 (en días, tiempo de
-// reloj) del tiempo que tarda un depósito en identificarse, sobre TODOS los depósitos
-// identificados HISTÓRICAMENTE del banco (2026-11-24, pedido explícito del usuario — no es por
-// mes/día de ningún corte en particular). Mismo permiso que el resto de /cortes.
+// GET /api/banks/cortes/tiempo-identificacion — mediana y percentil 90 (en HORAS HÁBILES, ver
+// horasHabilesEntre()) del tiempo que tarda un depósito en identificarse. Rescopeado 2026-11-25:
+// ya NO es sobre todos los identificados — es solo sobre los depósitos con código de cliente
+// detectado (ver BankMovementClienteCodigoMatch), decisión explícita del usuario. Mismo permiso
+// que el resto de /cortes, misma firma de respuesta (el rescoping es transparente para el
+// frontend). Reescalado de días a horas hábiles el mismo día (ver JSDoc en el servicio) para ser
+// comparable contra /cortes/tiempo-identificacion-cobranza de abajo en el mismo modal.
 router.get('/cortes/tiempo-identificacion', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco } = req.query;
   res.json(await indicadoresService.getTiempoIdentificacionGlobal(banco || null));
+}));
+
+// GET /api/banks/cortes/tiempo-identificacion/periodo — serie mensual o semanal de
+// mediana/p90/count en horas hábiles (2026-11-25, tercera métrica del modal de tiempo de
+// identificación, misma población restringida que la ruta de arriba). `granularidad`: 'mensual'
+// (default) | 'semanal'.
+router.get('/cortes/tiempo-identificacion/periodo', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, granularidad } = req.query;
+  res.json(await indicadoresService.getTiempoIdentificacionPorPeriodo({
+    banco: banco || null,
+    granularidad: granularidad === 'semanal' ? 'semanal' : 'mensual',
+  }));
+}));
+
+// GET /api/banks/cortes/tiempo-identificacion-cobranza — escenario hermano de la ruta de arriba
+// (2026-11-25): mismas horas hábiles, pero sobre TODOS los depósitos identificados del banco, sin
+// filtro de código de cliente, ancla en `createdAt` (cuándo entró a Numo) — ver JSDoc de
+// getTiempoIdentificacionCobranzaGlobal(). Mismo permiso que el resto de /cortes.
+router.get('/cortes/tiempo-identificacion-cobranza', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  res.json(await indicadoresService.getTiempoIdentificacionCobranzaGlobal(banco || null));
+}));
+
+// GET /api/banks/cortes/tiempo-identificacion-cobranza/periodo — serie mensual o semanal del
+// escenario Cobranza. `granularidad`: 'mensual' (default) | 'semanal'.
+router.get('/cortes/tiempo-identificacion-cobranza/periodo', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, granularidad } = req.query;
+  res.json(await indicadoresService.getTiempoIdentificacionCobranzaPorPeriodo({
+    banco: banco || null,
+    granularidad: granularidad === 'semanal' ? 'semanal' : 'mensual',
+  }));
 }));
 
 // GET /api/banks/cortes/descargar — Excel de TODO el panel de Cortes (Mensual/Diario/Antigüedad
@@ -883,6 +919,44 @@ router.post('/autorizaciones/match',
     } finally {
       autMatchRunning = false;
     }
+  }),
+);
+
+// POST /api/banks/clientes-codigo/importar — importación periódica (acumulativa, nunca
+// reemplaza el catálogo entero) del catálogo de clientes del ERP (Clientes-ids.xlsx), vía el
+// panel de Admins → tab "Archivos". Mismo permiso/patrón que /autorizaciones/match (upload de
+// Excel admin-only con el `upload` single-field ya declarado arriba). `importarCatalogo()`
+// dispara internamente actualizarMatches() — cada importación también persiste los matches
+// nuevos que encuentre (depósitos nuevos + códigos nuevos del catálogo), ver
+// clientes-codigo.service.js. `matchesNuevos` en la respuesta es cuántos se agregaron ahora.
+router.post('/clientes-codigo/importar',
+  authenticate,
+  permit('banks:import'),
+  upload.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const filas = await parseClientesIdsXlsx(req.file.buffer);
+    res.json(await clientesCodigoService.importarCatalogo(filas));
+  }),
+);
+
+// GET /api/banks/clientes-codigo/reporte-matches — indicador de Cortes "depósitos
+// identificados por número de cliente": Excel con los matches YA PERSISTIDOS (ver
+// actualizarMatches() — ya no se recalcula al vuelo en cada request), clasificados por
+// confianza (alta/media/baja — ver clientes-codigo.service.js). Mismo permiso que el resto de
+// reportes de Cortes (BANKS_READ): solo-lectura, misma data que ya es visible, en formato
+// descargable.
+router.get('/clientes-codigo/reporte-matches',
+  authenticate,
+  permit(PERMISSIONS.BANKS_READ),
+  asyncHandler(async (req, res) => {
+    const { fechaInicio, fechaFin, banco } = req.query;
+    const matches = await clientesCodigoService.listarMatchesPersistidos({ fechaInicio, fechaFin, banco: banco || null });
+    const buffer = await clientesCodigoService.buildReporteMatches(matches);
+    const fecha = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="Indicador-Codigos-Cliente-${fecha}.xlsx"`);
+    res.send(buffer);
   }),
 );
 

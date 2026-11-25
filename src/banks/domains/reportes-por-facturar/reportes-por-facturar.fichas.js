@@ -12,12 +12,22 @@
  *
  *   cobros con claveCentro = serie de la sucursal y fecha (día MX) = ese día
  *   (`/desgloses-cobro/almacen?centro=`), solo la parte en EFECTIVO:
- *     • Efectivo facturado:    cobro del ticket (CBT) de una venta ya facturada.
- *     • Efectivo consignación (clave efectivoPorFacturar; antes "por facturar",
- *       2026-11-06): cobros (no abonos) de ventas SIN factura todavía.
- *     • Cobranza en efectivo:  otros cobros (CFC, CPF, APS, MIS…) de ventas ya facturadas.
- *     • Abonos en efectivo:    abonos (ABO).
- *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
+ *   2026-11-25 (pedido del usuario) — renglones según el TIPO de venta en Kore
+ *   (nombreTipoMovimiento / tipoPago de /cuentas-pendientes, memoria kore_remisiones):
+ *     • Efectivo facturado:      venta de contado PUE ya facturada que quedó
+ *       cobrada en su totalidad (sin saldo pendiente). Ticket (CBT) y contra
+ *       entrega (CCE) facturados entran aquí sin preguntar a Kore.
+ *     • Consignación facturada (consignacionFacturada): cobros de una venta de
+ *       CONSIGNACIÓN (PPD o PUE) que ya está facturada, liquide o no.
+ *     • Cobranza facturado (clave cobranzaEfectivo): venta PPD facturada — el
+ *       cobro genera complemento de pago —, liquide o no.
+ *     • Abonos en efectivo:      cualquier otro cobro que deja SALDO PENDIENTE
+ *       (el saldo después del cobro y de la bonificación que Kore aplica en el
+ *       mismo momento, p. ej. BON 4%).
+ *     • Efectivo consignación SIN factura (clave efectivoPorFacturar): ya NO
+ *       suma al total a entregar; va al final del anexo con su desglose.
+ *       Incluye cualquier venta sin factura que no quedó con saldo pendiente.
+ *     • Venta miscelánea:        cobros MIS ("TIENDITA TYC"), facturados o no.
  *     • Cobros de otras sucursales (2026-11-06, pedido del usuario): cualquier
  *       cobro o abono en efectivo de una remisión de OTRA sucursal hecho en esta
  *       caja (Puerto 31-oct: remisiones y abonos de CEDIS $10,785.42). Va antes
@@ -39,6 +49,7 @@ const CFDI       = require('../../../visor/models/CFDI');
 const centrosSvc = require('../centros-costo/centros-costo.service');
 const { obtenerDesglosesCobroAlmacenPorCentro, obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
+const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -49,11 +60,18 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
-// Orden (2026-11-06, pedido del usuario): facturado, consignación, cobranza, abonos, venta miscelánea; luego lo demás.
-const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
+// Orden (2026-11-25, pedido del usuario): efectivo facturado, consignación facturada, cobranza
+// facturado, abonos, venta miscelánea, otras sucursales; luego lo que se resta.
+const ENTRADAS = ['efectivoFacturado', 'consignacionFacturada', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
 const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
-const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
+// Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
+const SIN_FACTURA = ['efectivoPorFacturar'];
+const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS, ...SIN_FACTURA];
+// Cobros que no hace falta preguntar a Kore: ticket y contra entrega son de contado.
+const ORIGEN_CONTADO = new Set(['CBT', 'CCE']);
+// Ajustes sin dinero (bonificación BON/BN) que Kore aplica justo después del cobro.
+const MS_AJUSTE_MISMO_COBRO = 2 * 60 * 1000;
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _serie = v => String(v ?? '').trim().toUpperCase();
@@ -144,6 +162,8 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen: serie, fechaDesde, fechaHasta }),
   ]);
 
+  // 1) Cobros en efectivo; los que dependen del tipo de venta se clasifican después.
+  const pendientes = [];
   for (const c of cuentas ?? []) {
     const facturada = !!c.serieFactura;
     const remision = c.serieVenta && c.folioVenta ? `${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}` : null;
@@ -162,28 +182,49 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
       const suma = fps.reduce((s, f) => s + (Number(f.monto) || 0), 0);
       const conSaldoFavor = fps.some(f => _forma(f) === 'saldoFavor');
       const factor = (!conSaldoFavor && fps.length > 1 && montoReal != null && suma > montoReal + 0.05) ? montoReal / suma : 1;
+      const cobro = `${origen}-${String(k.folioOrigen ?? '').trim()}`;
       for (const fp of fps) {
         const forma = _forma(fp);
         if (!forma) continue;
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
-        let concepto;
+        let concepto = null;
         if (forma !== 'efectivo') concepto = forma;
         else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
-        else if (origen === 'ABO') concepto = 'abonosEfectivo';
-        else if (!facturada) concepto = 'efectivoPorFacturar';
-        else if (origen === 'CBT') concepto = 'efectivoFacturado';
-        else concepto = 'cobranzaEfectivo';
-        montos[concepto] += monto;
-        if (ENTRADAS.includes(concepto)) {
-          detalle.push({
-            dia, serie, concepto, remision, factura, cobro: `${origen}-${String(k.folioOrigen ?? '').trim()}`,
-            fecha: k.fecha, importe: _r2(monto),
-          });
-        }
+        else if (ORIGEN_CONTADO.has(origen)) concepto = facturada ? 'efectivoFacturado' : 'efectivoPorFacturar';
+        const mov = { dia, serie, concepto, remision, factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto };
+        if (concepto) _sumar(montos, detalle, mov);
+        else pendientes.push({ ...mov, facturada, serieVenta: c.serieVenta, folioVenta: c.folioVenta, fechaCreacion: c.fechaCreacion ?? k.fecha });
       }
     }
   }
+
+  // 2) Tipo de venta (consignación / PPD / contado) y saldo después del cobro (2026-11-25).
+  const avisos = [];
+  if (pendientes.length) {
+    const remisiones = pendientes.filter(p => p.remision)
+      .map(p => ({ serie: _serie(p.serieVenta), folio: String(p.folioVenta).trim(), fechaCreacion: p.fechaCreacion }));
+    const { info } = await infoRemisiones({ rfc, remisiones });
+    // Solo las de contado necesitan el saldo fresco (consignación y PPD facturada no dependen del saldo).
+    const conSaldo = new Set(pendientes.filter(p => {
+      const i = info.get(_claveRem(p.remision));
+      return i?.nombreTipoMovimiento && !_esConsignacion(i) && !(p.facturada && _esPpd(i));
+    }).map(p => _claveRem(p.remision)));
+    if (conSaldo.size) {
+      const { info: frescas } = await infoRemisiones({
+        rfc, remisiones: remisiones.filter(r => conSaldo.has(`${r.serie}|${r.folio}`)), necesitaSaldo: () => true,
+      });
+      for (const [k, v] of frescas) info.set(k, v);
+    }
+    let sinTipo = 0;
+    for (const p of pendientes) {
+      const i = p.remision ? info.get(_claveRem(p.remision)) : null;
+      if (!i?.nombreTipoMovimiento) sinTipo++;
+      _sumar(montos, detalle, { ...p, ..._clasificar({ ...p, info: i }) });
+    }
+    if (sinTipo) avisos.push(`Kore no dio el tipo de venta de ${sinTipo} cobro(s) de la caja ${serie} del ${dia}; vuelve a generar la ficha.`);
+  }
+
   for (const s of salidas ?? []) {
     if (!s.fecha || _diaMx(s.fecha) !== dia) continue;
     const tipo = _serie(s.tipoMovimiento?.abreviatura);
@@ -201,7 +242,58 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     });
   }
   for (const k of CONCEPTOS) montos[k] = _r2(montos[k]);
-  return { montos, detalle };
+  return { montos, detalle, avisos };
+}
+
+const _claveRem = remision => String(remision ?? '').replace('-', '|');
+const _esConsignacion = i => /CONSIGNACI/i.test(String(i?.nombreTipoMovimiento ?? ''));
+const _esPpd = i => String(i?.tipoPago ?? '').toUpperCase().includes('PPD');
+
+function _sumar(montos, detalle, mov) {
+  montos[mov.concepto] += mov._monto;
+  if (!ENTRADAS.includes(mov.concepto) && !SIN_FACTURA.includes(mov.concepto)) return;
+  const d = { dia: mov.dia, serie: mov.serie, concepto: mov.concepto, remision: mov.remision, factura: mov.factura, cobro: mov.cobro, fecha: mov.fecha, importe: mov.importe };
+  if (mov.tipoVenta) d.tipoVenta = mov.tipoVenta;
+  if (mov.saldoDespues != null) d.saldoDespues = mov.saldoDespues;
+  detalle.push(d);
+}
+
+/**
+ * Saldo de la cuenta después del cobro (2026-11-25): el del movimiento del
+ * cobro y, si Kore aplicó justo después un ajuste sin dinero (bonificación
+ * BON/BN), el que dejó ese ajuste. Sin el movimiento, el saldo actual.
+ */
+function _saldoDespuesDe(info, cobro) {
+  const movs = Array.isArray(info?.abonos) ? info.abonos : [];
+  const i = movs.findIndex(m => _serie(m.movimiento) === _serie(cobro));
+  if (i < 0) return info?.saldoActual != null ? _r2(info.saldoActual) : null;
+  let saldo = movs[i].saldo;
+  const t0 = new Date(movs[i].fecha).getTime();
+  for (let j = i + 1; j < movs.length; j++) {
+    const m = movs[j];
+    if (m.forma || !(new Date(m.fecha).getTime() - t0 <= MS_AJUSTE_MISMO_COBRO)) break;
+    saldo = m.saldo;
+  }
+  return _r2(saldo);
+}
+
+/**
+ * Renglón de un cobro en efectivo según el tipo de venta (2026-11-25, pedido del usuario):
+ * consignación → facturada o sin factura (anexo, no suma); PPD facturada → cobranza
+ * (complemento); lo demás → abono si deja saldo pendiente, si no efectivo facturado / sin factura.
+ * Sin datos de Kore: como antes (abono si es ABO, cobranza si está facturada).
+ */
+function _clasificar({ facturada, cobro, info }) {
+  if (!info?.nombreTipoMovimiento) {
+    const origen = String(cobro ?? '').split('-')[0];
+    return { concepto: origen === 'ABO' ? 'abonosEfectivo' : facturada ? 'cobranzaEfectivo' : 'efectivoPorFacturar', tipoVenta: null, saldoDespues: null };
+  }
+  const tipoVenta = `${String(info.tipoPago ?? '').trim()} ${String(info.nombreTipoMovimiento).trim()}`.trim();
+  if (_esConsignacion(info)) return { concepto: facturada ? 'consignacionFacturada' : 'efectivoPorFacturar', tipoVenta, saldoDespues: null };
+  if (facturada && _esPpd(info)) return { concepto: 'cobranzaEfectivo', tipoVenta, saldoDespues: null };
+  const saldoDespues = _saldoDespuesDe(info, cobro);
+  if (saldoDespues != null && saldoDespues >= 0.01) return { concepto: 'abonosEfectivo', tipoVenta, saldoDespues };
+  return { concepto: facturada ? 'efectivoFacturado' : 'efectivoPorFacturar', tipoVenta, saldoDespues };
 }
 
 const _total = m => _r2(ENTRADAS.reduce((s, k) => s + m[k], 0) - SALIDAS.reduce((s, k) => s + m[k], 0));
@@ -278,7 +370,8 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (const dia of dias) {
     for (const serie of series) {
       try {
-        const { montos, detalle: det } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series });
+        const { montos, detalle: det, avisos = [] } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series });
+        if (avisos.length) { fallidas.push(`${serie}|${dia}`); advertencias.push(...avisos); }
         if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
         filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });
         detalle = detalle.concat(det);
@@ -289,7 +382,9 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
     }
   }
   await _completarDetalle({ rfc, detalle });
-  detalle.sort((a, b) => a.dia.localeCompare(b.dia) || a.serie.localeCompare(b.serie)
+  // Lo sin factura (no suma) va al final del anexo, con su desglose (2026-11-25).
+  const _alFinal = d => (SIN_FACTURA.includes(d.concepto) ? 1 : 0);
+  detalle.sort((a, b) => _alFinal(a) - _alFinal(b) || a.dia.localeCompare(b.dia) || a.serie.localeCompare(b.serie)
     || CONCEPTOS.indexOf(a.concepto) - CONCEPTOS.indexOf(b.concepto) || String(a.fecha).localeCompare(String(b.fecha)));
 
   const totales = Object.fromEntries([...CONCEPTOS, 'totalEntregar'].map(k => [k, _r2(filas.reduce((s, f) => s + f[k], 0))]));
@@ -322,7 +417,7 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 async function actualizarFacturasDetalle({ rfc, detalle }) {
   if (!rfc) throw new BadRequestError('RFC requerido');
   const lista = Array.isArray(detalle) ? detalle : [];
-  const sinFactura = lista.filter(d => d?.remision && !d.factura && ENTRADAS.includes(d.concepto));
+  const sinFactura = lista.filter(d => d?.remision && !d.factura && (ENTRADAS.includes(d.concepto) || SIN_FACTURA.includes(d.concepto)));
   const cajas = [...new Set(sinFactura.map(d => `${_serie(d.serie)}|${d.dia}`))]
     .filter(c => FECHA_RE.test(c.split('|')[1] ?? ''));
   const facturaDe = new Map(); // remisión → factura actual
@@ -373,4 +468,4 @@ async function listarBancos() {
   return todos.map(banco => ({ banco, numeroCuenta: configs.get(banco)?.numeroCuenta ?? null }));
 }
 
-module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, ENTRADAS, SALIDAS, CONCEPTOS };
+module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, _clasificar, ENTRADAS, SALIDAS, SIN_FACTURA, CONCEPTOS };

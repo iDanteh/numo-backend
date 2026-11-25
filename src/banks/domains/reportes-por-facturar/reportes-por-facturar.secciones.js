@@ -269,7 +269,7 @@ function _encabezado(row, n) {
  * Escribe un bloque: encabezado(s), filas agrupadas por cliente (depósitos +
  * subtotal) y TOTAL. `fila(d)` → arreglo de celdas.
  * 2026-11-10 (pedido del usuario): sin el renglón con el nombre del cliente
- * arriba de cada grupo — la agrupación y el "Subtotal <cliente>" se quedan.
+ * arriba de cada grupo — la agrupación y el "Total <cliente>" se quedan.
  */
 // 2026-11-10 (usuario: "el cliente debe estar a un lado de la fecha y se
 // recorre lo demás"): en todas las hojas la 2ª columna es el CLIENTE, la
@@ -292,7 +292,7 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
       if (abonos) _escribirAbonos(ws, d, n);
     }
     const sub = ws.addRow([]);
-    sub.getCell(2).value = `Subtotal ${g.cliente}`;
+    sub.getCell(2).value = `Total ${g.cliente}`; // 2026-11-25 (usuario): "Total <cliente>" en vez de "Subtotal"
     sub.getCell(colImporte).value = g.total;
     sub.getCell(colImporte).numFmt = DINERO;
     sub.font = { bold: true, italic: true };

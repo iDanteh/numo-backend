@@ -340,7 +340,7 @@ describe('secciones y Excel por pestaña', () => {
     // 2026-10-30: columna FORMA DE PAGO después de BANCO.
     // 2026-11-10: CLIENTE junto a la FECHA.
     expect(fila(enc + 1)).toEqual(['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', undefined, 'ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL']); // 2026-11-12: ESTATUS en MOSTRADOR
-    expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Subtotal ALFA', 'TOTAL']));
+    expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Total ALFA', 'TOTAL']));
     // Al final: TOTAL EFECTIVO (solo el cobro en caja de $1,500) y, aparte, DEPÓSITO EN EFECTIVO.
     const totalDe = etiqueta => { const n = ws.getColumn(2).values.indexOf(etiqueta); return n > 0 ? ws.getRow(n).getCell(4).value : null; };
     expect(totalDe('TOTAL EFECTIVO')).toBe(1500);

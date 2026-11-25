@@ -54,6 +54,17 @@ const configService = require('../domains/config/loyalty-config.service');
 const WHATSAPP_GRAPH_VERSION = 'v21.0';
 const WHATSAPP_TIMEOUT_MS = 10000;
 
+// Código de país de México — los teléfonos en Numo se guardan como 10 dígitos planos sin código
+// de país (ver TELEFONO_RE en loyalty-recovery.service.js/loyalty-kore-canje), pero la API de
+// WhatsApp Cloud exige el formato internacional completo en `to`. Confirmado contra la API real
+// (2026-11-25, prueba directa vía curl): mandar `52` + los 10 dígitos alcanza — Meta resuelve
+// internamente el prefijo móvil "1" (`wa_id` queda en `521...`), no hace falta agregarlo acá.
+const CODIGO_PAIS_MX = '52';
+
+function _normalizarTelefonoMx(telefono) {
+  return `${CODIGO_PAIS_MX}${telefono}`;
+}
+
 /**
  * Payload de WhatsApp Cloud API para una plantilla "Authentication" — exportado (prefijo `_`,
  * mismo criterio que `loyalty-config.service.js#_buscarOAdoptarNivelKore`) para poder probar la
@@ -62,7 +73,7 @@ const WHATSAPP_TIMEOUT_MS = 10000;
 function _armarPayloadWhatsapp(telefono, codigo, { templateNombre, templateIdioma }) {
   return {
     messaging_product: 'whatsapp',
-    to: telefono,
+    to: _normalizarTelefonoMx(telefono),
     type: 'template',
     template: {
       name: templateNombre,

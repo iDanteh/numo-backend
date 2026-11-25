@@ -83,7 +83,7 @@ describe('modo real, proveedor whatsapp — éxito', () => {
       `https://graph.facebook.com/v21.0/${WHATSAPP_CFG_COMPLETA.phoneNumberId}/messages`,
       expect.objectContaining({
         messaging_product: 'whatsapp',
-        to: TELEFONO,
+        to: `52${TELEFONO}`,
         type: 'template',
       }),
       expect.objectContaining({
@@ -113,7 +113,7 @@ describe('modo real, proveedor whatsapp — éxito', () => {
 
     expect(payload).toEqual({
       messaging_product: 'whatsapp',
-      to: TELEFONO,
+      to: `52${TELEFONO}`,
       type: 'template',
       template: {
         name: 'verificacion_codigo',
@@ -124,6 +124,17 @@ describe('modo real, proveedor whatsapp — éxito', () => {
         ],
       },
     });
+  });
+
+  // Bug real encontrado 2026-11-25: los teléfonos en Numo son 10 dígitos planos (sin código de
+  // país) y la API de WhatsApp Cloud los rechazaba/no entregaba el mensaje sin el prefijo
+  // internacional. Confirmado contra la API real de Meta que `52` + 10 dígitos alcanza.
+  test('_armarPayloadWhatsapp: antepone el código de país 52 a los 10 dígitos planos', () => {
+    const payload = _armarPayloadWhatsapp('9511314958', CODIGO, {
+      templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+
+    expect(payload.to).toBe('529511314958');
   });
 
   test('resuelve el proveedor desde configService.obtenerOtpEnvioProveedor() cuando no se pasa `canal`', async () => {

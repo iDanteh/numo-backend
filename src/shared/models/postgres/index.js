@@ -451,6 +451,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
 
+  // NC de aplicación de anticipo ya aplicadas en la póliza de su factura (2026-11-25, idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS ncs_anticipo_ya_aplicadas JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN ncs_anticipo_ya_aplicadas:', e.message));
+
   // Tickets de cajas con cobro real pero sin factura ligada, detectados al
   // generar la póliza (idempotente)
   await Poliza.sequelize.query(`

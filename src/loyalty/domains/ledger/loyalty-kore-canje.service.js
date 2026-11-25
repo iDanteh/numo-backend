@@ -15,9 +15,10 @@
  *
  * Flujo real: Kore consulta el saldo (`GET /saldo`, ya existente) → cajero decide
  * cuántos puntos usar → Kore pide este código (`solicitarCodigoCanje`) → Numo lo
- * manda por el canal de mensajería de la consulta pública (hoy SIMULADO, mismo
- * criterio que `loyalty-recovery.service.js#solicitarCodigo` — no hay proveedor
- * real elegido todavía) → cajero tipea el código en Kore → Kore lo valida
+ * manda por el mismo adapter de mensajería que la consulta pública (ver
+ * `otp-envio.adapter.js`, cableado acá 2026-11-25 — hasta entonces esta rama
+ * quedó sin actualizar desde que `loyalty-recovery.service.js#solicitarCodigo` se
+ * conectó el 2026-11-23) → cajero tipea el código en Kore → Kore lo valida
  * (`validarCodigoCanje`) → si es válido, Kore cobra y recién ENTONCES llama a
  * `POST /venta` (sin cambios, ver `loyalty-kore-venta.service.js`) — ese
  * endpoint no sabe nada de este código, ya se validó antes de llegar ahí.
@@ -56,6 +57,7 @@ const {
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
 const configService = require('../config/loyalty-config.service');
+const otpEnvioAdapter = require('../../shared/otp-envio.adapter');
 
 const TELEFONO_RE = /^\d{10}$/;
 const CODIGO_RE = /^\d{6}$/;
@@ -129,10 +131,13 @@ async function solicitarCodigoCanje(telefono) {
   logger.info(`[loyalty-kore-canje] Código de canje generado tel=${_maskTelefono(telefonoStr)}${sufijoCodigoDebug}`);
   _registrarEvento('solicitud_codigo_canje', 'exito', null, telefonoStr);
 
+  // Envío del código (ver docstring del archivo y otp-envio.adapter.js) — nunca lanza, una falla
+  // del proveedor real (o del simulado, que no debería fallar nunca) no debe romper este flujo.
+  await otpEnvioAdapter.enviarCodigo({ telefono: telefonoStr, codigo });
+
   const respuesta = { mensaje: 'Código enviado' };
-  // SIMULACIÓN TEMPORAL — mismo criterio y mismo motivo que
-  // loyalty-recovery.service.js#solicitarCodigo: no hay proveedor de mensajería real elegido
-  // todavía (WhatsApp/SMS). Remover esta rama cuando se conecte el envío real.
+  // Fuera de producción, el código viaja en la respuesta para poder probar el flujo completo sin
+  // depender de que el envío (simulado o real) haya efectivamente funcionado.
   if (process.env.NODE_ENV !== 'production') {
     respuesta.codigoDev = codigo;
   }

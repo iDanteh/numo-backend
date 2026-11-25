@@ -134,6 +134,13 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.JSONB,
     allowNull: true,
   },
+  // NC de Aplicación de Anticipo timbradas tarde cuyo anticipo ya se aplicó
+  // (cierre OPA) en la póliza de la factura (2026-11-25) — no se
+  // contabilizan; se listan en la hoja "NC anticipo ya aplicadas" del export.
+  ncsAnticipoYaAplicadas: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
   // Tickets de cajas con cobro real (mismo día) pero SIN ninguna factura
   // ligada — ej. venta de mostrador que nunca se globalizó. Informativo, no
   // se contabiliza — ver `_detectarPendientesPorFacturar` en

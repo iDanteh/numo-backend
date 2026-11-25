@@ -2754,6 +2754,63 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
   }
   return mapa;
 }
+// Egreso de Aplicación de Anticipo timbrado TARDE (2026-11-25, pedido del
+// usuario): su factura ya tuvo el cierre "OPA" (Cargo Anticipos + IVA del
+// anticipo) en la póliza de un día ANTERIOR — ese cierre YA es la aplicación
+// del anticipo; contabilizar el Egreso otra vez (TO-EGR: Cargo Anticipos /
+// Abono Clientes) descontaba el anticipo dos veces y dejaba un abono a
+// Clientes sin cargo. Casos reales CONSTRUCASA 23-nov: C0-261100329 (SYMS,
+// factura C0-261100327 con OPA-01356 en la póliza del 7-nov) y C0-261100121
+// (CARRASCO, factura C0-261100120 con OPA-00766 en la del 4-nov), creados en
+// Kore esos días y timbrados el 23-nov. Solo pólizas de días anteriores: al
+// regenerar el día de la factura la póliza vieja se cancela primero.
+// Devuelve uuid de la factura → { polizaId, numero, fecha, opa }.
+async function _facturasConOpaEnPolizaAnterior({ rfc, uuids, fechaInicio }) {
+  if (!uuids?.size || !fechaInicio) return new Map();
+  const dia = String(fechaInicio instanceof Date ? fechaInicio.toISOString() : fechaInicio).slice(0, 10);
+  const rows = await sequelize.query(
+    `SELECT UPPER(m.cfdi_uuid) AS uuid, m.concepto, p.id AS poliza_id, p.numero, p.fecha
+       FROM poliza_movimientos m
+       JOIN polizas p ON p.id = m.poliza_id
+      WHERE m.regla_nombre = 'OPA'
+        AND p.estado <> 'cancelada'
+        AND p.rfc = :rfc
+        AND p.fecha < :dia
+        AND UPPER(m.cfdi_uuid) IN (:uuids)
+      ORDER BY p.fecha, m.orden`,
+    { replacements: { rfc, dia, uuids: [...uuids] }, type: QueryTypes.SELECT },
+  );
+  const mapa = new Map();
+  for (const r of rows) {
+    if (!mapa.has(r.uuid)) mapa.set(r.uuid, { polizaId: r.poliza_id, numero: r.numero, fecha: r.fecha, opa: r.concepto ?? null });
+  }
+  return mapa;
+}
+
+function _avisoNcsAnticipoYaAplicadas(advertencias, ncs) {
+  if (!ncs.length) return;
+  advertencias.push(`ℹ ${ncs.length} NC de aplicación de anticipo no se contabilizan: el anticipo ya se aplicó (OPA) en la póliza de la factura — ver hoja "NC anticipo ya aplicadas"`);
+  for (const n of ncs.slice(0, 5)) {
+    advertencias.push(`  • ${n.serieFolio ?? n.uuid?.slice(0, 8)} ${n.receptor ?? ''} $${n.total.toFixed(2)}${n.polizaNumero != null ? ` — póliza ${n.polizaNumero} del ${n.polizaFecha}${n.opa ? ` (${n.opa})` : ''}` : ''}`);
+  }
+  if (ncs.length > 5) advertencias.push(`  … y ${ncs.length - 5} más`);
+}
+
+// Renglón de la hoja "NC anticipo ya aplicadas" (2026-11-25).
+function _ncAnticipoYaAplicada(cfdi, uuidFactura, previa) {
+  return {
+    uuid:        cfdi.uuid,
+    serieFolio:  [cfdi.serie, cfdi.folio].filter(Boolean).join('-') || null,
+    fecha:       cfdi.fecha ?? null,
+    receptor:    cfdi.receptor?.nombre ?? null,
+    total:       Number(cfdi.total) || 0,
+    facturaUuid: uuidFactura,
+    polizaNumero: previa?.numero ?? null,
+    polizaFecha:  previa?.fecha ?? null,
+    opa:          previa?.opa ?? null,
+  };
+}
+
 // Egreso de Aplicación de Anticipo (tipoRelacion=07) cuya Factura Final ya
 // trae el cierre "OPA" en este mismo batch: ese cierre (Cargo Anticipos +
 // IVA-anticipo, con la serie-folio del Egreso en la columna C) YA es la
@@ -4589,6 +4646,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // anterior, sin el ajuste de redirección de cuentas de arriba, hasta
   // confirmar un caso real cross-batch que lo amerite).
   const anticosCubiertosPorReg22C = new Map();
+  const opaPreviaProp = new Map();
+  const ncsAnticipoYaAplicadasProp = [];
   {
     const uuids07 = new Set(
       cfdiConRegla
@@ -4616,6 +4675,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         });
         for (const m of yaEnBD) anticosCubiertosPorReg22C.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
+      // Factura con cierre OPA en la póliza de un día anterior (2026-11-25).
+      for (const [u, previa] of await _facturasConOpaEnPolizaAnterior({ rfc, uuids: uuids07, fechaInicio })) {
+        anticosCubiertosPorReg22C.set(u, Infinity);
+        opaPreviaProp.set(u, previa);
+      }
     }
   }
 
@@ -4639,7 +4703,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
       // Fix 5 (cross-batch): omitir por completo si el anticipo ya se
       // procesó en una póliza previa no cancelada (ver comentario arriba).
-      if (uuid07 && anticosCubiertosPorReg22C.get(uuid07) === Infinity) continue;
+      if (uuid07 && anticosCubiertosPorReg22C.get(uuid07) === Infinity) {
+        ncsAnticipoYaAplicadasProp.push(_ncAnticipoYaAplicada(cfdi, uuid07, opaPreviaProp.get(uuid07)));
+        continue;
+      }
     }
     const context = {};
     if (rule?.cuentaDeltaAnticipo && cfdi.cfdiRelacionados?.length) {
@@ -5901,6 +5968,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
+  _avisoNcsAnticipoYaAplicadas(advertencias, ncsAnticipoYaAplicadasProp);
   if (anticiposACobranzaProp.length) {
     advertencias.push(`ℹ ${anticiposACobranzaProp.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaProp.join(', ')}`);
   }
@@ -6760,6 +6828,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // también en BD — la NC y la factura final pueden venir en batches
   // distintos, se sigue OMITIENDO por completo (criterio amount-blind).
   const anticosCubiertosPorReg22CGuard = new Map();
+  const opaPreviaGuard = new Map();
+  const ncsAnticipoYaAplicadasGuard = [];
   {
     const uuids07g = new Set(
       cfdiConRegla
@@ -6790,6 +6860,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         // anterior (siempre omitir).
         for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
+      // Factura con cierre OPA en la póliza de un día anterior (2026-11-25).
+      for (const [u, previa] of await _facturasConOpaEnPolizaAnterior({ rfc, uuids: uuids07g, fechaInicio })) {
+        anticosCubiertosPorReg22CGuard.set(u, Infinity);
+        opaPreviaGuard.set(u, previa);
+      }
     }
   }
 
@@ -6812,7 +6887,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07g = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
       uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
-      if (uuid07 && anticosCubiertosPorReg22CGuard.get(uuid07) === Infinity) continue;
+      if (uuid07 && anticosCubiertosPorReg22CGuard.get(uuid07) === Infinity) {
+        ncsAnticipoYaAplicadasGuard.push(_ncAnticipoYaAplicada(cfdi, uuid07, opaPreviaGuard.get(uuid07)));
+        continue;
+      }
     }
 
     if (!rule) {
@@ -7615,6 +7693,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (anticiposACobranzaGuard.length) {
     advertencias.push(`ℹ ${anticiposACobranzaGuard.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaGuard.join(', ')}`);
   }
+  _avisoNcsAnticipoYaAplicadas(advertencias, ncsAnticipoYaAplicadasGuard);
   if (sustitutosGuard.length) {
     advertencias.push(
       `⚠ ${sustitutosGuard.length} CFDI(s) sustituto(s) excluido(s) automáticamente de esta póliza por riesgo de doble conteo — revisa "sustitutosExcluidos" antes de incorporarlos manualmente`,
@@ -7812,6 +7891,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       estado:    'borrador',
       creadoPor: _userLabel(user),
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
+      ncsAnticipoYaAplicadas: ncsAnticipoYaAplicadasGuard.length ? ncsAnticipoYaAplicadasGuard : null,
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
       depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
       movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard.length ? movimientosPpdPorFacturarGuard : null,

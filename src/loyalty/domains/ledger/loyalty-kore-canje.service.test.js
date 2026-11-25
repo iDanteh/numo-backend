@@ -27,6 +27,9 @@ jest.mock('../../../shared/utils/logger', () => ({
 jest.mock('../config/loyalty-config.service', () => ({
   obtenerCanjeCodigoVigenciaMin: jest.fn(),
 }));
+jest.mock('../../shared/otp-envio.adapter', () => ({
+  enviarCodigo: jest.fn(),
+}));
 
 const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
 const {
@@ -34,6 +37,7 @@ const {
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
 const configService = require('../config/loyalty-config.service');
+const otpEnvioAdapter = require('../../shared/otp-envio.adapter');
 const {
   solicitarCodigoCanje, validarCodigoCanje, CanjeCodigoInvalidoError,
 } = require('./loyalty-kore-canje.service');
@@ -63,6 +67,9 @@ beforeEach(() => {
   LoyaltyCard.scope.mockReturnValue(LoyaltyCard);
   process.env.NODE_ENV = 'test';
   configService.obtenerCanjeCodigoVigenciaMin.mockResolvedValue(5);
+  // Default: éxito simulado — los tests que no apuntan al envío en sí no deben preocuparse por el
+  // resultado del adapter, mismo criterio que loyalty-recovery.service.test.js.
+  otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: true, simulado: true });
 });
 
 afterAll(() => {
@@ -109,6 +116,29 @@ describe('solicitarCodigoCanje — a diferencia de la consulta pública, SÍ lan
     const [[cambios]] = card.update.mock.calls;
     expect(cambios.canjeCodigoExpiraEn).toBeInstanceOf(Date);
     expect(cambios.canjeCodigoExpiraEn.getTime() - antes).toBeGreaterThanOrEqual(5 * 60 * 1000 - 1000);
+  });
+
+  // Cableado 2026-11-25: hasta acá, este flujo nunca llamaba al adapter de envío (quedó
+  // desactualizado desde que loyalty-recovery.service.js#solicitarCodigo se conectó el 2026-11-23).
+  test('llama a otpEnvioAdapter.enviarCodigo con el teléfono y el código generado', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigoCanje(TELEFONO);
+
+    expect(otpEnvioAdapter.enviarCodigo).toHaveBeenCalledWith({ telefono: TELEFONO, codigo: CODIGO_REAL });
+  });
+
+  test('un fallo del adapter de envío nunca rompe solicitarCodigoCanje (contrato de no-ruptura)', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+    otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: false, motivo: 'credenciales_no_configuradas' });
+
+    await expect(solicitarCodigoCanje(TELEFONO)).resolves.toMatchObject({ mensaje: expect.any(String) });
   });
 
   test('usa la vigencia configurable de loyalty-config.service (no un valor hardcodeado)', async () => {

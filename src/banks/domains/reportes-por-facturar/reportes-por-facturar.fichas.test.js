@@ -8,12 +8,14 @@ jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCen
 jest.mock('../banks/BankMovement.model', () => ({ distinct: jest.fn() }));
 jest.mock('../banks/repositories/bank-config.repository', () => ({ findAllAsMap: jest.fn() }));
 jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ select: () => ({ lean: async () => [{ serie: 'C0', folio: '2', nombre: 'JUAN PEREZ' }] }) })) }));
+jest.mock('../erp/kore-remisiones.service', () => ({ infoRemisiones: jest.fn() }));
 jest.mock('./reportes-por-facturar.fichas-guardadas', () => ({ cajasYaGuardadas: jest.fn(async () => []) }));
 jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 
 const CFDI = require('../../../visor/models/CFDI');
 const centros = require('../centros-costo/centros-costo.service');
 const erp = require('../erp/erp-sync.service');
+const koreRem = require('../erp/kore-remisiones.service');
 const fichas = require('./reportes-por-facturar.fichas');
 
 const lean = v => ({ select: () => ({ lean: async () => v }) });
@@ -25,6 +27,7 @@ const salida = (abreviatura, montoRetirado, fecha = '2026-10-31T20:00:00Z') => (
 beforeEach(() => {
   jest.clearAllMocks();
   centros.resolveBySerieMap.mockResolvedValue({ A0: { id: 1, sucursal: 'CEDIS' }, C0: { id: 3, sucursal: 'CONSTRUCASA' } });
+  koreRem.infoRemisiones.mockResolvedValue({ info: new Map() });
 });
 
 test('listarGlobales: solo vigentes, una por UUID (manda la ERP), ordenadas', async () => {
@@ -67,6 +70,8 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([
     salida('RETD', 20.78), salida('RETEF', 100), salida('RPF', 0.55), salida('ST', 50000), salida('CIC', 100000),
   ]);
+  // C0-1 es una venta PPD facturada: su cobranza y su abono van a "Cobranza facturado" (2026-11-25).
+  koreRem.infoRemisiones.mockResolvedValue({ info: new Map([['C0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' }]]) });
 
   const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(1);
@@ -74,16 +79,19 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   expect(r.cortes).toHaveLength(1);
   expect(r.cortes[0]).toMatchObject({
     serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
-    efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 300, abonosEfectivo: 150,
+    efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 450, abonosEfectivo: 0,
     devoluciones: 20.78, retiroEfectivo: 100, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
-    totalEntregar: 1589.06,
+    // Sin factura (170.39) ya NO suma (2026-11-25).
+    totalEntregar: 1418.67,
   });
-  expect(r.totales.totalEntregar).toBe(1589.06);
+  expect(r.totales.totalEntregar).toBe(1418.67);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
   expect(r.incompleta).toBe(false);
   // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
-  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1589.06);
+  expect(Math.round(r.detalle.filter(d => d.concepto !== 'efectivoPorFacturar').reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1418.67);
+  // Lo sin factura va al final del anexo.
+  expect(r.detalle[r.detalle.length - 1]).toMatchObject({ concepto: 'efectivoPorFacturar', remision: 'C0-2' });
   expect(r.detalle.find(d => d.concepto === 'miscelaneaEfectivo')).toMatchObject({ cobro: 'MIS-1', importe: 40 });
   const porFacturar = r.detalle.find(d => d.concepto === 'efectivoPorFacturar');
   expect(porFacturar).toMatchObject({ remision: 'C0-2', factura: null, cliente: 'JUAN PEREZ', importe: 170.39 });
@@ -102,7 +110,7 @@ test('calcularFicha: rango de varios días — una caja por día, días sin efec
   CFDI.find.mockReturnValue(lean([]));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-11-02' });
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(3);
-  expect(r.cortes.map(c => [c.dia, c.totalEntregar])).toEqual([['2026-11-01', 100]]);
+  expect(r.cortes.map(c => [c.dia, c.totalEntregar])).toEqual([['2026-11-01', 0]]);
   expect(r.totales.efectivoPorFacturar).toBe(100);
 });
 
@@ -171,4 +179,52 @@ test('calcularFicha: cobros y abonos de remisiones de OTRA sucursal van en su pr
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(r.totales).toMatchObject({ cobroOtraSucursal: 9462.82, efectivoPorFacturar: 0, abonosEfectivo: 0, efectivoFacturado: 100, totalEntregar: 9562.82 });
   expect(r.detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => d.remision)).toEqual(['A0-5411', 'A0-4991']);
+});
+
+describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado / abono)', () => {
+  const MOV = (movimiento, saldoAnterior, saldo, fecha, forma = 'EFECTIVO') => ({ movimiento, forma, saldoAnterior, saldo, fecha });
+  beforeEach(() => {
+    erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+    CFDI.find.mockReturnValue(lean([]));
+  });
+
+  test('consignación facturada / sin factura, PPD facturada, contado liquidado (con BON) y abono con saldo', async () => {
+    const cta = (folio, factura, origen, monto) => ({
+      serieVenta: 'C0', folioVenta: folio, serieFactura: factura ? 'C0' : null, folioFactura: factura, fechaCreacion: '2026-10-01T00:00:00Z',
+      cobros: [cobro(origen, monto, [EF(monto)], { folioOrigen: folio })],
+    });
+    erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+      cta('10', '900', 'CPF', 1000), cta('11', null, 'CPF', 200), cta('12', '901', 'ABO', 300), cta('13', '902', 'ABO', 96), cta('14', '903', 'ABO', 50),
+    ]);
+    const PUE = { tipoPago: 'PUE', nombreTipoMovimiento: 'FACTURADO' };
+    koreRem.infoRemisiones.mockImplementation(async ({ necesitaSaldo }) => ({ info: new Map([
+      ['C0|10', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
+      ['C0|11', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
+      ['C0|12', { tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' }],
+      // Contado: el saldo solo se pide fresco (necesitaSaldo).
+      ['C0|13', necesitaSaldo ? { ...PUE, abonos: [MOV('ABO-13', 100, 4, '2026-10-31T18:00:00Z'), MOV('RET-1', 4, 0, '2026-10-31T18:00:02Z', null)] } : PUE],
+      ['C0|14', necesitaSaldo ? { ...PUE, abonos: [MOV('ABO-14', 80, 30, '2026-10-31T18:00:00Z')] } : PUE],
+    ]) }));
+    const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+    expect(r.totales).toMatchObject({
+      consignacionFacturada: 1000, efectivoPorFacturar: 200, cobranzaEfectivo: 300, efectivoFacturado: 96, abonosEfectivo: 50,
+      totalEntregar: 1446,
+    });
+    expect(r.incompleta).toBe(false);
+    // Solo las de contado se piden con saldo fresco.
+    const fresca = koreRem.infoRemisiones.mock.calls.find(c => c[0].necesitaSaldo);
+    expect(fresca[0].remisiones.map(x => x.folio).sort()).toEqual(['13', '14']);
+    expect(r.detalle.find(d => d.remision === 'C0-14')).toMatchObject({ concepto: 'abonosEfectivo', saldoDespues: 30, tipoVenta: 'PUE FACTURADO' });
+    expect(r.detalle[r.detalle.length - 1]).toMatchObject({ concepto: 'efectivoPorFacturar', remision: 'C0-11' });
+  });
+
+  test('sin tipo de venta de Kore → como antes y la ficha queda incompleta (no se puede guardar)', async () => {
+    erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+      { serieVenta: 'C0', folioVenta: '20', serieFactura: 'C0', folioFactura: '9', cobros: [cobro('CPF', 10, [EF(10)])] },
+    ]);
+    const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+    expect(r.totales.cobranzaEfectivo).toBe(10);
+    expect(r.incompleta).toBe(true);
+    expect(r.advertencias[0]).toMatch(/tipo de venta/);
+  });
 });

@@ -10,6 +10,7 @@ const mongoose = require('mongoose');
  */
 const montosSchema = new mongoose.Schema({
   efectivoFacturado:   Number,
+  consignacionFacturada: Number, // 2026-11-25
   efectivoPorFacturar: Number,
   miscelaneaEfectivo:  Number,
   cobranzaEfectivo:    Number,

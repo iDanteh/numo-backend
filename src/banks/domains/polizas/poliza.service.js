@@ -5168,6 +5168,41 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     wsSustitutos.autoFilter = { from: 'A1', to: 'H1' };
   }
 
+  // NC de Aplicación de Anticipo timbradas tarde (2026-11-25): su anticipo ya
+  // se aplicó (cierre OPA) en la póliza de la factura; no se contabilizaron.
+  // Su XML se asocia en CONTPAQi a esa póliza.
+  if (poliza.ncsAnticipoYaAplicadas?.length > 0) {
+    const wsNcAnt = workbook.addWorksheet('NC anticipo ya aplicadas');
+    wsNcAnt.columns = [
+      { header: 'NC',                    key: 'serieFolio',   width: 16 },
+      { header: 'Fecha',                 key: 'fecha',        width: 12 },
+      { header: 'Cliente',               key: 'receptor',     width: 40 },
+      { header: 'Total',                 key: 'total',        width: 14 },
+      { header: 'Póliza donde se aplicó', key: 'poliza',      width: 22 },
+      { header: 'OPA',                   key: 'opa',          width: 14 },
+      { header: 'UUID NC',               key: 'uuid',         width: 38 },
+      { header: 'UUID factura',          key: 'facturaUuid',  width: 38 },
+    ];
+    wsNcAnt.getRow(1).font = { bold: true };
+    wsNcAnt.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    });
+    for (const n of poliza.ncsAnticipoYaAplicadas) {
+      const row = wsNcAnt.addRow({
+        serieFolio:  n.serieFolio,
+        fecha:       n.fecha ? new Date(n.fecha) : null,
+        receptor:    n.receptor,
+        total:       n.total,
+        poliza:      n.polizaNumero != null ? `${n.polizaNumero} (${n.polizaFecha})` : 'póliza anterior',
+        opa:         n.opa,
+        uuid:        n.uuid,
+        facturaUuid: n.facturaUuid,
+      });
+      if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';
+      row.getCell('total').numFmt = '#,##0.00';
+    }
+  }
+
   // Hoja de tickets de cajas con cobro real (mismo día) pero SIN ninguna
   // factura ligada — ej. venta de mostrador que nunca se globalizó. Solo
   // informativo: NUNCA se contabilizaron en esta póliza — ver

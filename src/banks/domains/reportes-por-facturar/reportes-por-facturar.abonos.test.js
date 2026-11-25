@@ -77,7 +77,7 @@ test('Excel: un renglón por abono debajo del depósito y SALDADA / PENDIENTE al
   expect(filas[i + 3][1]).toBe('JUAN');
   expect(filas[i + 3][2]).toBe('✔ SALDADA EL 30/10/26');
   // La agrupación sigue: subtotal del cliente.
-  expect(filas[i + 4][1]).toBe('Subtotal JUAN');
+  expect(filas[i + 4][1]).toBe('Total JUAN');
 });
 
 test('MOSTRADOR: sin abonos debajo, con ESTATUS SALDADA / ABONADA y saldo (2026-11-12)', () => {
@@ -101,8 +101,8 @@ test('MOSTRADOR: sin abonos debajo, con ESTATUS SALDADA / ABONADA y saldo (2026-
   expect(filas[enc].slice(8)).toEqual(['ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL']);
   // Depósito → directo su subtotal (sin renglones de abonos ni "✔ SALDADA EL").
   expect(filas[enc + 1].slice(8)).toEqual(['SALDADA', undefined, new Date('2026-10-30T12:00:00Z')]);
-  expect(filas[enc + 2][1]).toBe('Subtotal JUAN');
+  expect(filas[enc + 2][1]).toBe('Total JUAN');
   expect(filas[enc + 3].slice(8)).toEqual(['ABONADA', 120]);
-  expect(filas[enc + 4][1]).toBe('Subtotal LUIS');
+  expect(filas[enc + 4][1]).toBe('Total LUIS');
   expect(filas.some(f => String(f[2] ?? '').startsWith('↳'))).toBe(false);
 });

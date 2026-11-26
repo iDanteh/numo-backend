@@ -90,6 +90,7 @@ async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
     bancos, sucursalBanco: null,
     denominaciones: [], totalContado: null, diferencia: null,
     totales: ficha.totales, cortes: ficha.cortes, detalle: ficha.detalle,
+    retiroEfectivoInformativo: !!ficha.retiroEfectivoInformativo,
     creadoPor: _usuario(user),
       });
     } catch (err) {

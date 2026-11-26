@@ -84,15 +84,16 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
     serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
     efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 450, abonosEfectivo: 0,
     devoluciones: 20.78, retiroEfectivo: 100, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
-    // Sin factura (170.39) ya NO suma (2026-11-25).
-    totalEntregar: 1418.67,
+    // Sin factura (170.39) ya NO suma (2026-11-25); el retiro de efectivo (100) ya NO resta (2026-11-26).
+    totalEntregar: 1518.67,
   });
-  expect(r.totales.totalEntregar).toBe(1418.67);
+  expect(r.totales.totalEntregar).toBe(1518.67);
+  expect(r.retiroEfectivoInformativo).toBe(true);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
   expect(r.incompleta).toBe(false);
   // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
-  expect(Math.round(r.detalle.filter(d => d.concepto !== 'efectivoPorFacturar').reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1418.67);
+  expect(Math.round(r.detalle.filter(d => !['efectivoPorFacturar', 'retiroEfectivo'].includes(d.concepto)).reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1518.67);
   // Lo sin factura va al final del anexo.
   expect(r.detalle[r.detalle.length - 1]).toMatchObject({ concepto: 'efectivoPorFacturar', remision: 'C0-2' });
   expect(r.detalle.find(d => d.concepto === 'miscelaneaEfectivo')).toMatchObject({ cobro: 'MIS-1', importe: 40 });
@@ -101,7 +102,7 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   const facturado = r.detalle.find(d => d.concepto === 'efectivoFacturado');
   expect(facturado).toMatchObject({ remision: 'C0-1', factura: 'C0-1', facturaUuid: 'G1', esGlobal: true });
   expect(r.detalle.find(d => d.concepto === 'devoluciones')).toMatchObject({ importe: -20.78 });
-  // RETIRO DE EFECTIVO (RETEF, 2026-11-06) resta; ST y CIC no.
+  // RETIRO DE EFECTIVO (RETEF) va en el detalle como informativo (2026-11-26); ST y CIC no salen.
   expect(r.detalle.find(d => d.concepto === 'retiroEfectivo')).toMatchObject({ importe: -100 });
   expect(r.detalle.some(d => d.concepto === 'depositoEfectivo' || d.concepto === 'saldoFavor')).toBe(false);
 });

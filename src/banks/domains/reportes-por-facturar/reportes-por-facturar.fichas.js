@@ -211,8 +211,9 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
       const diaCobro = _diaMx(k.fecha);
       if (previos ? !(diaCobro < dia) : diaCobro !== dia) continue;
       // Global de un día posterior al cobro: ese día el cobro estaba sin factura.
-      // (Otras sucursales suman siempre: se quedan con su factura.)
-      const posterior = !previos && !deOtraSucursal && facturaKore && diaGlobal.get(facturaKore) > dia ? facturaKore : null;
+      // También para otras sucursales (2026-11-26, pedido del usuario, fecha estricta: PROMOTORIA
+      // I0-261100216 / I0-261100222 timbradas el 25 con cobros del 24 → suman el 25 en esta caja).
+      const posterior = !previos && facturaKore && diaGlobal.get(facturaKore) > dia ? facturaKore : null;
       // Los de días anteriores se evalúan como estaban ese día (sin factura); al sumarlos, facturados.
       const facturada = !previos && !!facturaKore && !posterior;
       const factura = facturada ? facturaKore : null;

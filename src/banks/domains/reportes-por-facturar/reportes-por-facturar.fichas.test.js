@@ -304,3 +304,17 @@ test('contra entrega sin factura ligada toma la factura del mismo importe y mome
   // Factura individual al RFC genérico (no global).
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-72', factura: 'E0-257', esGlobal: false });
 });
+
+// 2026-11-26 (fecha estricta): remisión de otra sucursal cobrada aquí con su global de un día
+// POSTERIOR → ese día va como otra sucursal SIN factura (no suma), con la global anotada.
+test('otra sucursal con global de un día posterior no suma el día del cobro', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'I0', folioVenta: '386', serieFactura: 'I0', folioFactura: '222', fechaCreacion: '2026-10-30T18:00:00Z', cobros: [cobro('CPF', 4143.21, [EF(4143.21)])] },
+  ]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  const G = { uuid: 'G222', serie: 'I0', folio: '222', fecha: '2026-11-01T19:32:00Z', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' };
+  CFDI.find.mockImplementation(q => lean(q.$or ? [G] : []));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 0, cobroOtraSucursalSinFactura: 4143.21, totalEntregar: 0 });
+  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursalSinFactura', factura: null, facturaPosterior: 'I0-222', facturaPosteriorDia: '2026-11-01' });
+});

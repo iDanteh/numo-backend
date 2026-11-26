@@ -74,9 +74,12 @@ const CAMPOS_GLOBAL = 'receptor global informacionGlobal';
 // Orden (2026-11-25, pedido del usuario): efectivo facturado, consignación facturada, cobranza
 // facturado, abonos, venta miscelánea, otras sucursales; luego lo que se resta.
 const ENTRADAS = ['efectivoFacturado', 'consignacionFacturada', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
-const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
+// retiroEfectivo (RETEF) ya NO resta (2026-11-26, decisión del usuario): Kore no dice para qué es y
+// los grandes salen del efectivo acumulado de días anteriores (CEDIS 20-nov RET-261113428 $278,200
+// a las 09:59). Va como informativo y en el anexo.
+const SALIDAS = ['devoluciones', 'faltante'];
 // bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
-const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
+const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
@@ -691,6 +694,8 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
     yaEnFicha,
     incompleta: fallidas.length > 0,
     advertencias: advertencias.length ? advertencias : null,
+    // Fichas desde 2026-11-26: el retiro de efectivo es informativo (no resta).
+    retiroEfectivoInformativo: true,
   };
 }
 

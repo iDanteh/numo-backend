@@ -60,12 +60,14 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 /**
  * ¿Factura GLOBAL? (2026-11-26) No basta el RFC genérico: Kore timbra facturas individuales a
- * XAXX010101000 con el nombre del cliente y sin InformacionGlobal (Atzompa E0-261100257,
- * ABRAHAM PACHECO, contra entrega). Global = RFC genérico + marca/nodo InformacionGlobal
- * (o, en copias viejas sin esos datos, el nombre "PUBLICO EN GENERAL").
+ * XAXX010101000 con el nombre del cliente (Atzompa E0-261100257, ABRAHAM PACHECO, contra entrega).
+ * Copia de Kore (ERP): manda su campo `Global` (CFDI.global, guardado desde jun-2026). Copia del
+ * SAT: RFC genérico + nodo InformacionGlobal del XML (o, sin él, el nombre "PUBLICO EN GENERAL").
  */
-const _esGlobal = c => _serie(c?.receptor?.rfc) === RFC_PUBLICO_GENERAL
-  && (c.global === true || !!c.informacionGlobal?.periodicidad || /P[UÚ]BLICO\s+EN\s+GENERAL/i.test(String(c.receptor?.nombre ?? '')));
+const _esGlobal = c => (c?.source === 'ERP'
+  ? c.global === true
+  : _serie(c?.receptor?.rfc) === RFC_PUBLICO_GENERAL
+    && (c.global === true || !!c.informacionGlobal?.periodicidad || /P[UÚ]BLICO\s+EN\s+GENERAL/i.test(String(c.receptor?.nombre ?? ''))));
 const CAMPOS_GLOBAL = 'receptor global informacionGlobal';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.

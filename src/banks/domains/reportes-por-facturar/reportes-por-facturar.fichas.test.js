@@ -52,7 +52,7 @@ test('listarGlobales valida el rango', async () => {
 
 test('calcularFicha: efectivo de la caja del día por concepto, menos devoluciones y faltante', async () => {
   // Facturas del detalle: C0-1 es la global (público en general).
-  CFDI.find.mockReturnValue(lean([{ uuid: 'G1', serie: 'C0', folio: '1', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, source: 'ERP' }]));
+  CFDI.find.mockReturnValue(lean([{ uuid: 'G1', serie: 'C0', folio: '1', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' }]));
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
     { serieVenta: 'C0', folioVenta: '1', serieFactura: 'C0', folioFactura: '1', cobros: [
       cobro('CBT', 1000, [EF(1000)]),                                                      // facturado
@@ -241,7 +241,7 @@ describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado
 // 2026-11-26 (pedido del usuario): cobrado sin factura el 31-oct y amparado por la global
 // C0-G2 del 1-nov → el 31 va como sin factura (no suma) y el 1-nov suma como consignación facturada.
 describe('cobro sin factura que ampara una global de un día posterior', () => {
-  const GLOBAL = { uuid: 'G2', serie: 'C0', folio: 'G2', fecha: '2026-11-01T20:00:00Z', receptor: { rfc: 'XAXX010101000' }, informacionGlobal: { periodicidad: '01' }, source: 'ERP' };
+  const GLOBAL = { uuid: 'G2', serie: 'C0', folio: 'G2', fecha: '2026-11-01T20:00:00Z', receptor: { rfc: 'XAXX010101000' }, informacionGlobal: { periodicidad: '01' }, global: true, source: 'ERP' };
   const cuenta = { serieVenta: 'C0', folioVenta: '30', serieFactura: 'C0', folioFactura: 'G2', fechaCreacion: '2026-10-01T00:00:00Z',
     cobros: [cobro('CPF', 500, [EF(500)], { folioOrigen: '30' })] };
   beforeEach(() => {

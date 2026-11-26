@@ -286,3 +286,18 @@ test('cobro de otra sucursal sin factura suma el día de su factura en la caja d
   expect(r.totales).toMatchObject({ cobroOtraSucursal: 400, bonificacionGlobal: 100, totalEntregar: 400 });
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-7', factura: 'E0-G9', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
 });
+
+// 2026-11-26: contra entrega (CCE) de otra sucursal sin factura ligada en Kore: se liga a la
+// factura de su serie con el mismo total timbrada junto al cobro (Atzompa E0-261102072).
+test('contra entrega sin factura ligada toma la factura del mismo importe y momento', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'E0', folioVenta: '72', serieFactura: null, fechaCreacion: '2026-10-30T18:00:00Z', cobros: [cobro('CCE', 2033.99, [EF(2033.99)])] },
+  ]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  const FACT = { uuid: '4B006F47', serie: 'E0', folio: '257', fecha: '2026-10-31T12:00:00Z', total: 2033.99, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' };
+  CFDI.find.mockImplementation(q => lean(q.total || q.$or ? [FACT] : []));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(CFDI.find.mock.calls.find(c => c[0].total)[0]).toMatchObject({ serie: 'E0', total: { $gte: 2033.98, $lte: 2034 } });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 2033.99, cobroOtraSucursalSinFactura: 0, totalEntregar: 2033.99 });
+  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-72', factura: 'E0-257' });
+});

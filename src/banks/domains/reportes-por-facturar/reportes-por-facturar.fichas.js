@@ -173,7 +173,9 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   // solo si la ficha es de esos días o si un cobro tiene una factura que NUMO no conoce.
   const { hoy, ayer } = _hoyAyer();
   if (dia >= ayer) await asegurarRecientes();
-  const facturasCobros = (cuentas ?? []).filter(c => c.serieFactura)
+  // Contra entrega sin factura ligada en Kore (2026-11-26, Atzompa E0-261102072 → E0-261100257).
+  const cuentasDia = await _ligarContraEntrega(rfc, cuentas, serie, dia);
+  const facturasCobros = cuentasDia.filter(c => c.serieFactura)
     .map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
   let { dias: diaGlobal, faltan } = await _diaDeGlobales(rfc, facturasCobros);
   if (faltan && dia < hoy && await asegurarRecientes()) ({ dias: diaGlobal } = await _diaDeGlobales(rfc, facturasCobros));
@@ -186,7 +188,7 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
 
   // 1) Cobros en efectivo; los que dependen del tipo de venta se clasifican después.
   const pendientes = [];
-  const lotes = [{ lista: cuentas, previos: false }, { lista: anteriores, previos: true }];
+  const lotes = [{ lista: cuentasDia, previos: false }, { lista: anteriores, previos: true }];
   for (const { lista, previos } of lotes) for (const c of lista ?? []) {
     const facturaKore = c.serieFactura ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null;
     const remision = c.serieVenta && c.folioVenta ? `${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}` : null;
@@ -406,6 +408,38 @@ async function _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarReciente
     });
   }
   return salida;
+}
+
+/**
+ * Pago contra entrega (CCE) sin factura ligada en Kore (2026-11-26, pedido del usuario): Kore
+ * timbra la factura en el momento del cobro pero no la liga a la remisión (Atzompa
+ * E0-261102072, ABRAHAM PACHECO, CCE-261100130 $2,033.99 → E0-261100257, UUID 4B006F47…).
+ * Se toma la factura vigente de la serie de la remisión con el mismo total timbrada junto al
+ * cobro — solo si hay exactamente una (Kore guarda la fecha de la factura en hora local con
+ * "Z": 6 h antes que la del cobro, por eso la ventana). Regresa copias de las cuentas ligadas.
+ */
+async function _ligarContraEntrega(rfc, cuentas, serie, dia) {
+  const lista = cuentas ?? [];
+  const usadas = new Set();
+  const ligadas = new Map();
+  for (const c of lista) {
+    if (c.serieFactura || !c.serieVenta) continue;
+    const k = (c.cobros ?? []).find(x => _serie(x.serieOrigen) === 'CCE' && _serie(x.claveCentro) === serie && x.fecha && _diaMx(x.fecha) === dia);
+    if (!k) continue;
+    const monto = Math.abs(Number(k.monto) || 0);
+    const t = new Date(k.fecha).getTime();
+    const docs = await CFDI.find({
+      'emisor.rfc': rfc, tipoDeComprobante: 'I', serie: _serie(c.serieVenta),
+      total: { $gte: monto - 0.01, $lte: monto + 0.01 },
+      fecha: { $gte: new Date(t - 7 * 3600000), $lte: new Date(t + 3600000) },
+    }).select('uuid serie folio fecha total receptor satStatus erpStatus source').lean();
+    const vigentes = _vigentesPorUuid(docs ?? []).filter(([u]) => !usadas.has(u));
+    if (vigentes.length !== 1) continue;
+    const [uuid, f] = vigentes[0];
+    usadas.add(uuid);
+    ligadas.set(c, { ...c, serieFactura: _serie(f.serie), folioFactura: String(f.folio ?? '').trim() });
+  }
+  return lista.map(c => ligadas.get(c) ?? c);
 }
 
 const _hoyAyer = (ahora = new Date()) => {

@@ -93,6 +93,8 @@ const fichaEfectivoSchema = new mongoose.Schema({
   totalContado:   Number,
   diferencia:     Number,
   totales:        montosSchema,
+  // 2026-11-26: el retiro de efectivo (RETEF) es informativo, no resta (fichas anteriores: sí restaba).
+  retiroEfectivoInformativo: { type: Boolean, default: false },
   cortes:         [corteSchema],
   detalle:        [detalleSchema],
   anexoActualizadoEn: { type: Date, default: null },

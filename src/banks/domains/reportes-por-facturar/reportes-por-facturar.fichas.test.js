@@ -195,11 +195,14 @@ describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado
     });
     erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
       cta('10', '900', 'CPF', 1000), cta('11', null, 'CPF', 200), cta('12', '901', 'ABO', 300), cta('13', '902', 'ABO', 96), cta('14', '903', 'ABO', 50),
+      cta('15', null, 'ABO', 70),
     ]);
     const PUE = { tipoPago: 'PUE', nombreTipoMovimiento: 'FACTURADO' };
     koreRem.infoRemisiones.mockImplementation(async ({ necesitaSaldo }) => ({ info: new Map([
       ['C0|10', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
-      ['C0|11', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
+      // Consignación sin factura: saldo fresco para separar el anexo (2026-11-26).
+      ['C0|11', necesitaSaldo ? { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', abonos: [MOV('CPF-11', 200, 0, '2026-10-31T18:00:00Z')] } : { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
+      ['C0|15', necesitaSaldo ? { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', abonos: [MOV('ABO-15', 100, 30, '2026-10-31T18:00:00Z')] } : { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION' }],
       ['C0|12', { tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' }],
       // Contado: el saldo solo se pide fresco (necesitaSaldo).
       ['C0|13', necesitaSaldo ? { ...PUE, abonos: [MOV('ABO-13', 100, 4, '2026-10-31T18:00:00Z'), MOV('RET-1', 4, 0, '2026-10-31T18:00:02Z', null)] } : PUE],
@@ -207,15 +210,16 @@ describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado
     ]) }));
     const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
     expect(r.totales).toMatchObject({
-      consignacionFacturada: 1000, efectivoPorFacturar: 200, cobranzaEfectivo: 300, efectivoFacturado: 96, abonosEfectivo: 50,
+      consignacionFacturada: 1000, efectivoPorFacturar: 270, cobranzaEfectivo: 300, efectivoFacturado: 96, abonosEfectivo: 50,
       totalEntregar: 1446,
     });
     expect(r.incompleta).toBe(false);
-    // Solo las de contado se piden con saldo fresco.
+    // Saldo fresco: contado y consignación sin factura.
     const fresca = koreRem.infoRemisiones.mock.calls.find(c => c[0].necesitaSaldo);
-    expect(fresca[0].remisiones.map(x => x.folio).sort()).toEqual(['13', '14']);
+    expect(fresca[0].remisiones.map(x => x.folio).sort()).toEqual(['11', '13', '14', '15']);
     expect(r.detalle.find(d => d.remision === 'C0-14')).toMatchObject({ concepto: 'abonosEfectivo', saldoDespues: 30, tipoVenta: 'PUE FACTURADO' });
-    expect(r.detalle[r.detalle.length - 1]).toMatchObject({ concepto: 'efectivoPorFacturar', remision: 'C0-11' });
+    expect(r.detalle.find(d => d.remision === 'C0-11')).toMatchObject({ concepto: 'efectivoPorFacturar', saldoDespues: 0 });
+    expect(r.detalle.find(d => d.remision === 'C0-15')).toMatchObject({ concepto: 'efectivoPorFacturar', saldoDespues: 30 });
   });
 
   test('sin tipo de venta de Kore → como antes y la ficha queda incompleta (no se puede guardar)', async () => {

@@ -72,6 +72,7 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   ]);
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([
     salida('RETD', 20.78), salida('RETEF', 100), salida('RPF', 0.55), salida('ST', 50000), salida('CIC', 100000),
+    salida('PG', 25), salida('PV', 10),
   ]);
   // C0-1 es una venta PPD facturada: su cobranza y su abono van a "Cobranza facturado" (2026-11-25).
   koreRem.infoRemisiones.mockResolvedValue({ info: new Map([['C0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' }]]) });
@@ -85,15 +86,17 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
     efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 450, abonosEfectivo: 0,
     devoluciones: 20.78, retiroEfectivo: 100, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
     // Sin factura (170.39) ya NO suma (2026-11-25); el retiro de efectivo (100) ya NO resta (2026-11-26).
-    totalEntregar: 1518.67,
+    // Pago de gastos (25) y de viáticos (10) restan (2026-11-26).
+    pagoGastos: 25, pagoViaticos: 10,
+    totalEntregar: 1483.67,
   });
-  expect(r.totales.totalEntregar).toBe(1518.67);
+  expect(r.totales.totalEntregar).toBe(1483.67);
   expect(r.retiroEfectivoInformativo).toBe(true);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
   expect(r.incompleta).toBe(false);
   // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
-  expect(Math.round(r.detalle.filter(d => !['efectivoPorFacturar', 'retiroEfectivo'].includes(d.concepto)).reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1518.67);
+  expect(Math.round(r.detalle.filter(d => !['efectivoPorFacturar', 'retiroEfectivo'].includes(d.concepto)).reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1483.67);
   // Lo sin factura va al final del anexo.
   expect(r.detalle[r.detalle.length - 1]).toMatchObject({ concepto: 'efectivoPorFacturar', remision: 'C0-2' });
   expect(r.detalle.find(d => d.concepto === 'miscelaneaEfectivo')).toMatchObject({ cobro: 'MIS-1', importe: 40 });

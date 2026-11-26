@@ -58,6 +58,15 @@ const MAX_DIAS_RANGO = 31;
 const MAX_DIAS_FICHA = 10;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
+/**
+ * ¿Factura GLOBAL? (2026-11-26) No basta el RFC genérico: Kore timbra facturas individuales a
+ * XAXX010101000 con el nombre del cliente y sin InformacionGlobal (Atzompa E0-261100257,
+ * ABRAHAM PACHECO, contra entrega). Global = RFC genérico + marca/nodo InformacionGlobal
+ * (o, en copias viejas sin esos datos, el nombre "PUBLICO EN GENERAL").
+ */
+const _esGlobal = c => _serie(c?.receptor?.rfc) === RFC_PUBLICO_GENERAL
+  && (c.global === true || !!c.informacionGlobal?.periodicidad || /P[UÚ]BLICO\s+EN\s+GENERAL/i.test(String(c.receptor?.nombre ?? '')));
+const CAMPOS_GLOBAL = 'receptor global informacionGlobal';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
 // Orden (2026-11-25, pedido del usuario): efectivo facturado, consignación facturada, cobranza
@@ -137,9 +146,10 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
     'receptor.rfc': RFC_PUBLICO_GENERAL,
     serie: { $in: series },
     fecha: { $gte: new Date(`${fechaInicio}T00:00:00.000-06:00`), $lte: new Date(`${fechaFin}T23:59:59.999-06:00`) },
-  }).select('uuid serie folio fecha total satStatus erpStatus source').lean();
+  }).select(`uuid serie folio fecha total satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
 
   const globales = _vigentesPorUuid(docs)
+    .filter(([, c]) => _esGlobal(c))
     .map(([uuid, c]) => ({
       uuid, serie: _serie(c.serie), folio: String(c.folio ?? '').trim(), fecha: c.fecha, dia: _diaMx(c.fecha),
       total: _r2(c.total), sucursal: sucursalDe.get(_serie(c.serie)) ?? null,
@@ -457,12 +467,12 @@ async function _diaDeGlobales(rfc, facturas) {
   if (!unicas.length) return { dias, faltan: false };
   const pares = unicas.map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
   const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
-    .select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+    .select(`uuid serie folio fecha satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
   // Conocida = está en NUMO aunque esté cancelada (no hace falta bajarla de Kore).
   const conocidas = new Set((docs ?? []).map(c => `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`));
   for (const [, c] of _vigentesPorUuid(docs ?? [])) {
     const clave = `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`;
-    if (c.fecha && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL) dias.set(clave, _diaMx(c.fecha));
+    if (c.fecha && _esGlobal(c)) dias.set(clave, _diaMx(c.fecha));
   }
   return { dias, faltan: unicas.some(f => !conocidas.has(f)) };
 }
@@ -472,9 +482,9 @@ async function _globalesDelDia(rfc, serie, dia) {
   const docs = await CFDI.find({
     'emisor.rfc': rfc, tipoDeComprobante: 'I', 'receptor.rfc': RFC_PUBLICO_GENERAL, serie,
     fecha: { $gte: new Date(`${dia}T00:00:00.000-06:00`), $lte: new Date(`${dia}T23:59:59.999-06:00`) },
-  }).select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+  }).select(`uuid serie folio fecha satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
   return _vigentesPorUuid(docs ?? [])
-    .filter(([, c]) => c.fecha && _diaMx(c.fecha) === dia && _serie(c.serie) === _serie(serie) && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL)
+    .filter(([, c]) => c.fecha && _diaMx(c.fecha) === dia && _serie(c.serie) === _serie(serie) && _esGlobal(c))
     .map(([, c]) => ({ serie: _serie(c.serie), folio: String(c.folio ?? '').trim() }));
 }
 
@@ -550,10 +560,10 @@ async function _completarDetalle({ rfc, detalle }) {
   if (facturas.length) {
     const pares = facturas.map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
     const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
-      .select('uuid serie folio receptor satStatus erpStatus source').lean();
+      .select(`uuid serie folio satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
     for (const [uuid, c] of _vigentesPorUuid(docs)) {
       porFactura.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, {
-        uuid, esGlobal: _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL, cliente: c.receptor?.nombre ?? null,
+        uuid, esGlobal: _esGlobal(c), cliente: c.receptor?.nombre ?? null,
       });
     }
   }

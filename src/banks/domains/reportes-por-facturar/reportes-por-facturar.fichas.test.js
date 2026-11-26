@@ -318,3 +318,17 @@ test('otra sucursal con global de un día posterior no suma el día del cobro', 
   expect(r.totales).toMatchObject({ cobroOtraSucursal: 0, cobroOtraSucursalSinFactura: 4143.21, totalEntregar: 0 });
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursalSinFactura', factura: null, facturaPosterior: 'I0-222', facturaPosteriorDia: '2026-11-01' });
 });
+
+// 2026-11-26: el día de la factura es el de su TIMBRADO (copia de Kore: UTC real → hora México).
+test('la global cuenta el día de su fecha de timbrado', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'I0', folioVenta: '9', serieFactura: 'I0', folioFactura: '77', fechaCreacion: '2026-10-30T18:00:00Z', cobros: [cobro('CPF', 100, [EF(100)])] },
+  ]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  // Emitida 31-oct 23:50 (hora local en NUMO), timbrada 1-nov 00:10 hora México (06:10 UTC).
+  const G = { uuid: 'G77', serie: 'I0', folio: '77', fecha: '2026-10-31T23:50:00Z', timbreFiscalDigital: { fechaTimbrado: '2026-11-01T06:10:00Z' },
+    receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' };
+  CFDI.find.mockImplementation(q => lean(q.$or ? [G] : []));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursalSinFactura', facturaPosterior: 'I0-77', facturaPosteriorDia: '2026-11-01' });
+});

@@ -4,7 +4,7 @@
 // de cada sucursal / día que indican.
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
-jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn() }));
+jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn(), obtenerDesglosesCobroPorFactura: jest.fn(async () => []) }));
 jest.mock('../banks/BankMovement.model', () => ({ distinct: jest.fn() }));
 jest.mock('../banks/repositories/bank-config.repository', () => ({ findAllAsMap: jest.fn() }));
 jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ select: () => ({ lean: async () => [{ serie: 'C0', folio: '2', nombre: 'JUAN PEREZ' }] }) })) }));
@@ -230,5 +230,36 @@ describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado
     expect(r.totales.cobranzaEfectivo).toBe(10);
     expect(r.incompleta).toBe(true);
     expect(r.advertencias[0]).toMatch(/tipo de venta/);
+  });
+});
+
+// 2026-11-26 (pedido del usuario): cobrado sin factura el 31-oct y amparado por la global
+// C0-G2 del 1-nov → el 31 va como sin factura (no suma) y el 1-nov suma como consignación facturada.
+describe('cobro sin factura que ampara una global de un día posterior', () => {
+  const GLOBAL = { uuid: 'G2', serie: 'C0', folio: 'G2', fecha: '2026-11-01T20:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' };
+  const cuenta = { serieVenta: 'C0', folioVenta: '30', serieFactura: 'C0', folioFactura: 'G2', fechaCreacion: '2026-10-01T00:00:00Z',
+    cobros: [cobro('CPF', 500, [EF(500)], { folioOrigen: '30' })] };
+  beforeEach(() => {
+    erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+    CFDI.find.mockImplementation(q => lean(q.fecha ? (q.fecha.$gte <= new Date(GLOBAL.fecha) && new Date(GLOBAL.fecha) <= q.fecha.$lte ? [GLOBAL] : []) : [GLOBAL]));
+    koreRem.infoRemisiones.mockImplementation(async ({ necesitaSaldo }) => ({ info: new Map([
+      ['C0|30', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', ...(necesitaSaldo ? { abonos: [{ movimiento: 'CPF-30', forma: 'EFECTIVO', saldoAnterior: 500, saldo: 0, fecha: '2026-10-31T18:00:00Z' }] } : {}) }],
+    ]) }));
+  });
+
+  test('día del cobro: sin factura (no suma) con la global posterior anotada', async () => {
+    erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([cuenta]);
+    const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+    expect(r.totales).toMatchObject({ consignacionFacturada: 0, efectivoPorFacturar: 500, totalEntregar: 0 });
+    expect(r.detalle[0]).toMatchObject({ concepto: 'efectivoPorFacturar', factura: null, facturaPosterior: 'C0-G2', facturaPosteriorDia: '2026-11-01', saldoDespues: 0 });
+  });
+
+  test('día de la global: suma como consignación facturada con el día del cobro', async () => {
+    erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([]);
+    erp.obtenerDesglosesCobroPorFactura.mockResolvedValue([cuenta]);
+    const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
+    expect(erp.obtenerDesglosesCobroPorFactura).toHaveBeenCalledWith(expect.objectContaining({ serieFactura: 'C0', folioFactura: 'G2' }));
+    expect(r.totales).toMatchObject({ consignacionFacturada: 500, efectivoPorFacturar: 0, totalEntregar: 500 });
+    expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31' });
   });
 });

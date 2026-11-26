@@ -205,10 +205,14 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     const remisiones = pendientes.filter(p => p.remision)
       .map(p => ({ serie: _serie(p.serieVenta), folio: String(p.folioVenta).trim(), fechaCreacion: p.fechaCreacion }));
     const { info } = await infoRemisiones({ rfc, remisiones });
-    // Solo las de contado necesitan el saldo fresco (consignación y PPD facturada no dependen del saldo).
+    // Saldo fresco: las de contado (abono o no) y la consignación SIN factura (2026-11-26: el
+    // anexo la separa en "con saldo pendiente" y "saldo 0"). Consignación facturada y PPD
+    // facturada no dependen del saldo.
     const conSaldo = new Set(pendientes.filter(p => {
       const i = info.get(_claveRem(p.remision));
-      return i?.nombreTipoMovimiento && !_esConsignacion(i) && !(p.facturada && _esPpd(i));
+      if (!i?.nombreTipoMovimiento) return false;
+      if (_esConsignacion(i)) return !p.facturada;
+      return !(p.facturada && _esPpd(i));
     }).map(p => _claveRem(p.remision)));
     if (conSaldo.size) {
       const { info: frescas } = await infoRemisiones({
@@ -289,7 +293,11 @@ function _clasificar({ facturada, cobro, info }) {
     return { concepto: origen === 'ABO' ? 'abonosEfectivo' : facturada ? 'cobranzaEfectivo' : 'efectivoPorFacturar', tipoVenta: null, saldoDespues: null };
   }
   const tipoVenta = `${String(info.tipoPago ?? '').trim()} ${String(info.nombreTipoMovimiento).trim()}`.trim();
-  if (_esConsignacion(info)) return { concepto: facturada ? 'consignacionFacturada' : 'efectivoPorFacturar', tipoVenta, saldoDespues: null };
+  if (_esConsignacion(info)) {
+    if (facturada) return { concepto: 'consignacionFacturada', tipoVenta, saldoDespues: null };
+    // Sin factura: el saldo después del cobro separa el anexo en "con saldo" y "saldo 0" (2026-11-26).
+    return { concepto: 'efectivoPorFacturar', tipoVenta, saldoDespues: _saldoDespuesDe(info, cobro) };
+  }
   if (facturada && _esPpd(info)) return { concepto: 'cobranzaEfectivo', tipoVenta, saldoDespues: null };
   const saldoDespues = _saldoDespuesDe(info, cobro);
   if (saldoDespues != null && saldoDespues >= 0.01) return { concepto: 'abonosEfectivo', tipoVenta, saldoDespues };

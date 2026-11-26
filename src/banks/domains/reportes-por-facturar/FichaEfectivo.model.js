@@ -49,6 +49,12 @@ const detalleSchema = new mongoose.Schema({
   // separa la consignación sin factura con saldo pendiente de la que quedó en saldo 0.
   tipoVenta:    String,
   saldoDespues: Number,
+  // 2026-11-26: cobro sin factura que ampara una global de un día posterior — el día del cobro
+  // va como sin factura (facturaPosterior / facturaPosteriorDia) y en la ficha del día de la
+  // global suma con el día en que se cobró (cobradoEl).
+  facturaPosterior:    String,
+  facturaPosteriorDia: String,
+  cobradoEl:           String,
 }, { _id: false });
 
 const denominacionSchema = new mongoose.Schema({

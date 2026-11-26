@@ -33,10 +33,12 @@ beforeEach(() => {
 
 test('listarGlobales: solo vigentes, una por UUID (manda la ERP), ordenadas', async () => {
   CFDI.find.mockReturnValue(lean([
-    { uuid: 'b', serie: 'C0', folio: '20', fecha: '2026-11-01T18:00:00Z', total: 50, source: 'SAT' },
-    { uuid: 'B', serie: 'C0', folio: '20', fecha: '2026-11-01T18:00:00Z', total: 50, source: 'ERP' },
-    { uuid: 'a', serie: 'C0', folio: '10', fecha: '2026-10-31T18:00:00Z', total: 100, source: 'ERP' },
-    { uuid: 'c', serie: 'C0', folio: '30', fecha: '2026-10-31T18:00:00Z', total: 70, source: 'ERP', satStatus: 'Cancelado' },
+    { uuid: 'b', serie: 'C0', folio: '20', fecha: '2026-11-01T18:00:00Z', total: 50, receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'SAT' },
+    { uuid: 'B', serie: 'C0', folio: '20', fecha: '2026-11-01T18:00:00Z', total: 50, receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' },
+    { uuid: 'a', serie: 'C0', folio: '10', fecha: '2026-10-31T18:00:00Z', total: 100, receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' },
+    { uuid: 'c', serie: 'C0', folio: '30', fecha: '2026-10-31T18:00:00Z', total: 70, receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP', satStatus: 'Cancelado' },
+    // RFC genérico con nombre del cliente y sin InformacionGlobal: NO es global (2026-11-26).
+    { uuid: 'd', serie: 'C0', folio: '40', fecha: '2026-10-31T18:00:00Z', total: 9, receptor: { rfc: 'XAXX010101000', nombre: 'ABRAHAM PACHECO' }, source: 'ERP' },
   ]));
   const r = await fichas.listarGlobales({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-11-01' });
   expect(CFDI.find.mock.calls[0][0]).toMatchObject({ 'receptor.rfc': 'XAXX010101000', serie: { $in: ['C0'] }, tipoDeComprobante: 'I' });
@@ -145,7 +147,7 @@ test('Anexo › Actualizar: pone la factura que ya tiene la remisión (sin cach�
     { serieVenta: 'C0', folioVenta: '2', serieFactura: 'C0', folioFactura: '900' },
     { serieVenta: 'C0', folioVenta: '3' }, // sigue sin factura
   ]);
-  CFDI.find.mockReturnValue(lean([{ uuid: 'U9', serie: 'C0', folio: '900', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }]));
+  CFDI.find.mockReturnValue(lean([{ uuid: 'U9', serie: 'C0', folio: '900', receptor: { rfc: 'XAXX010101000' }, global: true, source: 'ERP' }]));
   const detalle = [
     { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', factura: null, importe: 100 },
     { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-3', factura: null, importe: 50 },
@@ -239,7 +241,7 @@ describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado
 // 2026-11-26 (pedido del usuario): cobrado sin factura el 31-oct y amparado por la global
 // C0-G2 del 1-nov → el 31 va como sin factura (no suma) y el 1-nov suma como consignación facturada.
 describe('cobro sin factura que ampara una global de un día posterior', () => {
-  const GLOBAL = { uuid: 'G2', serie: 'C0', folio: 'G2', fecha: '2026-11-01T20:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' };
+  const GLOBAL = { uuid: 'G2', serie: 'C0', folio: 'G2', fecha: '2026-11-01T20:00:00Z', receptor: { rfc: 'XAXX010101000' }, informacionGlobal: { periodicidad: '01' }, source: 'ERP' };
   const cuenta = { serieVenta: 'C0', folioVenta: '30', serieFactura: 'C0', folioFactura: 'G2', fechaCreacion: '2026-10-01T00:00:00Z',
     cobros: [cobro('CPF', 500, [EF(500)], { folioOrigen: '30' })] };
   beforeEach(() => {
@@ -281,7 +283,7 @@ test('cobro de otra sucursal sin factura suma el día de su factura en la caja d
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
   erp.obtenerCuentaTicket.mockResolvedValueOnce({ factura: 'E0-G9', abonos: [
     { movimiento: 'CCE-1', forma: 'EFECTIVO', importe: 500 }, { movimiento: 'RET-1', origen: 'BN-1', forma: null, importe: 100 } ] });
-  CFDI.find.mockImplementation(q => lean(q.$or ? [{ uuid: 'U9', serie: 'E0', folio: 'G9', fecha: '2026-11-01T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }] : []));
+  CFDI.find.mockImplementation(q => lean(q.$or ? [{ uuid: 'U9', serie: 'E0', folio: 'G9', fecha: '2026-11-01T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, global: true, source: 'ERP' }] : []));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
   expect(r.totales).toMatchObject({ cobroOtraSucursal: 400, bonificacionGlobal: 100, totalEntregar: 400 });
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-7', factura: 'E0-G9', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
@@ -294,10 +296,11 @@ test('contra entrega sin factura ligada toma la factura del mismo importe y mome
     { serieVenta: 'E0', folioVenta: '72', serieFactura: null, fechaCreacion: '2026-10-30T18:00:00Z', cobros: [cobro('CCE', 2033.99, [EF(2033.99)])] },
   ]);
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
-  const FACT = { uuid: '4B006F47', serie: 'E0', folio: '257', fecha: '2026-10-31T12:00:00Z', total: 2033.99, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' };
+  const FACT = { uuid: '4B006F47', serie: 'E0', folio: '257', fecha: '2026-10-31T12:00:00Z', total: 2033.99, receptor: { rfc: 'XAXX010101000', nombre: 'ABRAHAM  PACHECO  PACHECO' }, global: false, source: 'ERP' };
   CFDI.find.mockImplementation(q => lean(q.total || q.$or ? [FACT] : []));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(CFDI.find.mock.calls.find(c => c[0].total)[0]).toMatchObject({ serie: 'E0', total: { $gte: 2033.98, $lte: 2034 } });
   expect(r.totales).toMatchObject({ cobroOtraSucursal: 2033.99, cobroOtraSucursalSinFactura: 0, totalEntregar: 2033.99 });
-  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-72', factura: 'E0-257' });
+  // Factura individual al RFC genérico (no global).
+  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-72', factura: 'E0-257', esGlobal: false });
 });

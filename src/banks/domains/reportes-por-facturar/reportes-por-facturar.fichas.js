@@ -90,6 +90,11 @@ const MS_AJUSTE_MISMO_COBRO = 2 * 60 * 1000;
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _serie = v => String(v ?? '').trim().toUpperCase();
 const _diaMx = f => new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10);
+// Fecha de un CFDI en NUMO: ya es hora LOCAL de México "pintada con Z" (erp-transformer
+// parseFechaFacturaERP y el XML del SAT) → el día es la parte de la fecha, sin restar 6 h
+// (2026-11-26: I0-261100216 timbrada 25-nov 09:27 se veía 03:27; 00:00–05:59 caía al día anterior).
+const _diaCfdi = f => new Date(f).toISOString().slice(0, 10);
+const _rangoCfdi = (desde, hasta = desde) => ({ $gte: new Date(`${desde}T00:00:00.000Z`), $lte: new Date(`${hasta}T23:59:59.999Z`) });
 const _dias = (a, b) => Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000) + 1;
 
 // Misma clasificación de formas que el reporte "Por facturar" (mostrador.service._formaPago).
@@ -147,13 +152,13 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
     tipoDeComprobante: 'I',
     'receptor.rfc': RFC_PUBLICO_GENERAL,
     serie: { $in: series },
-    fecha: { $gte: new Date(`${fechaInicio}T00:00:00.000-06:00`), $lte: new Date(`${fechaFin}T23:59:59.999-06:00`) },
+    fecha: _rangoCfdi(fechaInicio, fechaFin),
   }).select(`uuid serie folio fecha total satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
 
   const globales = _vigentesPorUuid(docs)
     .filter(([, c]) => _esGlobal(c))
     .map(([uuid, c]) => ({
-      uuid, serie: _serie(c.serie), folio: String(c.folio ?? '').trim(), fecha: c.fecha, dia: _diaMx(c.fecha),
+      uuid, serie: _serie(c.serie), folio: String(c.folio ?? '').trim(), fecha: c.fecha, dia: _diaCfdi(c.fecha),
       total: _r2(c.total), sucursal: sucursalDe.get(_serie(c.serie)) ?? null,
     }))
     .sort(_orden);
@@ -386,7 +391,7 @@ async function _diaDeFacturas(rfc, facturas) {
   if (!pares.length) return dias;
   const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
     .select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
-  for (const [, c] of _vigentesPorUuid(docs ?? [])) if (c.fecha) dias.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, _diaMx(c.fecha));
+  for (const [, c] of _vigentesPorUuid(docs ?? [])) if (c.fecha) dias.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, _diaCfdi(c.fecha));
   return dias;
 }
 
@@ -475,7 +480,7 @@ async function _diaDeGlobales(rfc, facturas) {
   const conocidas = new Set((docs ?? []).map(c => `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`));
   for (const [, c] of _vigentesPorUuid(docs ?? [])) {
     const clave = `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`;
-    if (c.fecha && _esGlobal(c)) dias.set(clave, _diaMx(c.fecha));
+    if (c.fecha && _esGlobal(c)) dias.set(clave, _diaCfdi(c.fecha));
   }
   return { dias, faltan: unicas.some(f => !conocidas.has(f)) };
 }
@@ -484,10 +489,10 @@ async function _diaDeGlobales(rfc, facturas) {
 async function _globalesDelDia(rfc, serie, dia) {
   const docs = await CFDI.find({
     'emisor.rfc': rfc, tipoDeComprobante: 'I', 'receptor.rfc': RFC_PUBLICO_GENERAL, serie,
-    fecha: { $gte: new Date(`${dia}T00:00:00.000-06:00`), $lte: new Date(`${dia}T23:59:59.999-06:00`) },
+    fecha: _rangoCfdi(dia),
   }).select(`uuid serie folio fecha satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
   return _vigentesPorUuid(docs ?? [])
-    .filter(([, c]) => c.fecha && _diaMx(c.fecha) === dia && _serie(c.serie) === _serie(serie) && _esGlobal(c))
+    .filter(([, c]) => c.fecha && _diaCfdi(c.fecha) === dia && _serie(c.serie) === _serie(serie) && _esGlobal(c))
     .map(([, c]) => ({ serie: _serie(c.serie), folio: String(c.folio ?? '').trim() }));
 }
 

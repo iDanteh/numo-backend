@@ -19,6 +19,8 @@ const montosSchema = new mongoose.Schema({
   abonosEfectivo:      Number,
   cobroOtraSucursal:   Number,
   devoluciones:        Number,
+  pagoGastos:          Number, // 2026-11-26 (PG)
+  pagoViaticos:        Number, // 2026-11-26 (PV)
   retiroEfectivo:      Number,
   faltante:            Number,
   depositoEfectivo:    Number,

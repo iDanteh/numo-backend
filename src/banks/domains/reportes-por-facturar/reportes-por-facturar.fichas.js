@@ -47,7 +47,7 @@
 
 const CFDI       = require('../../../visor/models/CFDI');
 const centrosSvc = require('../centros-costo/centros-costo.service');
-const { obtenerDesglosesCobroAlmacenPorCentro, obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
+const { obtenerDesglosesCobroAlmacenPorCentro, obtenerDesglosesSalidasCajaPorAlmacen, obtenerDesglosesCobroPorFactura } = require('../erp/erp-sync.service');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
@@ -162,16 +162,38 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen: serie, fechaDesde, fechaHasta }),
   ]);
 
+  // 2026-11-26 (pedido del usuario; CONCEPCION ESPINOSA y JUAN ALBERTO AQUINO, cobrados el
+  // 23-nov y amparados por la global A0-261112740 del 24): lo que se cobró SIN factura es
+  // "sin factura" en la ficha del día del cobro aunque hoy Kore ya lo muestre en una global
+  // de un día POSTERIOR, y la ficha del día de esa global lo suma (consignación facturada…).
+  const diaGlobal = await _diaDeGlobales(rfc, (cuentas ?? []).filter(c => c.serieFactura)
+    .map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`));
+  const anteriores = [];
+  for (const g of await _globalesDelDia(rfc, serie, dia)) {
+    const cs = await obtenerDesglosesCobroPorFactura({ rfc, serieFactura: g.serie, folioFactura: g.folio });
+    for (const c of cs ?? []) anteriores.push({ ...c, serieFactura: g.serie, folioFactura: g.folio });
+  }
+
   // 1) Cobros en efectivo; los que dependen del tipo de venta se clasifican después.
   const pendientes = [];
-  for (const c of cuentas ?? []) {
-    const facturada = !!c.serieFactura;
+  const lotes = [{ lista: cuentas, previos: false }, { lista: anteriores, previos: true }];
+  for (const { lista, previos } of lotes) for (const c of lista ?? []) {
+    const facturaKore = c.serieFactura ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null;
     const remision = c.serieVenta && c.folioVenta ? `${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}` : null;
     // Remisión de otra sucursal cobrada en esta caja (2026-11-06).
     const deOtraSucursal = !!c.serieVenta && !propias.has(_serie(c.serieVenta));
-    const factura = facturada ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null;
     for (const k of c.cobros ?? []) {
-      if (_serie(k.claveCentro) !== serie || !k.fecha || _diaMx(k.fecha) !== dia) continue;
+      if (_serie(k.claveCentro) !== serie || !k.fecha) continue;
+      const diaCobro = _diaMx(k.fecha);
+      if (previos ? !(diaCobro < dia) : diaCobro !== dia) continue;
+      // Global de un día posterior al cobro: ese día el cobro estaba sin factura.
+      // (Otras sucursales suman siempre: se quedan con su factura.)
+      const posterior = !previos && !deOtraSucursal && facturaKore && diaGlobal.get(facturaKore) > dia ? facturaKore : null;
+      // Los de días anteriores se evalúan como estaban ese día (sin factura); al sumarlos, facturados.
+      const facturada = !previos && !!facturaKore && !posterior;
+      const factura = facturada ? facturaKore : null;
+      const extra = previos ? { cobradoEl: diaCobro }
+        : posterior ? { facturaPosterior: posterior, facturaPosteriorDia: diaGlobal.get(posterior) } : {};
       const origen = _serie(k.serieOrigen);
       if (origen === 'APA') continue; // aplicación de saldo a favor: no es dinero nuevo
       const fps = k.formasPago ?? [];
@@ -187,14 +209,17 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
         const forma = _forma(fp);
         if (!forma) continue;
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
+        // Cobros de días anteriores (global de hoy): solo el efectivo que ese día quedó sin
+        // factura; otras sucursales y misceláneas ya sumaron en su día.
+        if (previos && (forma !== 'efectivo' || deOtraSucursal || origen === 'MIS')) continue;
         let concepto = null;
         if (forma !== 'efectivo') concepto = forma;
         else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
-        else if (ORIGEN_CONTADO.has(origen)) concepto = facturada ? 'efectivoFacturado' : 'efectivoPorFacturar';
-        const mov = { dia, serie, concepto, remision, factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto };
+        else if (ORIGEN_CONTADO.has(origen)) concepto = (facturada || previos) ? 'efectivoFacturado' : 'efectivoPorFacturar';
+        const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra };
         if (concepto) _sumar(montos, detalle, mov);
-        else pendientes.push({ ...mov, facturada, serieVenta: c.serieVenta, folioVenta: c.folioVenta, fechaCreacion: c.fechaCreacion ?? k.fecha });
+        else pendientes.push({ ...mov, facturada, previo: previos, serieVenta: c.serieVenta, folioVenta: c.folioVenta, fechaCreacion: c.fechaCreacion ?? k.fecha });
       }
     }
   }
@@ -224,6 +249,13 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     for (const p of pendientes) {
       const i = p.remision ? info.get(_claveRem(p.remision)) : null;
       if (!i?.nombreTipoMovimiento) sinTipo++;
+      if (p.previo) {
+        // Cobro de un día anterior que ampara la global de hoy: entra solo si ese día quedó
+        // sin factura (en una venta de contado que dejó saldo ya sumó como abono).
+        if (_clasificar({ ...p, facturada: false, info: i }).concepto !== 'efectivoPorFacturar') continue;
+        _sumar(montos, detalle, { ...p, ..._clasificar({ ...p, facturada: true, info: i }) });
+        continue;
+      }
       _sumar(montos, detalle, { ...p, ..._clasificar({ ...p, info: i }) });
     }
     if (sinTipo) avisos.push(`Kore no dio el tipo de venta de ${sinTipo} cobro(s) de la caja ${serie} del ${dia}; vuelve a generar la ficha.`);
@@ -249,6 +281,31 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
   return { montos, detalle, avisos };
 }
 
+/** Día (México) de las facturas GLOBALES de la lista: Map 'SERIE-FOLIO' → 'YYYY-MM-DD'. */
+async function _diaDeGlobales(rfc, facturas) {
+  const unicas = [...new Set(facturas)];
+  const dias = new Map();
+  if (!unicas.length) return dias;
+  const pares = unicas.map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
+  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', 'receptor.rfc': RFC_PUBLICO_GENERAL, $or: pares })
+    .select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+  for (const [, c] of _vigentesPorUuid(docs ?? [])) {
+    if (c.fecha && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL) dias.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, _diaMx(c.fecha));
+  }
+  return dias;
+}
+
+/** Facturas globales vigentes de una serie timbradas ese día (México). */
+async function _globalesDelDia(rfc, serie, dia) {
+  const docs = await CFDI.find({
+    'emisor.rfc': rfc, tipoDeComprobante: 'I', 'receptor.rfc': RFC_PUBLICO_GENERAL, serie,
+    fecha: { $gte: new Date(`${dia}T00:00:00.000-06:00`), $lte: new Date(`${dia}T23:59:59.999-06:00`) },
+  }).select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+  return _vigentesPorUuid(docs ?? [])
+    .filter(([, c]) => c.fecha && _diaMx(c.fecha) === dia && _serie(c.serie) === _serie(serie) && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL)
+    .map(([, c]) => ({ serie: _serie(c.serie), folio: String(c.folio ?? '').trim() }));
+}
+
 const _claveRem = remision => String(remision ?? '').replace('-', '|');
 const _esConsignacion = i => /CONSIGNACI/i.test(String(i?.nombreTipoMovimiento ?? ''));
 const _esPpd = i => String(i?.tipoPago ?? '').toUpperCase().includes('PPD');
@@ -259,6 +316,8 @@ function _sumar(montos, detalle, mov) {
   const d = { dia: mov.dia, serie: mov.serie, concepto: mov.concepto, remision: mov.remision, factura: mov.factura, cobro: mov.cobro, fecha: mov.fecha, importe: mov.importe };
   if (mov.tipoVenta) d.tipoVenta = mov.tipoVenta;
   if (mov.saldoDespues != null) d.saldoDespues = mov.saldoDespues;
+  if (mov.cobradoEl) d.cobradoEl = mov.cobradoEl;
+  if (mov.facturaPosterior) { d.facturaPosterior = mov.facturaPosterior; d.facturaPosteriorDia = mov.facturaPosteriorDia; }
   detalle.push(d);
 }
 
@@ -372,6 +431,11 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (let d = fechaInicio; d <= fechaFin; d = new Date(new Date(`${d}T00:00:00Z`).getTime() + 86400000).toISOString().slice(0, 10)) dias.push(d);
 
   const advertencias = [];
+  // Globales de hoy / ayer que la descarga nocturna aún no trae (2026-11-26): las usan los
+  // cobros sin factura que una global posterior ya ampara.
+  const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City' }).format(new Date());
+  const recientes = await traerFacturasRecientes({ series, fechaInicio, fechaFin: hoy > fechaFin ? hoy : fechaFin });
+  if (recientes?.error) advertencias.push(`No se pudieron traer de Kore las facturas del ${recientes.dias.join(' y ')} (${recientes.error}); pueden faltar globales de esos días.`);
   const fallidas = [];
   const filas = [];
   let detalle = [];

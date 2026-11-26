@@ -45,6 +45,10 @@ const detalleSchema = new mongoose.Schema({
   usuario:     String,
   fecha:       Date,
   importe:     Number,
+  // Tipo de venta en Kore y saldo de la cuenta después del cobro (2026-11-25/26): el anexo
+  // separa la consignación sin factura con saldo pendiente de la que quedó en saldo 0.
+  tipoVenta:    String,
+  saldoDespues: Number,
 }, { _id: false });
 
 const denominacionSchema = new mongoose.Schema({

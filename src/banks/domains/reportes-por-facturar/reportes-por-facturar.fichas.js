@@ -77,7 +77,8 @@ const ENTRADAS = ['efectivoFacturado', 'consignacionFacturada', 'cobranzaEfectiv
 // retiroEfectivo (RETEF) ya NO resta (2026-11-26, decisión del usuario): Kore no dice para qué es y
 // los grandes salen del efectivo acumulado de días anteriores (CEDIS 20-nov RET-261113428 $278,200
 // a las 09:59). Va como informativo y en el anexo.
-const SALIDAS = ['devoluciones', 'faltante'];
+// pagoGastos (PG) y pagoViaticos (PV): efectivo que sale de la caja — restan (2026-11-26, decisión del usuario).
+const SALIDAS = ['devoluciones', 'pagoGastos', 'pagoViaticos', 'faltante'];
 // bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
 const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
@@ -325,7 +326,10 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
     const tipo = _serie(s.tipoMovimiento?.abreviatura);
     const concepto = tipo === 'RETD' ? 'devoluciones'
       : (tipo === 'RETEF' || /^RETIRO DE EFECTIVO$/i.test(String(s.tipoMovimiento?.nombre ?? '').trim())) ? 'retiroEfectivo'
-      : tipo === 'RPF' ? 'faltante' : null;
+      : tipo === 'RPF' ? 'faltante'
+      : (tipo === 'PG' || /^PAGO DE GASTOS$/i.test(String(s.tipoMovimiento?.nombre ?? '').trim())) ? 'pagoGastos'
+      : (tipo === 'PV' || /^PAGO DE VI[AÁ]TICOS$/i.test(String(s.tipoMovimiento?.nombre ?? '').trim())) ? 'pagoViaticos'
+      : null;
     if (!concepto) continue;
     const monto = Number(s.montoRetirado) || 0;
     montos[concepto] += monto;

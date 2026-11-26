@@ -47,7 +47,7 @@
 
 const CFDI       = require('../../../visor/models/CFDI');
 const centrosSvc = require('../centros-costo/centros-costo.service');
-const { obtenerDesglosesCobroAlmacenPorCentro, obtenerDesglosesSalidasCajaPorAlmacen, obtenerDesglosesCobroPorFactura } = require('../erp/erp-sync.service');
+const { obtenerDesglosesCobroAlmacenPorCentro, obtenerDesglosesSalidasCajaPorAlmacen, obtenerDesglosesCobroPorFactura, obtenerCuentaTicket } = require('../erp/erp-sync.service');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
@@ -67,7 +67,9 @@ const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
 // bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
-const SIN_FACTURA = ['efectivoPorFacturar'];
+// cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
+// CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
+const SIN_FACTURA = ['efectivoPorFacturar', 'cobroOtraSucursalSinFactura'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS, ...SIN_FACTURA];
 // Cobros que no hace falta preguntar a Kore: ticket y contra entrega son de contado.
 const ORIGEN_CONTADO = new Set(['CBT', 'CCE']);
@@ -222,7 +224,7 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
         if (previos && (forma !== 'efectivo' || deOtraSucursal || origen === 'MIS')) continue;
         let concepto = null;
         if (forma !== 'efectivo') concepto = forma;
-        else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
+        else if (deOtraSucursal) concepto = facturada ? 'cobroOtraSucursal' : 'cobroOtraSucursalSinFactura';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (ORIGEN_CONTADO.has(origen)) concepto = (facturada || previos) ? 'efectivoFacturado' : 'efectivoPorFacturar';
         const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra,
@@ -274,6 +276,14 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   // "solo se debe sumar sin las BON porque eso se deposita").
   const globales = new Set([...diaGlobal.keys(), ...globalesHoy.map(g => `${g.serie}-${g.folio}`)]);
   await _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja: `${serie} del ${dia}` });
+
+  // 4) Cobros de otras sucursales hechos en esta caja SIN factura en días anteriores (fichas
+  // guardadas) que se facturaron HOY: suman hoy, por lo facturado (2026-11-26).
+  for (const d of await _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes })) {
+    detalle.push(d);
+    montos.cobroOtraSucursal += d.facturado;
+    montos.bonificacionGlobal += d.importe - d.facturado;
+  }
 
   for (const s of salidas ?? []) {
     if (!s.fecha || _diaMx(s.fecha) !== dia) continue;
@@ -354,6 +364,50 @@ async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja 
   if (sinMovimientos) avisos.push(`Kore no dio los movimientos de ${sinMovimientos} cobro(s) de la caja ${caja}: van con lo cobrado como facturado; vuelve a generar la ficha.`);
 }
 
+/** Día (México) de cada factura vigente de la lista (cualquier receptor): Map 'SERIE-FOLIO' → día. */
+async function _diaDeFacturas(rfc, facturas) {
+  const pares = [...new Set(facturas)].map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
+  const dias = new Map();
+  if (!pares.length) return dias;
+  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
+    .select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+  for (const [, c] of _vigentesPorUuid(docs ?? [])) if (c.fecha) dias.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, _diaMx(c.fecha));
+  return dias;
+}
+
+/**
+ * Cobros de remisiones de OTRAS sucursales hechos en la caja `serie` sin factura (renglón
+ * cobroOtraSucursalSinFactura de fichas guardadas vigentes, últimos 45 días) cuya factura es
+ * de `dia`: suman en la ficha de hoy por lo facturado (cobrado − BN), con el día del cobro.
+ * La ficha de la otra sucursal nunca los trae: el dinero entró a esta caja.
+ */
+async function _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes }) {
+  const FichaEfectivo = require('./FichaEfectivo.model');
+  const desde = new Date(new Date(`${dia}T00:00:00Z`).getTime() - 45 * 86400000).toISOString().slice(0, 10);
+  const docs = await FichaEfectivo.find({ rfc, estado: 'vigente', 'detalle.concepto': 'cobroOtraSucursalSinFactura' }).select('detalle').lean();
+  const pendientes = new Map();
+  for (const f of docs ?? []) for (const x of f.detalle ?? []) {
+    if (x.concepto === 'cobroOtraSucursalSinFactura' && x.serie === serie && x.dia < dia && x.dia >= desde && x.remision && x.cobro) pendientes.set(`${x.remision}|${x.cobro}`, x);
+  }
+  const salida = [];
+  for (const x of pendientes.values()) {
+    const i = x.remision.indexOf('-');
+    const c = await obtenerCuentaTicket({ rfc, serie: x.remision.slice(0, i), folio: x.remision.slice(i + 1), fechaCreacion: x.remisionCreada ?? x.fecha }).catch(() => null);
+    if (!c?.factura) continue;
+    const factura = _serie(c.factura);
+    let dias = await _diaDeFacturas(rfc, [factura]);
+    if (!dias.has(factura) && dia >= _hoyAyer().ayer && await asegurarRecientes()) dias = await _diaDeFacturas(rfc, [factura]);
+    if (dias.get(factura) !== dia) continue;
+    const proporcion = _bnDelCobro(c.abonos, x.cobro) ?? 0;
+    const importe = _r2(x.importe);
+    salida.push({
+      dia, serie, concepto: 'cobroOtraSucursal', remision: x.remision, factura, cobro: x.cobro, fecha: x.fecha,
+      importe, facturado: _r2(importe * (1 - proporcion)), cobradoEl: x.dia,
+    });
+  }
+  return salida;
+}
+
 const _hoyAyer = (ahora = new Date()) => {
   const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City' }).format(ahora);
   return { hoy, ayer: new Date(new Date(`${hoy}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10) };
@@ -402,6 +456,7 @@ function _sumar(montos, detalle, mov) {
   if (mov.saldoDespues != null) d.saldoDespues = mov.saldoDespues;
   if (mov.cobradoEl) d.cobradoEl = mov.cobradoEl;
   if (mov.fechaCreacion) Object.defineProperty(d, '_fechaCreacion', { value: mov.fechaCreacion, enumerable: false });
+  if (mov.concepto === 'cobroOtraSucursalSinFactura' && mov.fechaCreacion) d.remisionCreada = mov.fechaCreacion;
   if (mov.facturaPosterior) { d.facturaPosterior = mov.facturaPosterior; d.facturaPosteriorDia = mov.facturaPosteriorDia; }
   detalle.push(d);
 }

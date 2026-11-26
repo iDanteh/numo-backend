@@ -119,51 +119,6 @@ describe('obtenerPorcentajes', () => {
   });
 });
 
-describe('obtenerCongelamientoMeses / guardarCongelamientoMeses (Congelamiento de puntos, 2026-11-03)', () => {
-  test('obtenerCongelamientoMeses devuelve null cuando getValue tira (no configurado, D11)', async () => {
-    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
-    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CONGELAMIENTO_MESES');
-  });
-
-  test('obtenerCongelamientoMeses devuelve null cuando el valor guardado es "0" (deshabilitado explícito)', async () => {
-    globalConfigService.getValue.mockResolvedValue('0');
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
-  });
-
-  test('obtenerCongelamientoMeses devuelve el entero configurado', async () => {
-    globalConfigService.getValue.mockResolvedValue('6');
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBe(6);
-  });
-
-  test('guardarCongelamientoMeses(6) llama a setValue con tipo:"numero" y devuelve 6', async () => {
-    const resultado = await configService.guardarCongelamientoMeses(6, USER);
-    expect(globalConfigService.setValue).toHaveBeenCalledWith(
-      'lealtad', 'CONGELAMIENTO_MESES', '6',
-      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
-    );
-    expect(resultado).toBe(6);
-  });
-
-  test.each([null, undefined, 0])('guardarCongelamientoMeses(%p) deshabilita: persiste "0" y devuelve null', async (valor) => {
-    const resultado = await configService.guardarCongelamientoMeses(valor, USER);
-    expect(globalConfigService.setValue).toHaveBeenCalledWith(
-      'lealtad', 'CONGELAMIENTO_MESES', '0', expect.objectContaining({ tipo: 'numero' }),
-    );
-    expect(resultado).toBeNull();
-  });
-
-  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
-    'guardarCongelamientoMeses(%p) inválido (%s) → 400, no llama a setValue',
-    async (valor) => {
-      await expect(
-        configService.guardarCongelamientoMeses(valor, USER),
-      ).rejects.toMatchObject({ statusCode: 400 });
-      expect(globalConfigService.setValue).not.toHaveBeenCalled();
-    },
-  );
-});
-
 describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite mensual de consultas con código, 2026-11-09)', () => {
   test('obtenerConsultaCodigoMaxMes devuelve null cuando getValue tira (no configurado, D11)', async () => {
     globalConfigService.getValue.mockRejectedValue(new Error('no existe'));

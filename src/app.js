@@ -69,6 +69,7 @@ const loyaltyImportRoutes     = require('./loyalty/domains/import/loyalty-import
 const loyaltyKoreVentaRoutes  = require('./loyalty/domains/ledger/loyalty-kore-venta.routes');
 const loyaltyKoreClienteRoutes = require('./loyalty/domains/kore-match/loyalty-kore-cliente.routes');
 const loyaltyKoreNivelRoutes  = require('./loyalty/domains/kore-match/loyalty-kore-nivel.routes');
+const loyaltyKoreCongelamientoRoutes = require('./loyalty/domains/ledger/loyalty-kore-congelamiento.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -234,6 +235,11 @@ app.use('/api/loyalty/kore',      loyaltyKoreClienteRoutes);
 // Webhook Kore→Numo de catálogo de niveles (altas/ajustes/bajas, 2026-11-06) — mismo prefijo,
 // router separado por dominio (venta vs. catálogo de clientes vs. catálogo de niveles).
 app.use('/api/loyalty/kore',      loyaltyKoreNivelRoutes);
+// Webhook Kore→Numo de congelamiento por inactividad (cancelación de puntos/desactivación de
+// tarjeta, 2026-11-26) — reemplaza el cron diario que vivía en loyalty/jobs/: Kore ahora controla
+// la cadencia de ambos eventos, Numo solo los recibe y aplica. Router propio (domains/ledger/),
+// mismo prefijo que el resto de webhooks de Kore.
+app.use('/api/loyalty/kore',      loyaltyKoreCongelamientoRoutes);
 app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se
@@ -287,7 +293,6 @@ const startServer = async () => {
     require('./banks/jobs/estadisticaPorFacturarCron');
     require('./banks/jobs/cajaTransferenciaSyncCron');
     require('./banks/jobs/anticipoGeneradoReconciliacionCron');
-    require('./loyalty/jobs/congelamientoPuntosCron');
     require('./visor/jobs/credencialesAlertJob');
     require('./visor/jobs/cfdiCanceladoNotificacionJob');
     require('./system-monitor/system-monitor.cron');

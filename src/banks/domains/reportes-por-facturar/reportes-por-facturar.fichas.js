@@ -336,7 +336,8 @@ function _bnDelCobro(abonos, cobro) {
 async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja }) {
   const filas = detalle.filter(d => ENTRADAS.includes(d.concepto));
   for (const d of filas) d.facturado = d.importe;
-  const conGlobal = filas.filter(d => d.concepto !== 'cobroOtraSucursal' && d.remision && d.factura && globales.has(d.factura));
+  // Incluye los cobros de otras sucursales (2026-11-26, pedido del usuario: "debería sumar por lo facturado").
+  const conGlobal = filas.filter(d => d.remision && d.factura && globales.has(d.factura));
   if (!conGlobal.length) return;
   const remisiones = conGlobal.map(d => { const i = d.remision.indexOf('-'); return { serie: d.remision.slice(0, i), folio: d.remision.slice(i + 1), fechaCreacion: d._fechaCreacion }; });
   // Movimientos frescos salvo que la memoria ya traiga la BN (se aplica una vez, al timbrar).

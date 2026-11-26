@@ -120,6 +120,21 @@ function _esAnticipoOPA(fp) {
   return /^\s*anticipo\s*$/i.test(fp?.nombre ?? '');
 }
 
+// UUIDs (mayúsculas) de las facturas que relacionan su anticipo con
+// tipoRelacion 07: la póliza vendedora les arma cierre OPA (Cargo Anticipos +
+// IVA anticipo) aunque su forma de pago no sea 30, así que el cobro
+// "ANTICIPO" de otra sucursal tampoco debe dar cargo ni contar como cubierto.
+async function _facturasConAnticipoRelacionado(uuids) {
+  const lista = [...new Set((uuids ?? []).map(u => String(u || '').toUpperCase()).filter(Boolean))];
+  if (!lista.length) return new Set();
+  const docs = await CFDI.find({
+    uuid: { $in: lista },
+    tipoDeComprobante: 'I',
+    cfdiRelacionados: { $elemMatch: { tipoRelacion: '07' } },
+  }).select('uuid').lean();
+  return new Set(docs.map(d => String(d.uuid || '').toUpperCase()));
+}
+
 // "PUNTOS" = monedero electrónico Club Tuberos aplicado como forma de pago —
 // mismo principio que Saldo a Favor (reduce un pasivo existente, no es
 // dinero nuevo), pero cuenta distinta (2103090002, Anticipos Otros Club
@@ -1169,6 +1184,15 @@ async function construirMovimientosPuente({
   const nombresSinFactura = await _nombresClienteSinFactura(rfc,
     cuentas.filter(c => !c.serieFactura && !cfdiPorDoc.has(`${c.serieVenta}|${c.folioVenta}`)));
 
+  // Facturas con cierre OPA propio aunque su forma de pago no sea 30 — ver
+  // `_facturasConAnticipoRelacionado`.
+  const facturasConCierreOpa = await _facturasConAnticipoRelacionado(
+    cuentas
+      .filter(c => (c.cobros ?? []).some(cb => (cb.formasPago ?? []).some(_esAnticipoOPA)))
+      .map(c => cfdiPorDoc.get(`${c.serieVenta}|${c.folioVenta}`)?.uuid)
+      .filter(Boolean),
+  );
+
   for (const cuenta of cuentas) {
     const centroVendedor = cuenta.serieFactura ? ccBySerieMap[cuenta.serieFactura] : null;
     const cfdiOriginal = cfdiPorDoc.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? null;
@@ -1339,7 +1363,14 @@ async function construirMovimientosPuente({
         // factura es de otra forma de pago (ej. 01 con pago mixto efectivo +
         // anticipo, casos ABASUR I0-261100074 / B0-261006113) NO hay cierre
         // OPA y esta línea es el único Cargo de esa porción — se deja.
-        if (_esAnticipoOPA(fp) && String(cfdiOriginal?.formaPago ?? '').trim() === '30') {
+        // Excepción: factura de otra forma de pago que SÍ relaciona su anticipo
+        // (tipoRelacion 07) también trae cierre OPA (26-nov, JIVEYMAT
+        // I0-261100208 fP03: anticipo 4,691.82 + transferencia 6,683.81 en
+        // CEDIS) — sin omitirla aquí, el cubierto le restaba el anticipo al
+        // cargo y el cierre OPA salía solo por el sobrante ($120.68).
+        const facturaConCierreOpa = String(cfdiOriginal?.formaPago ?? '').trim() === '30'
+          || facturasConCierreOpa.has((cfdiOriginal?.uuid ?? '').toUpperCase());
+        if (_esAnticipoOPA(fp) && facturaConCierreOpa) {
           if (montoAsignado > 0) montoAnticipoOmitido += montoAsignado;
           return;
         }

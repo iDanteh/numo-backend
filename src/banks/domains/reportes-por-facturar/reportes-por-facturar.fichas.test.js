@@ -4,11 +4,12 @@
 // de cada sucursal / día que indican.
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
-jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn(), obtenerDesglosesCobroPorFactura: jest.fn(async () => []) }));
+jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn(), obtenerDesglosesCobroPorFactura: jest.fn(async () => []), obtenerCuentaTicket: jest.fn(async () => null) }));
 jest.mock('../banks/BankMovement.model', () => ({ distinct: jest.fn() }));
 jest.mock('../banks/repositories/bank-config.repository', () => ({ findAllAsMap: jest.fn() }));
 jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ select: () => ({ lean: async () => [{ serie: 'C0', folio: '2', nombre: 'JUAN PEREZ' }] }) })) }));
 jest.mock('../erp/kore-remisiones.service', () => ({ infoRemisiones: jest.fn() }));
+jest.mock('./FichaEfectivo.model', () => ({ find: jest.fn(() => ({ select: () => ({ lean: async () => [] }) })) }));
 jest.mock('./reportes-por-facturar.fichas-guardadas', () => ({ cajasYaGuardadas: jest.fn(async () => []) }));
 jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 
@@ -177,8 +178,10 @@ test('calcularFicha: cobros y abonos de remisiones de OTRA sucursal van en su pr
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
   CFDI.find.mockReturnValue(lean([]));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
-  expect(r.totales).toMatchObject({ cobroOtraSucursal: 9462.82, efectivoPorFacturar: 0, abonosEfectivo: 0, efectivoFacturado: 100, totalEntregar: 9562.82 });
-  expect(r.detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => d.remision)).toEqual(['A0-5411', 'A0-4991']);
+  // 2026-11-26: la de otra sucursal SIN factura (A0-5411) ya no suma: va al anexo hasta que se facture.
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 2725.73, cobroOtraSucursalSinFactura: 6737.09, efectivoPorFacturar: 0, abonosEfectivo: 0, efectivoFacturado: 100, totalEntregar: 2825.73 });
+  expect(r.detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => d.remision)).toEqual(['A0-4991']);
+  expect(r.detalle.find(d => d.remision === 'A0-5411')).toMatchObject({ concepto: 'cobroOtraSucursalSinFactura', factura: null });
 });
 
 describe('2026-11-25: renglones por tipo de venta (consignación / PPD / contado / abono)', () => {
@@ -265,4 +268,21 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
     expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400 });
     expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
   });
+});
+
+// 2026-11-26: cobro de otra sucursal sin factura (ficha guardada del 31-oct) que se facturó el
+// 1-nov con una global con BN → la ficha del 1-nov de ESTA caja lo suma por lo facturado.
+test('cobro de otra sucursal sin factura suma el día de su factura en la caja donde se cobró', async () => {
+  const FichaEfectivo = require('./FichaEfectivo.model');
+  FichaEfectivo.find.mockReturnValueOnce({ select: () => ({ lean: async () => [{ detalle: [
+    { dia: '2026-10-31', serie: 'C0', concepto: 'cobroOtraSucursalSinFactura', remision: 'E0-7', cobro: 'CCE-1', fecha: '2026-10-31T18:00:00Z', importe: 500, remisionCreada: '2026-10-30T18:00:00Z' },
+  ] }] }) });
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  erp.obtenerCuentaTicket.mockResolvedValueOnce({ factura: 'E0-G9', abonos: [
+    { movimiento: 'CCE-1', forma: 'EFECTIVO', importe: 500 }, { movimiento: 'RET-1', origen: 'BN-1', forma: null, importe: 100 } ] });
+  CFDI.find.mockImplementation(q => lean(q.$or ? [{ uuid: 'U9', serie: 'E0', folio: 'G9', fecha: '2026-11-01T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }] : []));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 400, bonificacionGlobal: 100, totalEntregar: 400 });
+  expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-7', factura: 'E0-G9', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
 });

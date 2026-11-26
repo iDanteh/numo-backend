@@ -12,6 +12,8 @@ const montosSchema = new mongoose.Schema({
   efectivoFacturado:   Number,
   consignacionFacturada: Number, // 2026-11-25
   efectivoPorFacturar: Number,
+  // 2026-11-26: cobro de una remisión de otra sucursal SIN factura (no suma hasta que se facture).
+  cobroOtraSucursalSinFactura: Number,
   miscelaneaEfectivo:  Number,
   cobranzaEfectivo:    Number,
   abonosEfectivo:      Number,
@@ -59,6 +61,9 @@ const detalleSchema = new mongoose.Schema({
   facturaPosterior:    String,
   facturaPosteriorDia: String,
   cobradoEl:           String,
+  // Fecha de creación de la remisión en Kore (la pide /cuentas-pendientes): para revisar
+  // después si un cobro de otra sucursal sin factura ya se facturó (2026-11-26).
+  remisionCreada:      Date,
 }, { _id: false });
 
 const denominacionSchema = new mongoose.Schema({

@@ -21,6 +21,8 @@ const montosSchema = new mongoose.Schema({
   faltante:            Number,
   depositoEfectivo:    Number,
   saldoFavor:          Number,
+  // 2026-11-26: BN que Kore aplica al timbrar la global (la factura sale por menos de lo cobrado).
+  bonificacionGlobal:  Number,
   totalEntregar:       Number,
 }, { _id: false });
 
@@ -52,6 +54,8 @@ const detalleSchema = new mongoose.Schema({
   // 2026-11-26: cobro sin factura que ampara una global de un día posterior — el día del cobro
   // va como sin factura (facturaPosterior / facturaPosteriorDia) y en la ficha del día de la
   // global suma con el día en que se cobró (cobradoEl).
+  // Importe facturado del cobro = cobrado − BN de la global (2026-11-26); es lo que suma.
+  facturado:           Number,
   facturaPosterior:    String,
   facturaPosteriorDia: String,
   cobradoEl:           String,

@@ -35,10 +35,12 @@ const svc = require('../../shared/services/global-config.service');
 // categoria (split 2026-11-03): 'bono'/'regalo' son el catálogo de bonificaciones,
 // 'correccion' es un motivo de ajuste — mismo criterio de backfill aplicado en
 // shared/models/postgres/index.js#syncModels para datos ya existentes.
-// 'congelamiento_inactividad' (2026-11-03): motivo usado por el job diario de "Congelamiento de
-// puntos" (ver loyalty/jobs/congelamiento-puntos.service.js) — puntosFijos queda en modo manual
+// 'congelamiento_inactividad' (2026-11-03, reemplazado 2026-11-26): motivo usado por la
+// cancelación de puntos del webhook Kore de congelamiento (ver
+// loyalty/domains/ledger/loyalty-kore-congelamiento.service.js) — ya NO es un job diario interno,
+// Kore controla la cadencia y Numo solo aplica el evento. puntosFijos queda en modo manual
 // (undefined → null) a propósito, igual que 'correccion': el monto a restar es el saldo completo
-// de CADA tarjeta al momento del congelamiento, nunca un valor fijo.
+// de CADA tarjeta al momento de la cancelación, nunca un valor fijo.
 const REASONS = [
   { clave: 'bono',       nombre: 'Bono',       categoria: 'bonificacion' },
   { clave: 'regalo',     nombre: 'Regalo',     categoria: 'bonificacion' },

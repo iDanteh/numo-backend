@@ -45,14 +45,9 @@ jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   listarNiveles: jest.fn(),
   listarMovimientosGlobal: jest.fn(),
 }));
-jest.mock('./jobs/congelamiento-puntos.service', () => ({
-  tarjetasPorVencer: jest.fn(),
-}));
 jest.mock('./domains/config/loyalty-config.service', () => ({
   obtenerPorcentajes: jest.fn(),
   guardarPorcentajes: jest.fn(),
-  obtenerCongelamientoMeses: jest.fn(),
-  guardarCongelamientoMeses: jest.fn(),
   obtenerConsultaCodigoMaxMes: jest.fn(),
   guardarConsultaCodigoMaxMes: jest.fn(),
   obtenerSesionConsultaUsosMax: jest.fn(),
@@ -98,7 +93,6 @@ const cardService = require('./domains/cards/loyalty-card.service');
 const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
-const congelamientoService = require('./jobs/congelamiento-puntos.service');
 const securityEventService = require('./domains/security/loyalty-security-event.service');
 const { PERMISSIONS } = require('../shared/config/rbac');
 
@@ -132,7 +126,6 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
   const casos = [
     { metodo: 'get',   ruta: '/cards',                    permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/pendientes-revision-kore', permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'get',   ruta: '/cards/por-vencer',          permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/cards/1/marcar-revisada',  permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
     { metodo: 'post',  ruta: '/cards',                     permiso: PERMISSIONS.LOYALTY_TARJETAS_CREAR, body: { telefono: '5512345678', nombre: 'Ana' } },
     { metodo: 'get',   ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_READ },
@@ -149,8 +142,6 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'post',  ruta: '/cards/1/ajustes',            permiso: PERMISSIONS.LOYALTY_AJUSTES, body: { puntos: 10, reasonId: 1, justificacion: 'bono' } },
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
-    { metodo: 'get',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
     { metodo: 'get',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 1 } },
     { metodo: 'get',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_READ },
@@ -285,26 +276,6 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(cardAuditService.listarHistorialCambios).toHaveBeenCalledWith('42');
   });
 
-  // Reporte "Puntos por vencer" (2026-11-03).
-  test('GET /cards/por-vencer pasa `dias` como diasVentana y responde { tarjetas }', async () => {
-    congelamientoService.tarjetasPorVencer.mockResolvedValue([{ id: 1 }]);
-
-    const res = await request(app).get('/cards/por-vencer?dias=15').set(perms(PERMISSIONS.LOYALTY_READ));
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ tarjetas: [{ id: 1 }] });
-    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({ diasVentana: 15 });
-  });
-
-  test('GET /cards/por-vencer sin `dias` deja que el servicio aplique su propio default', async () => {
-    congelamientoService.tarjetasPorVencer.mockResolvedValue([]);
-
-    const res = await request(app).get('/cards/por-vencer').set(perms(PERMISSIONS.LOYALTY_READ));
-
-    expect(res.status).toBe(200);
-    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({});
-  });
-
   // Reporte "Movimientos" (2026-10-29).
   test('GET /ledger/export pasa los filtros de query a listarMovimientosGlobal y responde { movimientos }', async () => {
     ledgerService.listarMovimientosGlobal.mockResolvedValue([{ id: 1 }, { id: 2 }]);
@@ -387,24 +358,6 @@ describe('wiring hacia los servicios (happy path)', () => {
       { cardId: '1', puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' },
       expect.any(Object),
     );
-  });
-
-  test('GET /config/congelamiento llama a obtenerCongelamientoMeses', async () => {
-    configService.obtenerCongelamientoMeses.mockResolvedValue(6);
-    const res = await request(app).get('/config/congelamiento').set(perms(PERMISSIONS.LOYALTY_READ));
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ meses: 6 });
-    expect(configService.obtenerCongelamientoMeses).toHaveBeenCalled();
-  });
-
-  test('PUT /config/congelamiento llama a guardarCongelamientoMeses con meses y el usuario', async () => {
-    configService.guardarCongelamientoMeses.mockResolvedValue(6);
-    const res = await request(app).put('/config/congelamiento')
-      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
-      .send({ meses: 6 });
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ meses: 6 });
-    expect(configService.guardarCongelamientoMeses).toHaveBeenCalledWith(6, expect.objectContaining({ dbId: '1' }));
   });
 
   test('GET /config/consulta-codigo-max-mes llama a obtenerConsultaCodigoMaxMes', async () => {

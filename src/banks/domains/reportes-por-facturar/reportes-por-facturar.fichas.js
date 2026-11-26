@@ -64,7 +64,8 @@ const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // facturado, abonos, venta miscelánea, otras sucursales; luego lo que se resta.
 const ENTRADAS = ['efectivoFacturado', 'consignacionFacturada', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
 const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
-const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
+// bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
+const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 const SIN_FACTURA = ['efectivoPorFacturar'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS, ...SIN_FACTURA];
@@ -151,7 +152,7 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
  * cada cobro / salida que lo forma (2026-11-05: el usuario quiere el rastro
  * venta → factura / global → ficha).
  */
-async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
+async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegurarRecientes = async () => {} }) {
   const propias = new Set(seriesSucursal.map(_serie));
   const montos = Object.fromEntries(CONCEPTOS.map(k => [k, 0]));
   const detalle = [];
@@ -166,10 +167,17 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
   // 23-nov y amparados por la global A0-261112740 del 24): lo que se cobró SIN factura es
   // "sin factura" en la ficha del día del cobro aunque hoy Kore ya lo muestre en una global
   // de un día POSTERIOR, y la ficha del día de esa global lo suma (consignación facturada…).
-  const diaGlobal = await _diaDeGlobales(rfc, (cuentas ?? []).filter(c => c.serieFactura)
-    .map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`));
+  // Las facturas de hoy / ayer aún no están en NUMO (descarga nocturna): se traen de Kore
+  // solo si la ficha es de esos días o si un cobro tiene una factura que NUMO no conoce.
+  const { hoy, ayer } = _hoyAyer();
+  if (dia >= ayer) await asegurarRecientes();
+  const facturasCobros = (cuentas ?? []).filter(c => c.serieFactura)
+    .map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
+  let { dias: diaGlobal, faltan } = await _diaDeGlobales(rfc, facturasCobros);
+  if (faltan && dia < hoy && await asegurarRecientes()) ({ dias: diaGlobal } = await _diaDeGlobales(rfc, facturasCobros));
   const anteriores = [];
-  for (const g of await _globalesDelDia(rfc, serie, dia)) {
+  const globalesHoy = await _globalesDelDia(rfc, serie, dia);
+  for (const g of globalesHoy) {
     const cs = await obtenerDesglosesCobroPorFactura({ rfc, serieFactura: g.serie, folioFactura: g.folio });
     for (const c of cs ?? []) anteriores.push({ ...c, serieFactura: g.serie, folioFactura: g.folio });
   }
@@ -217,9 +225,10 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
         else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (ORIGEN_CONTADO.has(origen)) concepto = (facturada || previos) ? 'efectivoFacturado' : 'efectivoPorFacturar';
-        const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra };
+        const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra,
+          fechaCreacion: c.fechaCreacion ?? k.fecha };
         if (concepto) _sumar(montos, detalle, mov);
-        else pendientes.push({ ...mov, facturada, previo: previos, serieVenta: c.serieVenta, folioVenta: c.folioVenta, fechaCreacion: c.fechaCreacion ?? k.fecha });
+        else pendientes.push({ ...mov, facturada, previo: previos, serieVenta: c.serieVenta, folioVenta: c.folioVenta });
       }
     }
   }
@@ -261,6 +270,11 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
     if (sinTipo) avisos.push(`Kore no dio el tipo de venta de ${sinTipo} cobro(s) de la caja ${serie} del ${dia}; vuelve a generar la ficha.`);
   }
 
+  // 3) Lo facturado de cada cobro amparado por una global (2026-11-26, pedido del usuario:
+  // "solo se debe sumar sin las BON porque eso se deposita").
+  const globales = new Set([...diaGlobal.keys(), ...globalesHoy.map(g => `${g.serie}-${g.folio}`)]);
+  await _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja: `${serie} del ${dia}` });
+
   for (const s of salidas ?? []) {
     if (!s.fecha || _diaMx(s.fecha) !== dia) continue;
     const tipo = _serie(s.tipoMovimiento?.abreviatura);
@@ -281,18 +295,87 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
   return { montos, detalle, avisos };
 }
 
-/** Día (México) de las facturas GLOBALES de la lista: Map 'SERIE-FOLIO' → 'YYYY-MM-DD'. */
+const _esBn = m => /^BN-/i.test(String(m?.origen ?? '').trim());
+
+/**
+ * Parte de un pago que se llevó la BN de la global (2026-11-26). Kore, al timbrar la
+ * global, aplica a la remisión una bonificación (origen BN-…, p. ej. BN-088622 $13,000 =
+ * 20% de VIRIDIANA A0-261002349) y la factura sale por lo cobrado menos esa BN. Cada BN se
+ * reparte entre los pagos (con forma de pago) hechos desde la BN anterior, en proporción.
+ * @returns {number|null} BN que corresponde al pago `cobro`; null si Kore no trae el movimiento.
+ */
+function _bnDelCobro(abonos, cobro) {
+  const movs = Array.isArray(abonos) ? abonos : [];
+  if (!movs.some(m => _serie(m.movimiento) === _serie(cobro))) return null;
+  let pagos = [];
+  let bn = 0;
+  for (const m of movs) {
+    if (_esBn(m)) {
+      const base = pagos.reduce((s, p) => s + p.importe, 0);
+      const mio = pagos.find(p => _serie(p.movimiento) === _serie(cobro));
+      if (mio && base > 0) bn += (Number(m.importe) || 0) * mio.importe / base;
+      pagos = [];
+    } else if (m.forma && Number(m.importe) > 0) {
+      pagos.push({ movimiento: m.movimiento, importe: Number(m.importe) });
+    } else if (m.forma && Number(m.importe) < 0) {
+      // Cobro cancelado (RAB, p. ej. GLADIS GOMEZ A0-261101623: CPF de $18,853.88 revertido):
+      // ya no cuenta para repartir la BN.
+      const i = pagos.findIndex(p => Math.abs(p.importe + Number(m.importe)) < 0.005);
+      if (i >= 0) pagos.splice(i, 1);
+    }
+  }
+  const pago = movs.find(m => _serie(m.movimiento) === _serie(cobro));
+  return pago && Number(pago.importe) > 0 ? bn / Number(pago.importe) : 0;
+}
+
+/**
+ * `facturado` de cada renglón que suma: lo cobrado menos la BN de la global (solo cobros
+ * amparados por una GLOBAL; lo demás se factura por lo cobrado). Ajusta los montos de cada
+ * renglón y acumula la diferencia en `bonificacionGlobal` (informativo).
+ */
+async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja }) {
+  const filas = detalle.filter(d => ENTRADAS.includes(d.concepto));
+  for (const d of filas) d.facturado = d.importe;
+  const conGlobal = filas.filter(d => d.concepto !== 'cobroOtraSucursal' && d.remision && d.factura && globales.has(d.factura));
+  if (!conGlobal.length) return;
+  const remisiones = conGlobal.map(d => { const i = d.remision.indexOf('-'); return { serie: d.remision.slice(0, i), folio: d.remision.slice(i + 1), fechaCreacion: d._fechaCreacion }; });
+  // Movimientos frescos salvo que la memoria ya traiga la BN (se aplica una vez, al timbrar).
+  const { info } = await infoRemisiones({ rfc, remisiones, necesitaSaldo: (k, g) => !(g?.abonos ?? []).some(_esBn) });
+  let sinMovimientos = 0;
+  for (const d of conGlobal) {
+    const proporcion = _bnDelCobro(info.get(_claveRem(d.remision))?.abonos, d.cobro);
+    if (proporcion == null) { sinMovimientos++; continue; }
+    const facturado = _r2(d.importe * (1 - proporcion));
+    montos[d.concepto] += facturado - d.importe;
+    montos.bonificacionGlobal += d.importe - facturado;
+    d.facturado = facturado;
+  }
+  if (sinMovimientos) avisos.push(`Kore no dio los movimientos de ${sinMovimientos} cobro(s) de la caja ${caja}: van con lo cobrado como facturado; vuelve a generar la ficha.`);
+}
+
+const _hoyAyer = (ahora = new Date()) => {
+  const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City' }).format(ahora);
+  return { hoy, ayer: new Date(new Date(`${hoy}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10) };
+};
+
+/**
+ * Día (México) de las facturas GLOBALES de la lista: `dias` Map 'SERIE-FOLIO' → 'YYYY-MM-DD';
+ * `faltan` = alguna factura (global o no) que todavía no está en NUMO.
+ */
 async function _diaDeGlobales(rfc, facturas) {
   const unicas = [...new Set(facturas)];
   const dias = new Map();
-  if (!unicas.length) return dias;
+  if (!unicas.length) return { dias, faltan: false };
   const pares = unicas.map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
-  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', 'receptor.rfc': RFC_PUBLICO_GENERAL, $or: pares })
+  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
     .select('uuid serie folio fecha receptor satStatus erpStatus source').lean();
+  // Conocida = está en NUMO aunque esté cancelada (no hace falta bajarla de Kore).
+  const conocidas = new Set((docs ?? []).map(c => `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`));
   for (const [, c] of _vigentesPorUuid(docs ?? [])) {
-    if (c.fecha && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL) dias.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, _diaMx(c.fecha));
+    const clave = `${_serie(c.serie)}-${String(c.folio ?? '').trim()}`;
+    if (c.fecha && _serie(c.receptor?.rfc) === RFC_PUBLICO_GENERAL) dias.set(clave, _diaMx(c.fecha));
   }
-  return dias;
+  return { dias, faltan: unicas.some(f => !conocidas.has(f)) };
 }
 
 /** Facturas globales vigentes de una serie timbradas ese día (México). */
@@ -317,6 +400,7 @@ function _sumar(montos, detalle, mov) {
   if (mov.tipoVenta) d.tipoVenta = mov.tipoVenta;
   if (mov.saldoDespues != null) d.saldoDespues = mov.saldoDespues;
   if (mov.cobradoEl) d.cobradoEl = mov.cobradoEl;
+  if (mov.fechaCreacion) Object.defineProperty(d, '_fechaCreacion', { value: mov.fechaCreacion, enumerable: false });
   if (mov.facturaPosterior) { d.facturaPosterior = mov.facturaPosterior; d.facturaPosteriorDia = mov.facturaPosteriorDia; }
   detalle.push(d);
 }
@@ -431,18 +515,26 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (let d = fechaInicio; d <= fechaFin; d = new Date(new Date(`${d}T00:00:00Z`).getTime() + 86400000).toISOString().slice(0, 10)) dias.push(d);
 
   const advertencias = [];
-  // Globales de hoy / ayer que la descarga nocturna aún no trae (2026-11-26): las usan los
-  // cobros sin factura que una global posterior ya ampara.
-  const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City' }).format(new Date());
-  const recientes = await traerFacturasRecientes({ series, fechaInicio, fechaFin: hoy > fechaFin ? hoy : fechaFin });
-  if (recientes?.error) advertencias.push(`No se pudieron traer de Kore las facturas del ${recientes.dias.join(' y ')} (${recientes.error}); pueden faltar globales de esos días.`);
+  // Facturas de hoy / ayer que la descarga nocturna aún no trae (2026-11-26): una sola vez por
+  // ficha y solo si hace falta (bajarlas tarda ~20 s). true = se trajeron sin error.
+  let traidas = null;
+  const asegurarRecientes = async () => {
+    if (!traidas) {
+      const { hoy, ayer } = _hoyAyer();
+      traidas = traerFacturasRecientes({ series, fechaInicio: ayer, fechaFin: hoy }).then(r => {
+        if (r?.error) advertencias.push(`No se pudieron traer de Kore las facturas del ${r.dias.join(' y ')} (${r.error}); pueden faltar globales de esos días.`);
+        return !r?.error;
+      });
+    }
+    return traidas;
+  };
   const fallidas = [];
   const filas = [];
   let detalle = [];
   for (const dia of dias) {
     for (const serie of series) {
       try {
-        const { montos, detalle: det, avisos = [] } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series });
+        const { montos, detalle: det, avisos = [] } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series, asegurarRecientes });
         if (avisos.length) { fallidas.push(`${serie}|${dia}`); advertencias.push(...avisos); }
         if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
         filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });

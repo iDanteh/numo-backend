@@ -243,7 +243,9 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
     erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
     CFDI.find.mockImplementation(q => lean(q.fecha ? (q.fecha.$gte <= new Date(GLOBAL.fecha) && new Date(GLOBAL.fecha) <= q.fecha.$lte ? [GLOBAL] : []) : [GLOBAL]));
     koreRem.infoRemisiones.mockImplementation(async ({ necesitaSaldo }) => ({ info: new Map([
-      ['C0|30', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', ...(necesitaSaldo ? { abonos: [{ movimiento: 'CPF-30', forma: 'EFECTIVO', saldoAnterior: 500, saldo: 0, fecha: '2026-10-31T18:00:00Z' }] } : {}) }],
+      ['C0|30', { tipoPago: 'PPD', nombreTipoMovimiento: 'CONSIGNACION', ...(necesitaSaldo ? { abonos: [{ movimiento: 'CPF-30', forma: 'EFECTIVO', importe: 500, saldoAnterior: 500, saldo: 0, fecha: '2026-10-31T18:00:00Z' },
+        // BN que Kore aplica al timbrar la global (20%): la factura sale por 400.
+        { movimiento: 'RET-9', origen: 'BN-1', forma: null, importe: 100, saldoAnterior: 0, saldo: -100, fecha: '2026-11-01T20:00:00Z' }] } : {}) }],
     ]) }));
   });
 
@@ -259,7 +261,8 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
     erp.obtenerDesglosesCobroPorFactura.mockResolvedValue([cuenta]);
     const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
     expect(erp.obtenerDesglosesCobroPorFactura).toHaveBeenCalledWith(expect.objectContaining({ serieFactura: 'C0', folioFactura: 'G2' }));
-    expect(r.totales).toMatchObject({ consignacionFacturada: 500, efectivoPorFacturar: 0, totalEntregar: 500 });
-    expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31' });
+    // Suma lo facturado (cobrado − BN de la global); la BN queda como informativo.
+    expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400 });
+    expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
   });
 });

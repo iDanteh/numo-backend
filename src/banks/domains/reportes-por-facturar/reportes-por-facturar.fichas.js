@@ -85,11 +85,17 @@ const SALIDAS = ['devoluciones', 'pagoGastos', 'pagoViaticos', 'faltante'];
 // efectivoCobrado (2026-11-27, pedido del usuario: casilla "ver también el total de efectivo cobrado"):
 // todo el efectivo cobrado en la caja ese día (facturado o no, incl. otras sucursales y misceláneas),
 // tal como lo registra Kore, antes de BN, devoluciones y salidas. No suma al total a entregar.
-const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion', 'efectivoCobrado'];
+// recibido* (2026-11-27, pedido del usuario: resumen "Recibí efectivo" como su Excel POR FACTURAR, por
+// día de cobro): el efectivo cobrado del día separado en mostrador / cobranza / otras sucursales.
+const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion', 'efectivoCobrado',
+  'recibidoMostrador', 'recibidoCobranza', 'recibidoOtrasSucursales'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
 const SIN_FACTURA = ['efectivoPorFacturar', 'cobroOtraSucursalSinFactura'];
+// Sucursales que el reporte "Por facturar" del usuario lleva juntas (CEDIS con PROMOTORIA, igual que
+// SUCURSALES_JUNTAS del frontend): en "Recibí efectivo" su efectivo va como mostrador, no como otra sucursal.
+const SUCURSALES_JUNTAS = { CEDIS: ['I0'] };
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS, ...SIN_FACTURA];
 // Cobros que no hace falta preguntar a Kore: ticket y contra entrega son de contado.
 const ORIGEN_CONTADO = new Set(['CBT', 'CCE']);
@@ -195,7 +201,8 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
  * cada cobro / salida que lo forma (2026-11-05: el usuario quiere el rastro
  * venta → factura / global → ficha).
  */
-async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegurarRecientes = async () => {} }) {
+async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], seriesJuntas = [], asegurarRecientes = async () => {} }) {
+  const juntas = new Set(seriesJuntas.map(_serie));
   const propias = new Set(seriesSucursal.map(_serie));
   const montos = Object.fromEntries(CONCEPTOS.map(k => [k, 0]));
   const detalle = [];
@@ -303,6 +310,7 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (ORIGEN_CONTADO.has(origen)) concepto = (facturada || previos) ? 'efectivoFacturado' : 'efectivoPorFacturar';
         const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra,
+          deJunta: deOtraSucursal && juntas.has(_serie(c.serieVenta)),
           fechaCreacion: c.fechaCreacion ?? k.fecha };
         if (concepto) _sumar(montos, detalle, mov);
         else pendientes.push({ ...mov, facturada, previo: previos, serieVenta: c.serieVenta, folioVenta: c.folioVenta });
@@ -699,6 +707,12 @@ const _esPpd = i => String(i?.tipoPago ?? '').toUpperCase().includes('PPD');
 function _sumar(montos, detalle, mov) {
   montos[mov.concepto] += mov._monto;
   if (!ENTRADAS.includes(mov.concepto) && !SIN_FACTURA.includes(mov.concepto)) return;
+  // Resumen "Recibí efectivo" (2026-11-27): solo lo cobrado ESTE día (no los cobros de días anteriores).
+  if (!mov.cobradoEl) {
+    const k = mov.concepto === 'cobranzaEfectivo' ? 'recibidoCobranza'
+      : !mov.deJunta && (mov.concepto === 'cobroOtraSucursal' || mov.concepto === 'cobroOtraSucursalSinFactura') ? 'recibidoOtrasSucursales' : 'recibidoMostrador';
+    montos[k] += mov._monto;
+  }
   const d = { dia: mov.dia, serie: mov.serie, concepto: mov.concepto, remision: mov.remision, factura: mov.factura, cobro: mov.cobro, fecha: mov.fecha, importe: mov.importe };
   if (mov.tipoVenta) d.tipoVenta = mov.tipoVenta;
   if (mov.saldoDespues != null) d.saldoDespues = mov.saldoDespues;
@@ -838,7 +852,7 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (const dia of dias) {
     for (const serie of series) {
       try {
-        const { montos, detalle: det, avisos = [] } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series, asegurarRecientes });
+        const { montos, detalle: det, avisos = [] } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series, seriesJuntas: SUCURSALES_JUNTAS[String(sucursal ?? '').trim().toUpperCase()] ?? [], asegurarRecientes });
         if (avisos.length) { fallidas.push(`${serie}|${dia}`); advertencias.push(...avisos); }
         if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
         filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });

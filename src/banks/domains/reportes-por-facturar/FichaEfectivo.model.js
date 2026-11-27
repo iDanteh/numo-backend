@@ -27,6 +27,8 @@ const montosSchema = new mongoose.Schema({
   saldoFavor:          Number,
   // 2026-11-26: BN que Kore aplica al timbrar la global (la factura sale por menos de lo cobrado).
   bonificacionGlobal:  Number,
+  // 2026-11-27: devolución antes de timbrar la global que quedó como saldo a favor (efectivo en caja sin factura).
+  saldoFavorDevolucion: Number,
   totalEntregar:       Number,
 }, { _id: false });
 
@@ -66,6 +68,13 @@ const detalleSchema = new mongoose.Schema({
   // Fecha de creación de la remisión en Kore (la pide /cuentas-pendientes): para revisar
   // después si un cobro de otra sucursal sin factura ya se facturó (2026-11-26).
   remisionCreada:      Date,
+  // 2026-11-27: devolución sobre el pago antes de timbrar la global (DEV-… en Kore): lo que se
+  // regresó en efectivo, lo que sigue a favor del cliente, y en el renglón de la remisión pagada
+  // con ese saldo a favor, de qué remisión salió.
+  devolucion:            Number,
+  devolucionReembolsada: Number,
+  saldoFavorPendiente:   Number,
+  saldoFavorDe:          String,
 }, { _id: false });
 
 const denominacionSchema = new mongoose.Schema({

@@ -78,8 +78,10 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   koreRem.infoRemisiones.mockResolvedValue({ info: new Map([['C0|1', { tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' }]]) });
 
   const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
-  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(1);
+  // Del día + los 15 días anteriores (otras sucursales facturadas hoy, 2026-11-27).
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(2);
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro.mock.calls[0][0]).toMatchObject({ centro: 'C0', fechaDesde: '2026-10-31T06:00:00.000Z', fechaHasta: '2026-11-01T05:59:59.999Z' });
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro.mock.calls[1][0]).toMatchObject({ centro: 'C0', fechaDesde: '2026-10-16T06:00:00.000Z', fechaHasta: '2026-10-31T05:59:59.999Z' });
   expect(r.cortes).toHaveLength(1);
   expect(r.cortes[0]).toMatchObject({
     serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
@@ -116,9 +118,21 @@ test('calcularFicha: rango de varios días — una caja por día, días sin efec
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
   CFDI.find.mockReturnValue(lean([]));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-11-02' });
-  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(3);
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(6); // día + 15 días anteriores, por día
   expect(r.cortes.map(c => [c.dia, c.totalEntregar])).toEqual([['2026-11-01', 0]]);
   expect(r.totales.efectivoPorFacturar).toBe(100);
+});
+
+test('calcularFicha: cobro de otra sucursal en esta caja un día anterior, global timbrada hoy → suma hoy sin ficha guardada (I0-261100386, 2026-11-27)', async () => {
+  // Global I0-9 de PROMOTORIA timbrada el 1-nov; el cobro fue en la caja C0 el 31-oct.
+  CFDI.find.mockReturnValue(lean([{ uuid: 'G9', serie: 'I0', folio: '9', fecha: '2026-11-01T12:00:00Z', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP' }]));
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ fechaDesde }) =>
+    (fechaDesde.startsWith('2026-11-01') ? [] : [{ cuentaId: 'k1', serieVenta: 'I0', folioVenta: '386', serieFactura: 'I0', folioFactura: '9',
+      cobros: [cobro('CPF', 4143.21, [EF(4143.21)])] }]));
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
+  expect(r.totales.cobroOtraSucursal).toBe(4143.21);
+  expect(r.detalle.find(d => d.remision === 'I0-386')).toMatchObject({ concepto: 'cobroOtraSucursal', factura: 'I0-9', cobradoEl: '2026-10-31', importe: 4143.21 });
 });
 
 test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', async () => {

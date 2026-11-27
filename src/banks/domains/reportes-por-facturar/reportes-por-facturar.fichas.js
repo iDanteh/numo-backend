@@ -109,6 +109,9 @@ const _diaFactura = c => {
   return c?.fecha ? _diaCfdi(c.fecha) : null;
 };
 const CAMPO_TIMBRADO = 'timbreFiscalDigital.fechaTimbrado';
+// Días hacia atrás que se piden a Kore para hallar cobros de otras sucursales hechos en la caja
+// y facturados en una global de hoy (CEDIS: 15 días ≈ 3,300 cuentas, ~7 s).
+const DIAS_OTRAS_PREVIAS = 15;
 const _masDias = (dia, n) => new Date(new Date(`${dia}T00:00:00Z`).getTime() + n * 86400000).toISOString().slice(0, 10);
 const _rangoCfdi = (desde, hasta = desde) => ({ $gte: new Date(`${desde}T00:00:00.000Z`), $lte: new Date(`${hasta}T23:59:59.999Z`) });
 const _dias = (a, b) => Math.round((new Date(`${b}T00:00:00Z`) - new Date(`${a}T00:00:00Z`)) / 86400000) + 1;
@@ -213,10 +216,34 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   let { dias: diaGlobal, faltan } = await _diaDeGlobales(rfc, facturasCobros);
   if (faltan && dia < hoy && await asegurarRecientes()) ({ dias: diaGlobal } = await _diaDeGlobales(rfc, facturasCobros));
   const anteriores = [];
+  const avisosPrevios = [];
   const globalesHoy = await _globalesDelDia(rfc, serie, dia);
   for (const g of globalesHoy) {
     const cs = await obtenerDesglosesCobroPorFactura({ rfc, serieFactura: g.serie, folioFactura: g.folio });
     for (const c of cs ?? []) anteriores.push({ ...c, serieFactura: g.serie, folioFactura: g.folio });
+  }
+  // Remisiones de OTRAS sucursales cobradas en esta caja en días anteriores y amparadas por una
+  // global timbrada HOY (2026-11-27, pedido del usuario: I0-261100386 cobrada en CEDIS el 24-nov,
+  // global I0-261100222 del 25 → "debería salir en la del 25" aunque la ficha del 24 no se haya
+  // guardado). Se piden a Kore los últimos DIAS_OTRAS_PREVIAS días de esta caja; lo más viejo
+  // sigue saliendo de las fichas guardadas (_otrasSucursalesFacturadasHoy).
+  const globalesOtrasHoy = new Set();
+  try {
+    const hasta = new Date(`${_masDias(dia, -1)}T23:59:59.999-06:00`).toISOString();
+    const desde = new Date(`${_masDias(dia, -DIAS_OTRAS_PREVIAS)}T00:00:00.000-06:00`).toISOString();
+    const previas = (await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde: desde, fechaHasta: hasta }) ?? [])
+      .filter(c => c.serieVenta && !propias.has(_serie(c.serieVenta)) && c.serieFactura);
+    const facturas = previas.map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
+    let { dias, faltan } = await _diaDeGlobales(rfc, facturas);
+    if (faltan && dia >= ayer && await asegurarRecientes()) ({ dias } = await _diaDeGlobales(rfc, facturas));
+    const yaEstan = new Set(anteriores.map(c => c.cuentaId).filter(Boolean));
+    previas.forEach((c, i) => {
+      if (dias.get(facturas[i]) !== dia || (c.cuentaId && yaEstan.has(c.cuentaId))) return;
+      globalesOtrasHoy.add(facturas[i]);
+      anteriores.push(c);
+    });
+  } catch (e) {
+    avisosPrevios.push(`No se pudieron consultar en Kore los cobros de otras sucursales de días anteriores en la caja ${serie} (${e.response?.status ?? e.message}); solo se toman los de fichas guardadas.`);
   }
 
   // 1) Cobros en efectivo; los que dependen del tipo de venta se clasifican después.
@@ -256,11 +283,11 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
         if (!forma) continue;
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
         // Cobros de días anteriores (global de hoy): solo el efectivo que ese día quedó sin
-        // factura; otras sucursales y misceláneas ya sumaron en su día.
-        if (previos && (forma !== 'efectivo' || deOtraSucursal || origen === 'MIS')) continue;
+        // factura; las misceláneas ya sumaron en su día.
+        if (previos && (forma !== 'efectivo' || origen === 'MIS')) continue;
         let concepto = null;
         if (forma !== 'efectivo') concepto = forma;
-        else if (deOtraSucursal) concepto = facturada ? 'cobroOtraSucursal' : 'cobroOtraSucursalSinFactura';
+        else if (deOtraSucursal) concepto = (facturada || previos) ? 'cobroOtraSucursal' : 'cobroOtraSucursalSinFactura';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (ORIGEN_CONTADO.has(origen)) concepto = (facturada || previos) ? 'efectivoFacturado' : 'efectivoPorFacturar';
         const mov = { dia, serie, concepto, remision, factura: previos ? facturaKore : factura, cobro, fecha: k.fecha, importe: _r2(monto), _monto: monto, ...extra,
@@ -310,12 +337,16 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
 
   // 3) Lo facturado de cada cobro amparado por una global (2026-11-26, pedido del usuario:
   // "solo se debe sumar sin las BON porque eso se deposita").
-  const globales = new Set([...diaGlobal.keys(), ...globalesHoy.map(g => `${g.serie}-${g.folio}`)]);
+  const globales = new Set([...diaGlobal.keys(), ...globalesHoy.map(g => `${g.serie}-${g.folio}`), ...globalesOtrasHoy]);
+  avisos.push(...avisosPrevios);
   await _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja: `${serie} del ${dia}` });
 
   // 4) Cobros de otras sucursales hechos en esta caja SIN factura en días anteriores (fichas
-  // guardadas) que se facturaron HOY: suman hoy, por lo facturado (2026-11-26).
+  // guardadas) que se facturaron HOY: suman hoy, por lo facturado (2026-11-26). Los que ya
+  // trajo Kore arriba (últimos DIAS_OTRAS_PREVIAS días) no se repiten.
+  const yaSumados = new Set(detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => `${d.remision}|${d.cobro}`));
   for (const d of await _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes })) {
+    if (yaSumados.has(`${d.remision}|${d.cobro}`)) continue;
     detalle.push(d);
     montos.cobroOtraSucursal += d.facturado;
     montos.bonificacionGlobal += d.importe - d.facturado;

@@ -82,7 +82,10 @@ const SALIDAS = ['devoluciones', 'pagoGastos', 'pagoViaticos', 'faltante'];
 // bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
 // saldoFavorDevolucion (2026-11-27): devolución sobre un pago en efectivo antes de timbrar la global
 // que quedó como saldo a favor del cliente — el dinero sigue en la caja pero no está facturado.
-const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion'];
+// efectivoCobrado (2026-11-27, pedido del usuario: casilla "ver también el total de efectivo cobrado"):
+// todo el efectivo cobrado en la caja ese día (facturado o no, incl. otras sucursales y misceláneas),
+// tal como lo registra Kore, antes de BN, devoluciones y salidas. No suma al total a entregar.
+const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion', 'efectivoCobrado'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
@@ -290,6 +293,7 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
         const forma = _forma(fp);
         if (!forma) continue;
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
+        if (!previos && forma === 'efectivo') montos.efectivoCobrado += monto;
         // Cobros de días anteriores (global de hoy): solo el efectivo que ese día quedó sin
         // factura; las misceláneas ya sumaron en su día.
         if (previos && (forma !== 'efectivo' || origen === 'MIS')) continue;

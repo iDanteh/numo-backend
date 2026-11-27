@@ -327,7 +327,7 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
     const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
     expect(erp.obtenerDesglosesCobroPorFactura).toHaveBeenCalledWith(expect.objectContaining({ serieFactura: 'C0', folioFactura: 'G2' }));
     // Suma lo facturado (cobrado − BN de la global); la BN queda como informativo.
-    expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400, efectivoCobrado: 0, recibidoMostrador: 0 });
+    expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400, efectivoCobrado: 0, recibidoMostrador: 0, recibidoDiasAnteriores: 500 });
     expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
   });
 });
@@ -345,7 +345,7 @@ test('cobro de otra sucursal sin factura suma el día de su factura en la caja d
     { movimiento: 'CCE-1', forma: 'EFECTIVO', importe: 500 }, { movimiento: 'RET-1', origen: 'BN-1', forma: null, importe: 100 } ] });
   CFDI.find.mockImplementation(q => lean(q.$or ? [{ uuid: 'U9', serie: 'E0', folio: 'G9', fecha: '2026-11-01T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, global: true, source: 'ERP' }] : []));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
-  expect(r.totales).toMatchObject({ cobroOtraSucursal: 400, bonificacionGlobal: 100, totalEntregar: 400 });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 400, bonificacionGlobal: 100, totalEntregar: 400, recibidoDiasAnteriores: 500 });
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursal', remision: 'E0-7', factura: 'E0-G9', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
 });
 

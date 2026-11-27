@@ -35,6 +35,7 @@ const montosSchema = new mongoose.Schema({
   recibidoMostrador:   Number,
   recibidoCobranza:    Number,
   recibidoOtrasSucursales: Number,
+  recibidoDiasAnteriores: Number, // 2026-11-27: cobrado antes, facturado (global timbrada) hoy
   totalEntregar:       Number,
 }, { _id: false });
 

@@ -31,6 +31,10 @@ const montosSchema = new mongoose.Schema({
   saldoFavorDevolucion: Number,
   // 2026-11-27: todo el efectivo que entró a la caja en el día (con y sin factura, antes de BN y salidas).
   efectivoCobrado:     Number,
+  // 2026-11-27: "Recibí efectivo" (lo cobrado del día): mostrador / cobranza / otras sucursales.
+  recibidoMostrador:   Number,
+  recibidoCobranza:    Number,
+  recibidoOtrasSucursales: Number,
   totalEntregar:       Number,
 }, { _id: false });
 

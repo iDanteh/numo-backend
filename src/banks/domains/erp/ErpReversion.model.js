@@ -51,7 +51,11 @@ const erpReversionSchema = new mongoose.Schema({
     efectoLealtad: {
       type: new mongoose.Schema({
         idAbono:          { type: String, required: true },
-        cardId:           { type: Number, required: true },
+        // String, no Number: LoyaltyCard.id es UUID desde el 2026-10-29 (migración Postgres,
+        // ver shared/models/postgres/LoyaltyCard.js) — este campo quedó desactualizado y
+        // reventaba con ValidationError (Cast to Number failed) en cualquier reversión de un
+        // abono con puntos de Lealtad, abortando el guardado de ErpReversion por completo.
+        cardId:           { type: String, required: true },
         puntosRevertidos: { type: Number, required: true },
       }, { _id: false }),
       default: null,

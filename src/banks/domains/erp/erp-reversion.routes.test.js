@@ -373,14 +373,15 @@ describe('procesarReversionKore — wiring de reversión de puntos de Lealtad (D
     });
     BankMovement.find.mockResolvedValue([mov]);
     ErpReversion.create.mockResolvedValue({ _id: 'rev-loyalty-ok' });
-    revertirPuntosPorAbono.mockResolvedValue({ reverted: true, cardId: 7, puntosRevertidos: '-50.00' });
+    // cardId como UUID (string), no numérico — LoyaltyCard.id es UUID desde el 2026-10-29.
+    revertirPuntosPorAbono.mockResolvedValue({ reverted: true, cardId: 'c3b1a2d4-5e6f-4a1b-8c2d-9f0e1a2b3c4d', puntosRevertidos: '-50.00' });
 
     await procesarReversionKore({
       erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', referencia: '6aee0e1b2ff6fb0001f89db0',
     });
 
     expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({
-      efectoLealtad: { idAbono: '6aee0e1b2ff6fb0001f89db0', cardId: 7, puntosRevertidos: '-50.00' },
+      efectoLealtad: { idAbono: '6aee0e1b2ff6fb0001f89db0', cardId: 'c3b1a2d4-5e6f-4a1b-8c2d-9f0e1a2b3c4d', puntosRevertidos: '-50.00' },
     }));
   });
 

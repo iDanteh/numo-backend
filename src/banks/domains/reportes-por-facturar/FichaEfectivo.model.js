@@ -29,6 +29,8 @@ const montosSchema = new mongoose.Schema({
   bonificacionGlobal:  Number,
   // 2026-11-27: devolución antes de timbrar la global que quedó como saldo a favor (efectivo en caja sin factura).
   saldoFavorDevolucion: Number,
+  // 2026-11-27: todo el efectivo que entró a la caja en el día (con y sin factura, antes de BN y salidas).
+  efectivoCobrado:     Number,
   totalEntregar:       Number,
 }, { _id: false });
 

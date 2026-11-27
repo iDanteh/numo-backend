@@ -156,6 +156,27 @@ test('calcularFicha: devolución antes de timbrar la global → facturado = cobr
   expect(r.detalle.find(d => d.saldoFavorDe === 'I0-351')).toMatchObject({ remision: 'I0-364', factura: 'I0-9', cobro: 'APA-950', importe: 42.87, facturado: 42.87 });
 });
 
+test('calcularFicha: saldo a favor de la devolución aplicado a una remisión que no está en la caja → informativo, no suma', async () => {
+  CFDI.find.mockReturnValue(lean([{ uuid: 'G9', serie: 'I0', folio: '9', fecha: '2026-10-31T18:00:00Z', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP', timbreFiscalDigital: { fechaTimbrado: '2026-11-01T00:00:00Z' } }]));
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ fechaDesde }) => (fechaDesde.startsWith('2026-10-31') ? [
+    { cuentaId: 'a', serieVenta: 'I0', folioVenta: '351', serieFactura: 'I0', folioFactura: '9', cobros: [cobro('CPF', 258.38, [EF(258.38)], { folioOrigen: '3251', fecha: '2026-10-31T15:44:00Z' })] },
+  ] : []));
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  koreRem.infoRemisiones.mockResolvedValue({ info: new Map([['I0|351', { nombreTipoMovimiento: 'CONSIGNACION', abonos: [
+    { fecha: '2026-10-31T15:44:00Z', movimiento: 'CPF-3251', forma: 'EFECTIVO', importe: 258.38, saldoAnterior: 258.38, saldo: 0 },
+    { fecha: '2026-10-31T17:35:00Z', movimiento: 'RET-5283', origen: 'DEV-059736', forma: null, importe: 166.41, saldoAnterior: 0, saldo: -166.41 },
+    { fecha: '2026-10-31T17:41:00Z', movimiento: 'APA-950', forma: 'SALDO A FAVOR', importe: -42.87, saldoAnterior: -166.41, saldo: -123.54 },
+    // Devolución DESPUÉS del timbrado (nota de crédito): no cambia lo facturado.
+    { fecha: '2026-11-01T02:00:00Z', movimiento: 'RET-9999', origen: 'DEV-1', forma: null, importe: 50, saldoAnterior: -123.54, saldo: -173.54 },
+  ] }]]) });
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.totales.cobroOtraSucursal).toBe(91.97);
+  expect(r.totales.saldoFavorDevolucion).toBe(166.41);
+  expect(r.detalle.find(d => d.remision === 'I0-351')).toMatchObject({ importe: 258.38, facturado: 91.97, devolucion: 166.41, saldoFavorPendiente: 166.41 });
+  expect(r.detalle.some(d => d.saldoFavorDe)).toBe(false);
+  expect(r.advertencias.join(' ')).toMatch(/APA-950/);
+});
+
 test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', async () => {
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockRejectedValue(new Error('429'));
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);

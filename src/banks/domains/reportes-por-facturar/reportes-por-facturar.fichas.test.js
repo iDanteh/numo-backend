@@ -317,7 +317,7 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
   test('día del cobro: sin factura (no suma) con la global posterior anotada', async () => {
     erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([cuenta]);
     const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
-    expect(r.totales).toMatchObject({ consignacionFacturada: 0, efectivoPorFacturar: 500, totalEntregar: 0 });
+    expect(r.totales).toMatchObject({ consignacionFacturada: 0, efectivoPorFacturar: 500, totalEntregar: 0, efectivoCobrado: 500 });
     expect(r.detalle[0]).toMatchObject({ concepto: 'efectivoPorFacturar', factura: null, facturaPosterior: 'C0-G2', facturaPosteriorDia: '2026-11-01', saldoDespues: 0 });
   });
 
@@ -327,7 +327,7 @@ describe('cobro sin factura que ampara una global de un día posterior', () => {
     const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-11-01', fechaFin: '2026-11-01' });
     expect(erp.obtenerDesglosesCobroPorFactura).toHaveBeenCalledWith(expect.objectContaining({ serieFactura: 'C0', folioFactura: 'G2' }));
     // Suma lo facturado (cobrado − BN de la global); la BN queda como informativo.
-    expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400 });
+    expect(r.totales).toMatchObject({ consignacionFacturada: 400, bonificacionGlobal: 100, efectivoPorFacturar: 0, totalEntregar: 400, efectivoCobrado: 0 });
     expect(r.detalle[0]).toMatchObject({ dia: '2026-11-01', concepto: 'consignacionFacturada', factura: 'C0-G2', cobradoEl: '2026-10-31', importe: 500, facturado: 400 });
   });
 });

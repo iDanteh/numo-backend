@@ -251,7 +251,18 @@ function _trocearRango(fechaDesdeIso, fechaHastaIso) {
   return bloques;
 }
 
+// Barrido de entradas vencidas (2026-11-27): antes solo se borraba una entrada al volver a
+// pedir la MISMA clave, así que las de otros días / rangos se quedaban en memoria para
+// siempre (la ficha de efectivo pide 15 días de la caja: ~1.3 MB por consulta de CEDIS).
+const _ultimoBarrido = new WeakMap();
+function _barrerVencidas(cache, ahora = Date.now()) {
+  if (ahora - (_ultimoBarrido.get(cache) ?? 0) < 60 * 1000) return;
+  _ultimoBarrido.set(cache, ahora);
+  for (const [k, e] of cache) if (ahora - e.ts >= TTL_CACHE_MS) cache.delete(k);
+}
+
 function _leerCache(cache, clave) {
+  _barrerVencidas(cache);
   const entry = cache.get(clave);
   if (!entry) return undefined;
   if (Date.now() - entry.ts >= TTL_CACHE_MS) { cache.delete(clave); return undefined; }
@@ -397,6 +408,7 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   if (!centro || !fechaDesde || !fechaHasta) return [];
 
   const clave = `${rfc}::${centro}::${fechaDesde}::${fechaHasta}`;
+  if (sinCache) _barrerVencidas(_cacheAlmacenPorCentro);
   const cacheado = sinCache ? undefined : _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 

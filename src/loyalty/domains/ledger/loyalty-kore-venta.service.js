@@ -78,6 +78,13 @@
  *    `POST /venta`, hasta `MAX_VENTAS_POR_LOTE` ventas por request, procesadas en serie, cada una
  *    independiente (una que falla no aborta las demás) — cada "venta" del lote trae su propio
  *    `abonos[]` con el contrato nuevo, ver su propio docstring más abajo.
+ *  - Saldo negativo en canje (2026-11-20, PROVISIONAL, pedido explícito del usuario): por default
+ *    un canje que supera el saldo disponible sigue bloqueando el abono (400), exactamente igual
+ *    que siempre. Si `PERMITIR_SALDO_NEGATIVO_CANJE` (ver loyalty-config.service.js) está activo,
+ *    el abono se aplica igual (saldo resultante negativo) con un campo `advertencia` en la
+ *    respuesta de ESE abono — reemplaza el CHECK de Postgres `loyalty_cards_saldo_no_negativo`
+ *    (D4, eliminado a propósito), el control pasa a ser 100% de esta capa. Fuera de alcance:
+ *    `loyalty-ledger.service.js` (canje/ajuste manual de staff) sigue bloqueando siempre.
  */
 
 const { Transaction, Op } = require('sequelize');
@@ -90,6 +97,7 @@ const { toCents, fromCents, calcularPuntos, normalizarTelefono } = require('../.
 const configService = require('../config/loyalty-config.service');
 const { _resolverCentroCostoPorSerieFolio, _obtenerCentroCosto, _aplicarMovimiento } = require('./loyalty-ledger.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
+const { findByAuth0Sub } = require('../../../banks/domains/users/user.service');
 const { logger } = require('../../../shared/utils/logger');
 const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 
@@ -106,9 +114,10 @@ const REINTENTOS_DELAYS_MS = [500, 1500]; // 3 intentos en total (1 + 2 reintent
 const _sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // `usuarioAplicaNombre` desapareció del contrato (2026-11-06) — el ledger sigue queriendo un
-// `usuarioNombre` legible para el detalle de movimientos, así que se usa un valor fijo descriptivo,
-// mismo criterio que `ACTOR_WEBHOOK` en loyalty-kore-cliente.service.js. `usuarioId` SÍ sigue
-// viniendo real (`abono.usuarioAplicaId`).
+// `usuarioNombre` legible para el detalle de movimientos. Mientras no se pueda resolver el sub real
+// (ver `_resolverUsuarioNombre` abajo), se usa este valor fijo descriptivo como fallback, mismo
+// criterio que `ACTOR_WEBHOOK` en loyalty-kore-cliente.service.js. `usuarioId` SÍ sigue viniendo real
+// (`abono.usuarioAplicaId`).
 const USUARIO_NOMBRE_WEBHOOK = 'Kore (webhook venta)';
 
 function _refAcumulacion(serieFolio, idAbono) { return `${serieFolio}:${idAbono}:ACUMULACION`; }
@@ -307,6 +316,30 @@ function _respuestaIdempotenteAbono(idAbono, filas) {
 }
 
 /**
+ * Resuelve `abono.usuarioAplicaId` a un nombre real de SOLO LECTURA, mediante `findByAuth0Sub`
+ * (nunca crea un usuario — a diferencia de `resolveUser`/`findOrCreate` del flujo manual, acá el sub
+ * puede no tener ningún usuario real registrado en Numo). El adaptador interno de Solicitudes de
+ * Cobro manda en este mismo campo un `_id` de Mongo en vez de un sub de Auth0 (ver
+ * collection-request.service.js) — `findByAuth0Sub` simplemente no encuentra nada para ese formato y
+ * cae al fallback, sin romper nada. Cacheado en `estado` (compartido entre TODOS los abonos del
+ * mismo request): varios abonos de la misma CxC suelen compartir el mismo cajero.
+ */
+async function _resolverUsuarioNombre(usuarioAplicaId, estado) {
+  estado.usuariosResueltos = estado.usuariosResueltos || {};
+  if (usuarioAplicaId in estado.usuariosResueltos) return estado.usuariosResueltos[usuarioAplicaId];
+
+  let nombre = USUARIO_NOMBRE_WEBHOOK;
+  try {
+    const user = await findByAuth0Sub(usuarioAplicaId);
+    if (user?.nombre) nombre = user.nombre;
+  } catch (err) {
+    logger.warn(`[loyalty-kore-venta] No se pudo resolver usuarioAplicaId "${usuarioAplicaId}" a nombre: ${err.message}`);
+  }
+  estado.usuariosResueltos[usuarioAplicaId] = nombre;
+  return nombre;
+}
+
+/**
  * Aplica UN abono nuevo (nunca antes visto) dentro de su propio savepoint (`t` ya es la transacción
  * del savepoint, no la del request completo — ver el caller). Puede lanzar `BadRequestError` (tarjeta
  * inactiva, saldo insuficiente) o `SequelizeUniqueConstraintError` (carrera) — ambos los maneja el
@@ -315,6 +348,8 @@ function _respuestaIdempotenteAbono(idAbono, filas) {
 async function _procesarUnAbonoNuevo({
   t, card, datos, abono, estado, centroCosto, participaLealtad, concepto, pctNivelInfo, promoVigente,
 }) {
+  const usuarioNombre = await _resolverUsuarioNombre(abono.usuarioAplicaId, estado);
+
   // ── Canje: gate independiente, se resuelve ANTES que la acumulación ──────
   let formaPuntosLinea = null;
   const formasResueltas = [];
@@ -378,11 +413,26 @@ async function _procesarUnAbonoNuevo({
     puntosPromoCents = promoVigente ? calcularPuntos(montoBaseCalculoCents, Number(promoVigente.porcentajeBono)) : 0;
   }
 
+  // Saldo negativo en canje (2026-11-20, PROVISIONAL, pedido explícito del usuario): por default
+  // (PERMITIR_SALDO_NEGATIVO_CANJE:false) se sigue bloqueando exactamente igual que siempre, mismo
+  // BadRequestError/mensaje. Si está activo, el abono se deja aplicar igual (saldo resultante
+  // negativo) con una advertencia — nunca cambia el gate de "tarjeta inactiva" arriba.
+  let advertenciaSaldoNegativo = null;
   if (puntosDescontadosCents > 0) {
     if (!card.activa) throw new BadRequestError(`La tarjeta está inactiva, no se puede descontar puntos (abono "${abono.idAbono}").`);
     const saldoActualCents = toCents(card.saldoPuntos);
     if (puntosDescontadosCents > saldoActualCents) {
-      throw new BadRequestError(`El monto de puntos a usar supera el saldo disponible del cliente (abono "${abono.idAbono}").`);
+      const permitirSaldoNegativo = await configService.obtenerPermitirSaldoNegativoCanje();
+      if (!permitirSaldoNegativo) {
+        throw new BadRequestError(`El monto de puntos a usar supera el saldo disponible del cliente (abono "${abono.idAbono}").`);
+      }
+      const saldoResultanteCents = saldoActualCents - puntosDescontadosCents;
+      logger.warn(
+        `[loyalty-kore-venta] Saldo de puntos quedará negativo (PERMITIR_SALDO_NEGATIVO_CANJE activo): `
+        + `tarjeta=${card.id} abono="${abono.idAbono}" saldoAnterior=${fromCents(saldoActualCents)} `
+        + `puntosADescontar=${fromCents(puntosDescontadosCents)} saldoResultante=${fromCents(saldoResultanteCents)}`,
+      );
+      advertenciaSaldoNegativo = 'El saldo de puntos quedó negativo.';
     }
   }
   if ((puntosNivelCents > 0 || puntosPromoCents > 0) && !card.activa) {
@@ -401,7 +451,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refCanje(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 
@@ -420,7 +470,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refAcumulacion(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 
@@ -440,7 +490,7 @@ async function _procesarUnAbonoNuevo({
       origen: ORIGEN_KORE,
       referenciaExterna: _refPromocion(datos.serieFolio, abono.idAbono),
       usuarioId: abono.usuarioAplicaId,
-      usuarioNombre: USUARIO_NOMBRE_WEBHOOK,
+      usuarioNombre,
     });
   }
 
@@ -454,6 +504,10 @@ async function _procesarUnAbonoNuevo({
     status: huboMovimiento ? 'aplicado' : 'no_califica',
     puntosDescontados: entryCanje ? Math.abs(Number(entryCanje.puntos)) : 0,
     puntosAcumulados,
+    // Solo presente cuando PERMITIR_SALDO_NEGATIVO_CANJE dejó pasar un descuento que superaba el
+    // saldo disponible (ver arriba) — nunca cambia el shape general de la respuesta para el resto
+    // de los abonos.
+    ...(advertenciaSaldoNegativo ? { advertencia: advertenciaSaldoNegativo } : {}),
   };
 }
 

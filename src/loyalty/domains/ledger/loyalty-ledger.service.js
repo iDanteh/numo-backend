@@ -595,7 +595,7 @@ async function listarNiveles(cardId) {
  */
 async function listarMovimientosGlobal(filtros = {}) {
   const {
-    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax, telefono,
   } = filtros;
 
   const where = {};
@@ -636,19 +636,43 @@ async function listarMovimientosGlobal(filtros = {}) {
     where.puntos = { ...(where.puntos ?? {}), [Op.lte]: Number(puntosMax) };
   }
 
+  // Filtro por teléfono de la tarjeta del CLIENTE (2026-11-20, pedido explícito del usuario) —
+  // distinto de `usuarioNombre` arriba (ese es el OPERADOR/staff que registró el movimiento). El
+  // include de `card` NO lleva `where` cuando no hay filtro: agregar un `where` vacío convertiría
+  // el join en `required: true` por default de Sequelize, cambiando el comportamiento sin filtro
+  // (hoy el include es opcional). Mismo criterio que la búsqueda de tarjetas en
+  // loyalty-card.service.js#listar (`telefono: { [Op.like]: 'prefijo%' }`) — prefijo, no substring
+  // (a diferencia de `nombre`/`usuarioNombre`, que usan Op.iLike de substring).
+  // Trim ANTES de checar truthiness (fix 2026-11-20): un valor solo-espacios (ej. ' ') es truthy
+  // crudo pero recorta a '' — sin este orden, cardInclude.where quedaba seteado con un LIKE '%'
+  // que no filtra nada pero SÍ fuerza required:true en el include (el mismo problema que el
+  // comentario de arriba evita para el caso sin telefono en absoluto).
+  const telefonoTrim = String(telefono ?? '').trim();
+  const cardInclude = { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] };
+  if (telefonoTrim) {
+    cardInclude.where = { telefono: { [Op.like]: `${telefonoTrim}%` } };
+  }
+
   return LoyaltyPointsLedger.findAll({
     where,
     include: [
-      { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
+      cardInclude,
       { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
       // Discrepancia con el enunciado: CentroCosto NO tiene columna `nombre` (ver
       // shared/models/postgres/CentroCosto.js) — el nombre de la sucursal vive en `sucursal`.
       // `attributes: ['nombre']` tal cual rompería contra Postgres real (columna inexistente);
       // se trae la columna real `sucursal` pero se alias-ea como `nombre` en el resultado para
       // no romper el contrato de API ya acordado con el frontend (`centroCosto.nombre`).
-      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+      // `serieFacturacion` (2026-11-20, pedido explícito del usuario): código del centro tal cual
+      // lo usa Kore (A0, B0, etc.) — para el reporte "Movimientos por centro", que agrupa por este
+      // código en vez de por el nombre de sucursal.
+      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre'], 'serieFacturacion'] },
     ],
-    order: [['createdAt', 'DESC']],
+    // Tiebreaker `id` ASC (2026-11-20): `createdAt` solo no es determinista entre dos filas con el
+    // mismo timestamp — el reporte "Movimientos por centro" asigna color a cada centro en el orden
+    // de PRIMERA aparición de estas filas, así que sin este segundo criterio el orden (y por tanto
+    // el color asignado a cada centro) podía variar entre dos exportaciones de los mismos datos.
+    order: [['createdAt', 'DESC'], ['id', 'ASC']],
   });
 }
 

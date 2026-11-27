@@ -142,6 +142,14 @@ const config = Object.freeze({
     urlPanel:     process.env.KIOSCO_ADMIN_URL?.trim().replace(/\/+$/, '') || null,
   }),
 
+  /** Redis — pub/sub cross-worker de Socket.IO + store compartido de rate limiters
+   *  (consultoría de desempeño 2026-11-11: cluster nativo + Redis). Sin valor
+   *  requerido — default a localhost para que el dev local sin Redis levantado
+   *  no rompa nada que no lo necesite todavía. */
+  redis: Object.freeze({
+    url: process.env.REDIS_URL || 'redis://localhost:6379',
+  }),
+
 });
 
 module.exports = config;

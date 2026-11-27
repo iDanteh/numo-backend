@@ -45,16 +45,21 @@ jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   listarNiveles: jest.fn(),
   listarMovimientosGlobal: jest.fn(),
 }));
-jest.mock('./jobs/congelamiento-puntos.service', () => ({
-  tarjetasPorVencer: jest.fn(),
-}));
 jest.mock('./domains/config/loyalty-config.service', () => ({
   obtenerPorcentajes: jest.fn(),
   guardarPorcentajes: jest.fn(),
-  obtenerCongelamientoMeses: jest.fn(),
-  guardarCongelamientoMeses: jest.fn(),
   obtenerConsultaCodigoMaxMes: jest.fn(),
   guardarConsultaCodigoMaxMes: jest.fn(),
+  obtenerSesionConsultaUsosMax: jest.fn(),
+  guardarSesionConsultaUsosMax: jest.fn(),
+  obtenerPermitirSaldoNegativoCanje: jest.fn(),
+  guardarPermitirSaldoNegativoCanje: jest.fn(),
+  obtenerOtpEnvioModo: jest.fn(),
+  guardarOtpEnvioModo: jest.fn(),
+  obtenerOtpEnvioProveedor: jest.fn(),
+  guardarOtpEnvioProveedor: jest.fn(),
+  obtenerOtpWhatsappConfig: jest.fn(),
+  guardarOtpWhatsappConfig: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -77,6 +82,9 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   sincronizarNivelesKore: jest.fn(),
   actualizarNivelKore: jest.fn(),
 }));
+jest.mock('./domains/security/loyalty-security-event.service', () => ({
+  listarEventosSeguridad: jest.fn(),
+}));
 
 const express = require('express');
 const request = require('supertest');
@@ -85,7 +93,7 @@ const cardService = require('./domains/cards/loyalty-card.service');
 const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
-const congelamientoService = require('./jobs/congelamiento-puntos.service');
+const securityEventService = require('./domains/security/loyalty-security-event.service');
 const { PERMISSIONS } = require('../shared/config/rbac');
 
 function perms(...list) {
@@ -99,6 +107,15 @@ beforeEach(() => {
   // mockeadas (que solo hacen res.json(await ...), inofensivo con undefined), GET /cards/:id/foto
   // desestructura { data, mimetype } del resultado.
   cardService.obtenerFoto.mockResolvedValue({ data: Buffer.from('img'), mimetype: 'image/png' });
+  // Default sano para la matriz de permisos genérica de abajo — a diferencia del resto de mocks
+  // de configService (inofensivos con undefined, solo se envuelven en res.json), las rutas de
+  // GET/PUT /config/otp-whatsapp desestructuran campos del resultado para enmascarar los secretos.
+  const otpWhatsappDefault = {
+    phoneNumberId: null, wabaId: null, token: null, appSecret: null,
+    templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+  };
+  configService.obtenerOtpWhatsappConfig.mockResolvedValue(otpWhatsappDefault);
+  configService.guardarOtpWhatsappConfig.mockResolvedValue(otpWhatsappDefault);
   app = express();
   app.use(express.json());
   app.use('/', router);
@@ -109,7 +126,6 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
   const casos = [
     { metodo: 'get',   ruta: '/cards',                    permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/pendientes-revision-kore', permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'get',   ruta: '/cards/por-vencer',          permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/cards/1/marcar-revisada',  permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
     { metodo: 'post',  ruta: '/cards',                     permiso: PERMISSIONS.LOYALTY_TARJETAS_CREAR, body: { telefono: '5512345678', nombre: 'Ana' } },
     { metodo: 'get',   ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_READ },
@@ -126,10 +142,18 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'post',  ruta: '/cards/1/ajustes',            permiso: PERMISSIONS.LOYALTY_AJUSTES, body: { puntos: 10, reasonId: 1, justificacion: 'bono' } },
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
-    { metodo: 'get',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
     { metodo: 'get',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 1 } },
+    { metodo: 'get',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/sesion-consulta-usos-max', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 3 } },
+    { metodo: 'get',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/permitir-saldo-negativo-canje', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { habilitado: true } },
+    { metodo: 'get',   ruta: '/config/otp-envio-modo',       permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-envio-modo',       permiso: PERMISSIONS.LOYALTY_CONFIG, body: { modo: 'simulado' } },
+    { metodo: 'get',   ruta: '/config/otp-envio-proveedor',  permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-envio-proveedor',  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { proveedor: 'whatsapp' } },
+    { metodo: 'get',   ruta: '/config/otp-whatsapp',         permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/otp-whatsapp',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { phoneNumberId: '123' } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -151,6 +175,7 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config/niveles-kore',           permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/config/niveles-kore/sync',      permiso: PERMISSIONS.LOYALTY_CONFIG },
     { metodo: 'patch', ruta: '/config/niveles-kore/1',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esInicial: true } },
+    { metodo: 'get',   ruta: '/auditoria/eventos-seguridad',   permiso: PERMISSIONS.LOYALTY_AUDITORIA },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -251,26 +276,6 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(cardAuditService.listarHistorialCambios).toHaveBeenCalledWith('42');
   });
 
-  // Reporte "Puntos por vencer" (2026-11-03).
-  test('GET /cards/por-vencer pasa `dias` como diasVentana y responde { tarjetas }', async () => {
-    congelamientoService.tarjetasPorVencer.mockResolvedValue([{ id: 1 }]);
-
-    const res = await request(app).get('/cards/por-vencer?dias=15').set(perms(PERMISSIONS.LOYALTY_READ));
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ tarjetas: [{ id: 1 }] });
-    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({ diasVentana: 15 });
-  });
-
-  test('GET /cards/por-vencer sin `dias` deja que el servicio aplique su propio default', async () => {
-    congelamientoService.tarjetasPorVencer.mockResolvedValue([]);
-
-    const res = await request(app).get('/cards/por-vencer').set(perms(PERMISSIONS.LOYALTY_READ));
-
-    expect(res.status).toBe(200);
-    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({});
-  });
-
   // Reporte "Movimientos" (2026-10-29).
   test('GET /ledger/export pasa los filtros de query a listarMovimientosGlobal y responde { movimientos }', async () => {
     ledgerService.listarMovimientosGlobal.mockResolvedValue([{ id: 1 }, { id: 2 }]);
@@ -287,6 +292,19 @@ describe('wiring hacia los servicios (happy path)', () => {
       nivelAplicado: 'Oro', origen: 'kore', reasonId: '7', usuarioNombre: 'Ana',
       puntosMin: '-50', puntosMax: '100',
     });
+  });
+
+  // Filtro "Teléfono/tarjeta" (2026-11-20) — pasa el query param al servicio igual que el resto.
+  test('GET /ledger/export pasa telefono a listarMovimientosGlobal', async () => {
+    ledgerService.listarMovimientosGlobal.mockResolvedValue([]);
+
+    const res = await request(app).get('/ledger/export?telefono=5551234567')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(ledgerService.listarMovimientosGlobal).toHaveBeenCalledWith(
+      expect.objectContaining({ telefono: '5551234567' }),
+    );
   });
 
   // Reporte "Tarjetas" (2026-10-29).
@@ -342,24 +360,6 @@ describe('wiring hacia los servicios (happy path)', () => {
     );
   });
 
-  test('GET /config/congelamiento llama a obtenerCongelamientoMeses', async () => {
-    configService.obtenerCongelamientoMeses.mockResolvedValue(6);
-    const res = await request(app).get('/config/congelamiento').set(perms(PERMISSIONS.LOYALTY_READ));
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ meses: 6 });
-    expect(configService.obtenerCongelamientoMeses).toHaveBeenCalled();
-  });
-
-  test('PUT /config/congelamiento llama a guardarCongelamientoMeses con meses y el usuario', async () => {
-    configService.guardarCongelamientoMeses.mockResolvedValue(6);
-    const res = await request(app).put('/config/congelamiento')
-      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
-      .send({ meses: 6 });
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ meses: 6 });
-    expect(configService.guardarCongelamientoMeses).toHaveBeenCalledWith(6, expect.objectContaining({ dbId: '1' }));
-  });
-
   test('GET /config/consulta-codigo-max-mes llama a obtenerConsultaCodigoMaxMes', async () => {
     configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(1);
     const res = await request(app).get('/config/consulta-codigo-max-mes').set(perms(PERMISSIONS.LOYALTY_READ));
@@ -376,6 +376,155 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ max: 1 });
     expect(configService.guardarConsultaCodigoMaxMes).toHaveBeenCalledWith(1, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/sesion-consulta-usos-max llama a obtenerSesionConsultaUsosMax', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
+    const res = await request(app).get('/config/sesion-consulta-usos-max').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 3 });
+    expect(configService.obtenerSesionConsultaUsosMax).toHaveBeenCalled();
+  });
+
+  test('PUT /config/sesion-consulta-usos-max llama a guardarSesionConsultaUsosMax con max y el usuario', async () => {
+    configService.guardarSesionConsultaUsosMax.mockResolvedValue(0);
+    const res = await request(app).put('/config/sesion-consulta-usos-max')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ max: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 0 });
+    expect(configService.guardarSesionConsultaUsosMax).toHaveBeenCalledWith(0, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/permitir-saldo-negativo-canje llama a obtenerPermitirSaldoNegativoCanje', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
+    const res = await request(app).get('/config/permitir-saldo-negativo-canje').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ habilitado: false });
+    expect(configService.obtenerPermitirSaldoNegativoCanje).toHaveBeenCalled();
+  });
+
+  test('PUT /config/permitir-saldo-negativo-canje llama a guardarPermitirSaldoNegativoCanje con habilitado y el usuario', async () => {
+    configService.guardarPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    const res = await request(app).put('/config/permitir-saldo-negativo-canje')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ habilitado: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ habilitado: true });
+    expect(configService.guardarPermitirSaldoNegativoCanje).toHaveBeenCalledWith(true, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-envio-modo llama a obtenerOtpEnvioModo', async () => {
+    configService.obtenerOtpEnvioModo.mockResolvedValue('simulado');
+    const res = await request(app).get('/config/otp-envio-modo').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ modo: 'simulado' });
+    expect(configService.obtenerOtpEnvioModo).toHaveBeenCalled();
+  });
+
+  test('PUT /config/otp-envio-modo llama a guardarOtpEnvioModo con modo y el usuario', async () => {
+    configService.guardarOtpEnvioModo.mockResolvedValue('real');
+    const res = await request(app).put('/config/otp-envio-modo')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ modo: 'real' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ modo: 'real' });
+    expect(configService.guardarOtpEnvioModo).toHaveBeenCalledWith('real', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('PUT /config/otp-envio-modo propaga el BadRequestError de un modo inválido', async () => {
+    const { BadRequestError } = require('../shared/errors/AppError');
+    configService.guardarOtpEnvioModo.mockRejectedValue(new BadRequestError('El modo de envío de código debe ser uno de: simulado, real.'));
+    const res = await request(app).put('/config/otp-envio-modo')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ modo: 'telepatia' });
+    expect(res.status).toBe(400);
+    expect(configService.guardarOtpEnvioModo).toHaveBeenCalledWith('telepatia', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-envio-proveedor llama a obtenerOtpEnvioProveedor', async () => {
+    configService.obtenerOtpEnvioProveedor.mockResolvedValue('whatsapp');
+    const res = await request(app).get('/config/otp-envio-proveedor').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ proveedor: 'whatsapp' });
+    expect(configService.obtenerOtpEnvioProveedor).toHaveBeenCalled();
+  });
+
+  test('PUT /config/otp-envio-proveedor llama a guardarOtpEnvioProveedor con proveedor y el usuario', async () => {
+    configService.guardarOtpEnvioProveedor.mockResolvedValue('otro-proveedor');
+    const res = await request(app).put('/config/otp-envio-proveedor')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ proveedor: 'otro-proveedor' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ proveedor: 'otro-proveedor' });
+    expect(configService.guardarOtpEnvioProveedor).toHaveBeenCalledWith('otro-proveedor', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/otp-whatsapp llama a obtenerOtpWhatsappConfig y enmascara token/appSecret', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: '999', token: 'token-real-super-secreto',
+      appSecret: 'app-secret-real', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      phoneNumberId: '1234567890', wabaId: '999', token: '••••••••',
+      appSecret: '••••••••', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    expect(configService.obtenerOtpWhatsappConfig).toHaveBeenCalled();
+  });
+
+  test('GET /config/otp-whatsapp nunca filtra el valor real de token/appSecret en el response', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: '999', token: 'token-real-super-secreto',
+      appSecret: 'app-secret-real', templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    const crudo = JSON.stringify(res.body);
+    expect(crudo).not.toContain('token-real-super-secreto');
+    expect(crudo).not.toContain('app-secret-real');
+  });
+
+  test('GET /config/otp-whatsapp devuelve null (no enmascarado) para token/appSecret aún no configurados', async () => {
+    configService.obtenerOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: null, wabaId: null, token: null, appSecret: null,
+      templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).get('/config/otp-whatsapp').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeNull();
+    expect(res.body.appSecret).toBeNull();
+  });
+
+  test('PUT /config/otp-whatsapp llama a guardarOtpWhatsappConfig con el payload y el usuario, y enmascara la respuesta', async () => {
+    configService.guardarOtpWhatsappConfig.mockResolvedValue({
+      phoneNumberId: '1234567890', wabaId: null, token: 'token-nuevo',
+      appSecret: null, templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    const res = await request(app).put('/config/otp-whatsapp')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ phoneNumberId: '1234567890', token: 'token-nuevo' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      phoneNumberId: '1234567890', wabaId: null, token: '••••••••',
+      appSecret: null, templateNombre: 'verificacion_codigo', templateIdioma: 'es_MX',
+    });
+    expect(configService.guardarOtpWhatsappConfig).toHaveBeenCalledWith(
+      {
+        phoneNumberId: '1234567890', wabaId: undefined, token: 'token-nuevo',
+        appSecret: undefined, templateNombre: undefined, templateIdioma: undefined,
+      },
+      expect.objectContaining({ dbId: '1' }),
+    );
+  });
+
+  test('PUT /config/otp-envio-proveedor propaga el BadRequestError de un proveedor vacío', async () => {
+    const { BadRequestError } = require('../shared/errors/AppError');
+    configService.guardarOtpEnvioProveedor.mockRejectedValue(new BadRequestError('proveedor es requerido.'));
+    const res = await request(app).put('/config/otp-envio-proveedor')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ proveedor: '' });
+    expect(res.status).toBe(400);
   });
 
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {
@@ -642,5 +791,34 @@ describe('PATCH /cards/:id/marcar-revisada', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ id: 42, revisionPendiente: false });
     expect(cardService.marcarRevisada).toHaveBeenCalledWith('42', expect.objectContaining({ dbId: '1' }));
+  });
+});
+
+describe('GET /auditoria/eventos-seguridad (2026-11-13, pedido explícito del usuario)', () => {
+  test('exige loyalty:auditoria, no loyalty:config ni loyalty:read', async () => {
+    securityEventService.listarEventosSeguridad.mockResolvedValue({ total: 0, eventos: [] });
+
+    const sinPermiso = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(sinPermiso.status).toBe(403);
+
+    const conConfigNoAlcanza = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(conConfigNoAlcanza.status).toBe(403);
+
+    const res = await request(app).get('/auditoria/eventos-seguridad').set(perms(PERMISSIONS.LOYALTY_AUDITORIA));
+    expect(res.status).toBe(200);
+  });
+
+  test('pasa los filtros de querystring tal cual al service', async () => {
+    securityEventService.listarEventosSeguridad.mockResolvedValue({ total: 2, eventos: [{ id: 1 }, { id: 2 }] });
+
+    const res = await request(app).get('/auditoria/eventos-seguridad')
+      .query({ telefono: '5512345678', tipo: 'solicitud_codigo_canje', resultado: 'fallo', limit: '10' })
+      .set(perms(PERMISSIONS.LOYALTY_AUDITORIA));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ total: 2, eventos: [{ id: 1 }, { id: 2 }] });
+    expect(securityEventService.listarEventosSeguridad).toHaveBeenCalledWith(expect.objectContaining({
+      telefono: '5512345678', tipo: 'solicitud_codigo_canje', resultado: 'fallo', limit: '10',
+    }));
   });
 });

@@ -119,51 +119,6 @@ describe('obtenerPorcentajes', () => {
   });
 });
 
-describe('obtenerCongelamientoMeses / guardarCongelamientoMeses (Congelamiento de puntos, 2026-11-03)', () => {
-  test('obtenerCongelamientoMeses devuelve null cuando getValue tira (no configurado, D11)', async () => {
-    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
-    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CONGELAMIENTO_MESES');
-  });
-
-  test('obtenerCongelamientoMeses devuelve null cuando el valor guardado es "0" (deshabilitado explícito)', async () => {
-    globalConfigService.getValue.mockResolvedValue('0');
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
-  });
-
-  test('obtenerCongelamientoMeses devuelve el entero configurado', async () => {
-    globalConfigService.getValue.mockResolvedValue('6');
-    await expect(configService.obtenerCongelamientoMeses()).resolves.toBe(6);
-  });
-
-  test('guardarCongelamientoMeses(6) llama a setValue con tipo:"numero" y devuelve 6', async () => {
-    const resultado = await configService.guardarCongelamientoMeses(6, USER);
-    expect(globalConfigService.setValue).toHaveBeenCalledWith(
-      'lealtad', 'CONGELAMIENTO_MESES', '6',
-      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
-    );
-    expect(resultado).toBe(6);
-  });
-
-  test.each([null, undefined, 0])('guardarCongelamientoMeses(%p) deshabilita: persiste "0" y devuelve null', async (valor) => {
-    const resultado = await configService.guardarCongelamientoMeses(valor, USER);
-    expect(globalConfigService.setValue).toHaveBeenCalledWith(
-      'lealtad', 'CONGELAMIENTO_MESES', '0', expect.objectContaining({ tipo: 'numero' }),
-    );
-    expect(resultado).toBeNull();
-  });
-
-  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
-    'guardarCongelamientoMeses(%p) inválido (%s) → 400, no llama a setValue',
-    async (valor) => {
-      await expect(
-        configService.guardarCongelamientoMeses(valor, USER),
-      ).rejects.toMatchObject({ statusCode: 400 });
-      expect(globalConfigService.setValue).not.toHaveBeenCalled();
-    },
-  );
-});
-
 describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite mensual de consultas con código, 2026-11-09)', () => {
   test('obtenerConsultaCodigoMaxMes devuelve null cuando getValue tira (no configurado, D11)', async () => {
     globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
@@ -207,6 +162,298 @@ describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite men
       expect(globalConfigService.setValue).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('obtenerSesionConsultaUsosMax / guardarSesionConsultaUsosMax (límite de consultas SIN código, 2026-11-20)', () => {
+  test('obtenerSesionConsultaUsosMax devuelve el default (3) cuando getValue tira (nunca configurado)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(3);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'SESION_CONSULTA_USOS_MAX');
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve 0 cuando el valor guardado es "0" (deshabilitado de verdad, NO default)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(0);
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('5');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(5);
+  });
+
+  test('obtenerSesionConsultaUsosMax devuelve el default si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('abc');
+    await expect(configService.obtenerSesionConsultaUsosMax()).resolves.toBe(3);
+  });
+
+  test('guardarSesionConsultaUsosMax(5) llama a setValue con tipo:"numero" y devuelve 5', async () => {
+    const resultado = await configService.guardarSesionConsultaUsosMax(5, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'SESION_CONSULTA_USOS_MAX', '5',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(5);
+  });
+
+  test('guardarSesionConsultaUsosMax(0) persiste "0" y devuelve 0 (deshabilitado de verdad, no se normaliza a null)', async () => {
+    const resultado = await configService.guardarSesionConsultaUsosMax(0, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'SESION_CONSULTA_USOS_MAX', '0', expect.objectContaining({ tipo: 'numero' }),
+    );
+    expect(resultado).toBe(0);
+  });
+
+  test.each([null, undefined, ''])(
+    'guardarSesionConsultaUsosMax(%p) inválido (a diferencia de CONGELAMIENTO_MESES, acá vacío no deshabilita) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarSesionConsultaUsosMax(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
+    'guardarSesionConsultaUsosMax(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarSesionConsultaUsosMax(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerCanjeCodigoVigenciaMin / guardarCanjeCodigoVigenciaMin (código de autorización de canje, 2026-11-13)', () => {
+  test('obtenerCanjeCodigoVigenciaMin devuelve el default (5) cuando getValue tira (a diferencia de D11, acá sí hace falta un default usable)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(5);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CANJE_CODIGO_VIGENCIA_MIN');
+  });
+
+  test('obtenerCanjeCodigoVigenciaMin devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('10');
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(10);
+  });
+
+  test('obtenerCanjeCodigoVigenciaMin devuelve el default si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerCanjeCodigoVigenciaMin()).resolves.toBe(5);
+  });
+
+  test('guardarCanjeCodigoVigenciaMin(10) llama a setValue con tipo:"numero" y devuelve 10', async () => {
+    const resultado = await configService.guardarCanjeCodigoVigenciaMin(10, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CANJE_CODIGO_VIGENCIA_MIN', '10',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(10);
+  });
+
+  test.each([[0, 'cero'], [-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico'], [null, 'null'], [undefined, 'undefined']])(
+    'guardarCanjeCodigoVigenciaMin(%p) inválido (%s) → 400, no llama a setValue (no admite deshabilitar, a diferencia de CONGELAMIENTO_MESES)',
+    async (valor) => {
+      await expect(
+        configService.guardarCanjeCodigoVigenciaMin(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerPermitirSaldoNegativoCanje / guardarPermitirSaldoNegativoCanje (saldo negativo en canje, 2026-11-20, PROVISIONAL)', () => {
+  test('obtenerPermitirSaldoNegativoCanje devuelve false cuando getValue tira (nunca configurado, default bloquea)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(false);
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE');
+  });
+
+  test('obtenerPermitirSaldoNegativoCanje devuelve true cuando el valor guardado es "true"', async () => {
+    globalConfigService.getValue.mockResolvedValue('true');
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(true);
+  });
+
+  test('obtenerPermitirSaldoNegativoCanje devuelve false cuando el valor guardado es "false"', async () => {
+    globalConfigService.getValue.mockResolvedValue('false');
+    await expect(configService.obtenerPermitirSaldoNegativoCanje()).resolves.toBe(false);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje(true) llama a setValue con tipo:"booleano" y devuelve true', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje(true, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'true',
+      expect.objectContaining({ tipo: 'booleano', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(true);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje(false) persiste "false" y devuelve false', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje(false, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'false', expect.objectContaining({ tipo: 'booleano' }),
+    );
+    expect(resultado).toBe(false);
+  });
+
+  test('guardarPermitirSaldoNegativoCanje acepta los strings "true"/"false" (ej. payload HTTP crudo)', async () => {
+    const resultado = await configService.guardarPermitirSaldoNegativoCanje('true', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'PERMITIR_SALDO_NEGATIVO_CANJE', 'true', expect.anything(),
+    );
+    expect(resultado).toBe(true);
+  });
+
+  test.each([[1, 'número'], ['si', 'string no boolean'], [null, 'null'], [undefined, 'undefined']])(
+    'guardarPermitirSaldoNegativoCanje(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarPermitirSaldoNegativoCanje(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerOtpEnvioModo / guardarOtpEnvioModo (envío de código OTP, 2026-11-23)', () => {
+  test('obtenerOtpEnvioModo devuelve "simulado" cuando getValue tira (nunca configurado, default preserva el comportamiento actual)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('simulado');
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_MODO');
+  });
+
+  test('obtenerOtpEnvioModo devuelve "real" cuando está configurado explícitamente', async () => {
+    globalConfigService.getValue.mockResolvedValue('real');
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('real');
+  });
+
+  test('obtenerOtpEnvioModo devuelve el default "simulado" si el valor guardado es inválido (defensivo)', async () => {
+    globalConfigService.getValue.mockResolvedValue('algo-invalido');
+    await expect(configService.obtenerOtpEnvioModo()).resolves.toBe('simulado');
+  });
+
+  test('guardarOtpEnvioModo("real") llama a setValue con tipo:"texto" y devuelve "real"', async () => {
+    const resultado = await configService.guardarOtpEnvioModo('real', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_ENVIO_MODO', 'real',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe('real');
+  });
+
+  test('guardarOtpEnvioModo acepta mayúsculas/espacios ("  REAL  ") normalizando a "real"', async () => {
+    const resultado = await configService.guardarOtpEnvioModo('  REAL  ', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_MODO', 'real', expect.anything());
+    expect(resultado).toBe('real');
+  });
+
+  test.each([['sms'], [''], [null], [undefined]])(
+    'guardarOtpEnvioModo(%p) inválido → 400, no llama a setValue',
+    async (valor) => {
+      await expect(configService.guardarOtpEnvioModo(valor, USER)).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe('obtenerOtpEnvioProveedor / guardarOtpEnvioProveedor', () => {
+  test('obtenerOtpEnvioProveedor devuelve "whatsapp" cuando getValue tira (default, único proveedor real hoy)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerOtpEnvioProveedor()).resolves.toBe('whatsapp');
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'OTP_ENVIO_PROVEEDOR');
+  });
+
+  test('obtenerOtpEnvioProveedor devuelve el valor configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('otro-canal');
+    await expect(configService.obtenerOtpEnvioProveedor()).resolves.toBe('otro-canal');
+  });
+
+  test('guardarOtpEnvioProveedor("whatsapp") llama a setValue con tipo:"texto"', async () => {
+    const resultado = await configService.guardarOtpEnvioProveedor('whatsapp', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_ENVIO_PROVEEDOR', 'whatsapp',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe('whatsapp');
+  });
+
+  test.each([[''], [null], [undefined]])('guardarOtpEnvioProveedor(%p) vacío → 400, no llama a setValue', async (valor) => {
+    await expect(configService.guardarOtpEnvioProveedor(valor, USER)).rejects.toMatchObject({ statusCode: 400 });
+    expect(globalConfigService.setValue).not.toHaveBeenCalled();
+  });
+});
+
+describe('obtenerOtpWhatsappConfig / guardarOtpWhatsappConfig (credenciales WhatsApp Cloud API, 2026-11-23)', () => {
+  test('obtenerOtpWhatsappConfig devuelve todo null/default cuando ninguna clave está configurada (alta en Meta todavía pendiente)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await expect(configService.obtenerOtpWhatsappConfig()).resolves.toEqual({
+      phoneNumberId: null,
+      wabaId: null,
+      token: null,
+      appSecret: null,
+      templateNombre: 'verificacion_codigo',
+      templateIdioma: 'es_MX',
+    });
+  });
+
+  test('obtenerOtpWhatsappConfig lee cada clave de la sección lealtad', async () => {
+    globalConfigService.getValue.mockImplementation(async (section, clave) => {
+      const valores = {
+        OTP_WHATSAPP_PHONE_NUMBER_ID: '1234567890',
+        OTP_WHATSAPP_WABA_ID: 'waba-1',
+        OTP_WHATSAPP_TOKEN: 'tok-real',
+        OTP_WHATSAPP_APP_SECRET: 'secreto-real',
+        OTP_WHATSAPP_TEMPLATE_NOMBRE: 'otra_plantilla',
+        OTP_WHATSAPP_TEMPLATE_IDIOMA: 'es',
+      };
+      if (section !== 'lealtad' || !(clave in valores)) throw new Error(`no mockeada: ${section}.${clave}`);
+      return valores[clave];
+    });
+
+    await expect(configService.obtenerOtpWhatsappConfig()).resolves.toEqual({
+      phoneNumberId: '1234567890',
+      wabaId: 'waba-1',
+      token: 'tok-real',
+      appSecret: 'secreto-real',
+      templateNombre: 'otra_plantilla',
+      templateIdioma: 'es',
+    });
+  });
+
+  test('guardarOtpWhatsappConfig solo escribe las llaves presentes (patch parcial, ej. solo phoneNumberId)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({ phoneNumberId: '1234567890' }, USER);
+
+    expect(globalConfigService.setValue).toHaveBeenCalledTimes(1);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_PHONE_NUMBER_ID', '1234567890',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+  });
+
+  test('guardarOtpWhatsappConfig marca token/appSecret con esSecreto:true (nunca en texto plano en el audit log)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({ token: 'tok-nuevo', appSecret: 'secreto-nuevo' }, USER);
+
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_TOKEN', 'tok-nuevo',
+      expect.objectContaining({ tipo: 'texto', esSecreto: true }),
+    );
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'OTP_WHATSAPP_APP_SECRET', 'secreto-nuevo',
+      expect.objectContaining({ tipo: 'texto', esSecreto: true }),
+    );
+  });
+
+  test('guardarOtpWhatsappConfig({}) no escribe nada (ninguna llave presente)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+
+    await configService.guardarOtpWhatsappConfig({}, USER);
+
+    expect(globalConfigService.setValue).not.toHaveBeenCalled();
+  });
 });
 
 describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
@@ -802,7 +1049,9 @@ describe('actualizarFormaPagoKore', () => {
 // nunca duplicarse.
 
 function makeNivel(overrides = {}) {
-  return { id: 1, koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, esInicial: false, activo: true, update: jest.fn(), ...overrides };
+  return {
+    id: 1, koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, esInicial: false, activo: true, update: jest.fn(), ...overrides,
+  };
 }
 
 describe('sincronizarNivelesKore', () => {
@@ -816,9 +1065,50 @@ describe('sincronizarNivelesKore', () => {
 
     expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: 'n1' } });
     expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
-      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, activo: true, esInicial: false,
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, activo: true, esInicial: false,
     });
     expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('acepta el shape real de Kore (camelCase: id/nombre/porcentajePuntos), no solo PascalCase', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ id: 6, nombre: 'Esmeralda', porcentajePuntos: 3 }]);
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(null); // por koreId
+    LoyaltyKoreNivel.create.mockResolvedValue(makeNivel());
+    LoyaltyKoreNivel.findAll.mockResolvedValue([]);
+
+    const resultado = await configService.sincronizarNivelesKore();
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: '6' } });
+    expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
+      koreId: '6', nombre: 'Esmeralda', porcentaje: 3, color: null, activo: true, esInicial: false,
+    });
+    expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('guarda el color hex real de Kore (camelCase) en cada sync — "último valor gana", igual que nombre/porcentaje', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ id: 1, nombre: 'Oro', porcentajePuntos: 2.5, color: '#E6DF0A' }]);
+    const existente = makeNivel({ color: '#OLDCOLOR' });
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(existente);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarNivelesKore();
+
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: '1', nombre: 'Oro', porcentaje: 2.5, color: '#E6DF0A', activo: true,
+    });
+  });
+
+  test('sin color en el payload de Kore (PascalCase legado): persiste color:null, no lo omite', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 1.5 }]);
+    const existente = makeNivel({ color: '#AAAAAA' });
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(existente);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarNivelesKore();
+
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, color: null, activo: true,
+    });
   });
 
   test('adopta una fila transicional (koreId:null) por nombre en vez de duplicarla, preserva esInicial', async () => {
@@ -832,7 +1122,9 @@ describe('sincronizarNivelesKore', () => {
     const resultado = await configService.sincronizarNivelesKore();
 
     expect(LoyaltyKoreNivel.findOne).toHaveBeenNthCalledWith(2, { where: { koreId: null, nombre: 'Bronce' } });
-    expect(transicional.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce', porcentaje: 2, activo: true });
+    expect(transicional.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 2, color: null, activo: true,
+    });
     expect(LoyaltyKoreNivel.create).not.toHaveBeenCalled();
     expect(resultado.actualizados).toBe(1);
   });
@@ -845,7 +1137,9 @@ describe('sincronizarNivelesKore', () => {
 
     await configService.sincronizarNivelesKore();
 
-    expect(existente.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce Plus', porcentaje: 1.75, activo: true });
+    expect(existente.update).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce Plus', porcentaje: 1.75, color: null, activo: true,
+    });
     expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ esInicial: expect.anything() }));
   });
 

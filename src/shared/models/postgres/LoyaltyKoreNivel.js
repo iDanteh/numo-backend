@@ -53,6 +53,11 @@ const LoyaltyKoreNivel = sequelize.define('LoyaltyKoreNivel', {
     allowNull: true,
     comment:   'Autoritativo de Kore (a diferencia de LoyaltyKoreConcepto/FormaPago) — Numo nunca configura esto manualmente.',
   },
+  color: {
+    type:      DataTypes.STRING(20),
+    allowNull: true,
+    comment:   'Hex de Kore tal cual viene (ej. "#E6DF0A"), sin validar formato. Autoritativo de Kore, mismo criterio que porcentaje.',
+  },
   esInicial: {
     type:         DataTypes.BOOLEAN,
     allowNull:    false,

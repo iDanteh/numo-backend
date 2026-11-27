@@ -611,13 +611,25 @@ describe('construirFilasDesdeCorrecciones', () => {
   test('resuelve nivelSugerido vía Categoria, con default Bronce + info cuando no reconoce', () => {
     const [reconocida, noReconocida] = applyService.construirFilasDesdeCorrecciones([
       corregida({ tarjetaRaw: '2001', categoriaOriginal: 'Plata' }),
-      corregida({ tarjetaRaw: '2002', categoriaOriginal: 'Profesionales' }),
+      corregida({ tarjetaRaw: '2002', categoriaOriginal: 'Sin categoria' }),
     ]);
 
     expect(reconocida.nivelSugerido).toBe('Plata');
     expect(reconocida.info).not.toContain('nivel_asignado_por_default');
     expect(noReconocida.nivelSugerido).toBe('Bronce');
     expect(noReconocida.info).toContain('nivel_asignado_por_default');
+  });
+
+  test('Categoria "Profesionales"/"Público en general" se asignan EXPLÍCITAMENTE a nivelSugerido "Azul" (2026-11-12), sin asignación por default', () => {
+    const [profesionales, publicoGeneral] = applyService.construirFilasDesdeCorrecciones([
+      corregida({ tarjetaRaw: '2003', categoriaOriginal: 'Profesionales' }),
+      corregida({ tarjetaRaw: '2004', categoriaOriginal: 'Público en general' }),
+    ]);
+
+    expect(profesionales.nivelSugerido).toBe('Azul');
+    expect(profesionales.info).not.toContain('nivel_asignado_por_default');
+    expect(publicoGeneral.nivelSugerido).toBe('Azul');
+    expect(publicoGeneral.info).not.toContain('nivel_asignado_por_default');
   });
 
   test('fila sin celular ni telefono: sin_contacto, contacto vacío', () => {

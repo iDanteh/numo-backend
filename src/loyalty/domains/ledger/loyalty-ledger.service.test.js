@@ -766,9 +766,9 @@ describe('listarMovimientosGlobal — reporte "Movimientos" (2026-10-29)', () =>
       include: [
         { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
         { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
-        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre'], 'serieFacturacion'] },
       ],
-      order: [['createdAt', 'DESC']],
+      order: [['createdAt', 'DESC'], ['id', 'ASC']],
     });
     expect(resultado).toEqual([{ id: 1 }]);
   });
@@ -845,6 +845,35 @@ describe('listarMovimientosGlobal — reporte "Movimientos" (2026-10-29)', () =>
     const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
     expect(where.puntos[Op.gte]).toBe(10);
     expect(where.puntos[Op.lte]).toBeUndefined();
+  });
+
+  // Filtro "Teléfono/tarjeta" (2026-11-20) — filtra por el CLIENTE, distinto de `usuarioNombre`
+  // (operador/staff). Mismo criterio que la búsqueda de tarjetas (Op.like de prefijo).
+  test('telefono filtra el include de card con Op.like de prefijo (mismo criterio que search de cards)', async () => {
+    await ledgerService.listarMovimientosGlobal({ telefono: '555' });
+
+    const { include } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    const cardInclude = include.find((inc) => inc.as === 'card');
+    expect(cardInclude.where).toEqual({ telefono: { [Op.like]: '555%' } });
+  });
+
+  test('sin telefono: el include de card no lleva where (no cambia a required:true por default)', async () => {
+    await ledgerService.listarMovimientosGlobal({});
+
+    const { include } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    const cardInclude = include.find((inc) => inc.as === 'card');
+    expect(cardInclude.where).toBeUndefined();
+  });
+
+  // Fix 2026-11-20: un telefono solo-espacios es truthy ANTES de recortar — sin trim-primero, esto
+  // forzaba un where con LIKE '%' (no filtra nada) pero SÍ dejaba el include en required:true,
+  // exactamente la regresión que el test de arriba ("sin telefono") existe para evitar.
+  test('telefono solo espacios: el include de card no lleva where (mismo criterio que sin telefono)', async () => {
+    await ledgerService.listarMovimientosGlobal({ telefono: '   ' });
+
+    const { include } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    const cardInclude = include.find((inc) => inc.as === 'card');
+    expect(cardInclude.where).toBeUndefined();
   });
 });
 

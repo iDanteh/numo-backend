@@ -58,7 +58,7 @@ describe('correrMatchKore', () => {
   });
 
   test('match exacto por tarjetaLegada === normalizarTarjeta(monedero): UPDATEa koreClienteId/koreMonedero', async () => {
-    const c = card({ tarjetaLegada: '44' }); // ya normalizado al persistirse (ver loyalty-import-apply.service.js)
+    const c = card({ tarjetaLegada: '44', nivel: 'Azul' }); // ya normalizado al persistirse (ver loyalty-import-apply.service.js)
     LoyaltyCard.findAll.mockResolvedValue([c]);
     obtenerClientesConMonedero.mockResolvedValue([
       { id: '1066bvfaevunm', codigo: 18595, nombre: 'ALBERTO', razonSocial: 'ALBERTO ANGEL', monedero: '044' }, // normaliza a '44'
@@ -74,10 +74,10 @@ describe('correrMatchKore', () => {
       sinMatchEnKoreCount: 0,
       sinMatchEnLealtadCount: 0,
     });
-    // matcheadosDetalle (2026-10-23): alimenta el Excel que genera el frontend al terminar el
-    // job — NUNCA se trunca, a diferencia de las listas de error.
+    // matcheadosDetalle (2026-10-23, + nivel 2026-11-12): alimenta el Excel que genera el
+    // frontend al terminar el job — NUNCA se trunca, a diferencia de las listas de error.
     expect(resumen.matcheadosDetalle).toEqual([
-      { telefono: '5551234567', nombre: 'CLIENTE', tarjetaLegada: '44', koreClienteId: '1066bvfaevunm', koreMonedero: '044' },
+      { telefono: '5551234567', nombre: 'CLIENTE', nivel: 'Azul', tarjetaLegada: '44', koreClienteId: '1066bvfaevunm', koreMonedero: '044' },
     ]);
   });
 
@@ -119,7 +119,7 @@ describe('correrMatchKore', () => {
   });
 
   test('tarjeta de Lealtad sin match en Kore: se reporta en sinMatchEnKore', async () => {
-    const c = card({ id: 7, telefono: '5559999999', nombre: 'HUERFANA', tarjetaLegada: 'CF-3615' });
+    const c = card({ id: 7, telefono: '5559999999', nombre: 'HUERFANA', nivel: 'Plata', tarjetaLegada: 'CF-3615' });
     LoyaltyCard.findAll.mockResolvedValue([c]);
     obtenerClientesConMonedero.mockResolvedValue([
       { id: 'kore-1', nombre: 'OTRO', monedero: '1' }, // no matchea con CF-3615
@@ -130,10 +130,10 @@ describe('correrMatchKore', () => {
     expect(c.update).not.toHaveBeenCalled();
     expect(resumen.sinMatchEnKoreCount).toBe(1);
     expect(resumen.sinMatchEnKore).toEqual([
-      { cardId: 7, telefono: '5559999999', nombre: 'HUERFANA', tarjetaLegada: 'CF-3615' },
+      { cardId: 7, telefono: '5559999999', nombre: 'HUERFANA', nivel: 'Plata', tarjetaLegada: 'CF-3615' },
     ]);
-    // sinMatchEnKoreDetalle (2026-10-23): alimenta la 2da pestaña del Excel — mismo shape que
-    // sinMatchEnKore, pero nunca se trunca (ver siguiente test).
+    // sinMatchEnKoreDetalle (2026-10-23, + nivel 2026-11-12): alimenta la 2da pestaña del Excel
+    // — mismo shape que sinMatchEnKore, pero nunca se trunca (ver siguiente test).
     expect(resumen.sinMatchEnKoreDetalle).toEqual(resumen.sinMatchEnKore);
   });
 

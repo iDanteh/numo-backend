@@ -3,8 +3,11 @@
 /**
  * shared/models/postgres/LoyaltySecurityEvent.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Sistema de Lealtad — auditoría append-only de intentos sobre el flujo OTP de
- * la ruta pública de consulta de puntos (ver `loyalty-recovery.service.js`).
+ * Sistema de Lealtad — auditoría append-only de intentos sobre flujos OTP:
+ * la ruta pública de consulta de puntos (`loyalty-recovery.service.js`) y el
+ * código de autorización de canje server-a-servidor con Kore
+ * (`loyalty-kore-canje.service.js`, 2026-11-13 — columnas de código propias,
+ * nunca comparten slot con las de consulta pública).
  * Nunca se actualiza ni se borra desde la app. Complementa — no reemplaza — el
  * log de Winston: acá se puede investigar un teléfono o una IP a través del
  * tiempo (patrones de abuso), algo que el log rotativo no permite. Nunca
@@ -25,7 +28,8 @@ const LoyaltySecurityEvent = sequelize.define('LoyaltySecurityEvent', {
     allowNull: true,
   },
   tipo: {
-    type:      DataTypes.STRING(30), // 'solicitud_codigo' | 'confirmacion_codigo' | 'ver_consulta' | 'guardar_email'
+    type:      DataTypes.STRING(30), // 'solicitud_codigo' | 'confirmacion_codigo' | 'ver_consulta' |
+                                      // 'guardar_email' | 'solicitud_codigo_canje' | 'confirmacion_codigo_canje'
     allowNull: false,
   },
   resultado: {

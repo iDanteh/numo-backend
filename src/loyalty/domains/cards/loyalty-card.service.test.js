@@ -423,6 +423,51 @@ describe('cambiarNivel', () => {
   });
 });
 
+// Bug real 2026-11-17: el webhook de catálogo de clientes (loyalty-kore-cliente.service.js)
+// empezó a recibir el `id` de categoría de Kore ("1") en vez del nombre ("Oro") que mandaba antes.
+// `LoyaltyCard.nivel` sigue siendo el nombre (no se tocó el modelo de datos) — este resolver
+// traduce lo que venga de Kore ANTES de que nivelEsValido()/cambiarNivel() lo validen.
+describe('resolverNombreNivel', () => {
+  beforeEach(() => {
+    LoyaltyKoreNivel.findOne.mockReset();
+  });
+
+  test('koreId conocido → devuelve el nombre del catálogo', async () => {
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce({ nombre: 'Oro' }); // match por koreId
+
+    const resultado = await cardService.resolverNombreNivel('1');
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: '1' } });
+    expect(resultado).toBe('Oro');
+  });
+
+  test('no matchea por koreId pero sí por nombre (compatibilidad con el formato viejo)', async () => {
+    LoyaltyKoreNivel.findOne
+      .mockResolvedValueOnce(null) // por koreId
+      .mockResolvedValueOnce({ nombre: 'Bronce' }); // por nombre
+
+    const resultado = await cardService.resolverNombreNivel('Bronce');
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenNthCalledWith(2, { where: { nombre: 'Bronce' } });
+    expect(resultado).toBe('Bronce');
+  });
+
+  test('no matchea ni por koreId ni por nombre → devuelve el valor crudo (nivelEsValido lo rechaza después)', async () => {
+    LoyaltyKoreNivel.findOne.mockResolvedValue(null);
+
+    const resultado = await cardService.resolverNombreNivel('Diamante');
+
+    expect(resultado).toBe('Diamante');
+  });
+
+  test('valor vacío/undefined/null: no consulta la base, lo devuelve tal cual', async () => {
+    await expect(cardService.resolverNombreNivel(undefined)).resolves.toBeUndefined();
+    await expect(cardService.resolverNombreNivel(null)).resolves.toBeNull();
+    await expect(cardService.resolverNombreNivel('')).resolves.toBe('');
+    expect(LoyaltyKoreNivel.findOne).not.toHaveBeenCalled();
+  });
+});
+
 describe('listar — orden (sort/sortDir)', () => {
   beforeEach(() => {
     LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });

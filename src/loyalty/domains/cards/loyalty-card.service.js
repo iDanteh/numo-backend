@@ -42,6 +42,25 @@ async function obtenerNivelInicial() {
   return NIVEL_FALLBACK_SIN_CATALOGO;
 }
 
+// `resolverNombreNivel` (2026-11-17, bug real encontrado en producción): el webhook de catálogo de
+// clientes (loyalty-kore-cliente.service.js) mandaba el NOMBRE del nivel ("Oro"), pero Kore cambió
+// a mandar su `id` numérico de categoría ("1") — `nivelEsValido()`/`cambiarNivel()` siguen
+// esperando el nombre (así vive `LoyaltyCard.nivel`, no se toca el modelo de datos por esto), así
+// que hace falta traducir ANTES de validar. Tolerante a ambos formatos a propósito (mismo criterio
+// que el fix de camelCase en sincronizarNivelesKore): intenta por `koreId` primero (lo que Kore
+// manda hoy), cae a `nombre` si no matchea (compatibilidad con quien lo siga mandando así). Si
+// ninguno matchea, devuelve el valor crudo sin tocar — así el error de `nivelEsValido()` sigue
+// mostrando el valor real que vino, en vez de enmascararlo.
+async function resolverNombreNivel(valor) {
+  if (valor === undefined || valor === null || String(valor).trim() === '') return valor;
+  const v = String(valor).trim();
+  const porKoreId = await LoyaltyKoreNivel.findOne({ where: { koreId: v } });
+  if (porKoreId) return porKoreId.nombre;
+  const porNombre = await LoyaltyKoreNivel.findOne({ where: { nombre: v } });
+  if (porNombre) return porNombre.nombre;
+  return valor;
+}
+
 // Mismo literal que el actor sintético de loyalty-kore-cliente.service.js (webhook de catálogo de
 // clientes) — único discriminador de origen, no hace falta una columna nueva: cualquier otro valor
 // de `createdById` (incluido `null`, tarjetas migradas sin ese dato histórico) es origen "Numo"
@@ -496,5 +515,5 @@ async function marcarRevisada(cardId, user) {
 module.exports = {
   crearTarjeta, listar, obtener, obtenerParaEditar, editarTarjeta, cambiarNip, cambiarNivel,
   subirFoto, obtenerFoto, listarPendientesRevisionKore, marcarRevisada,
-  nivelEsValido, obtenerNivelInicial,
+  nivelEsValido, obtenerNivelInicial, resolverNombreNivel,
 };

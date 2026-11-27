@@ -47,3 +47,34 @@ describe('CollectionRequest schema — multi-bank-movement (PR1)', () => {
     expect(Array.isArray(doc.inconsistenciaPostKore.movimientosPendientes)).toBe(true);
   });
 });
+
+// Bug real 2026-11-18: identificar() de una solicitud "PUNTOS" ya guardada ANTES de que
+// 'puntos' existiera como tipoSaldoEspecial fallaba al hacer cr.save() — el pre('validate')
+// exigía saldosAplicados retroactivamente, sin que nada de esa solicitud hubiera cambiado.
+// Fix: autocompletar con el importe completo en vez de exigirlo (no hay nada que elegir
+// para "puntos", a diferencia de saldo_favor/anticipo donde el id SÍ importa).
+describe('CollectionRequest schema — pre(validate) autocompleta saldosAplicados para "puntos"', () => {
+  test('forma de pago "PUNTOS" sin saldosAplicados (documento viejo) valida OK y se autocompleta', async () => {
+    const doc = new CollectionRequest({
+      cxcs: [{ erpId: '1' }],
+      formasPago: [{ formaPagoId: 'f1', formaPagoDescripcion: 'PUNTOS', importe: 955.02 }],
+      monto: 955.02,
+      solicitanteUserId: 'user-1',
+    });
+
+    await expect(doc.validate()).resolves.toBeUndefined();
+    expect(doc.formasPago[0].saldosAplicados).toHaveLength(1);
+    expect(doc.formasPago[0].saldosAplicados[0].monto).toBe(955.02);
+  });
+
+  test('"Saldo a favor" sin saldosAplicados SIGUE fallando (sin cambios, id SÍ importa)', async () => {
+    const doc = new CollectionRequest({
+      cxcs: [{ erpId: '1' }],
+      formasPago: [{ formaPagoId: 'f1', formaPagoDescripcion: 'Saldo a favor', importe: 500 }],
+      monto: 500,
+      solicitanteUserId: 'user-1',
+    });
+
+    await expect(doc.validate()).rejects.toThrow(/requiere saldosAplicados/);
+  });
+});

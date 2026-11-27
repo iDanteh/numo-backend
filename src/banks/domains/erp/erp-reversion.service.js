@@ -11,6 +11,11 @@ const { logger }                  = require('../../../shared/utils/logger');
 // para que otros dominios los reutilicen sin duplicar la lógica de sync contra Kore. Sin
 // require circular — erp.routes.js no requiere nada de este archivo.
 const erpRoutes = require('./erp.routes');
+// Reversión de puntos de Lealtad por abono puntual (cambio `cxc-reversiones-puntos-abono`,
+// design.md D4/D6) — dirección banks/erp -> loyalty, un require puntual a UNA sola función, no al
+// dominio completo. Sin require circular: loyalty-kore-reversion-abono.service.js solo requiere
+// loyalty-ledger.service.js (su único escritor), que no requiere nada de banks/domains/erp.
+const { revertirPuntosPorAbono } = require('../../../loyalty/domains/ledger/loyalty-kore-reversion-abono.service');
 
 // Mismo tamaño de página que ya usa el resto del módulo ERP (ver ERP_PAGE_SIZE en erp.routes.js).
 const ERP_REVERSION_PAGE_SIZE = 50;
@@ -328,6 +333,24 @@ async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExtern
 // el aporte — ver _aplicarReversionAMovimiento — dejando siempre un rastro de auditoría
 // (ErpReversion) para la bandeja de consulta.
 async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folioExterno, referencia, payloadOriginal } = {}) {
+  // D4 (cambio `cxc-reversiones-puntos-abono`): ANTES del BankMovement.find — independiente de
+  // si hay algo bancario vinculado (el early-return de abajo es un concern de auditoría Mongo,
+  // ajeno a si este abono tuvo efecto de lealtad). D6: envuelto en su propio try/catch que NUNCA
+  // repropaga — un bug en el dominio Lealtad jamás debe bloquear ni revertir una reversión
+  // bancaria que Kore ya confirmó de su lado.
+  let efectoLealtad = null;
+  if (referencia) {
+    try {
+      const serieFolio = `${serieExterna}-${folioExterno}`;
+      const resultado = await revertirPuntosPorAbono({ serieFolio, idAbono: referencia, motivo });
+      if (resultado.reverted) {
+        efectoLealtad = { idAbono: referencia, cardId: resultado.cardId, puntosRevertidos: resultado.puntosRevertidos };
+      }
+    } catch (err) {
+      logger.error(`[erp-reversion] Error al revertir puntos de Lealtad (erpId=${erpId}, idAbono=${referencia}): ${err.message}`, { stack: err.stack });
+    }
+  }
+
   const movs = await BankMovement.find({ erpIds: erpId });
 
   if (movs.length === 0) {
@@ -459,6 +482,7 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
     referencia:         referencia ?? null,
     serieFolioMismatch,
     payloadOriginal:    payloadOriginal ?? null,
+    efectoLealtad, // D3 — null en el caso mayoritario (sin `referencia`, sin efecto, o cubierto por un retiro de venta previo)
     movimientosAfectados: resultados.map(r => ({
       movementId:              r.movementId,
       tipo:                    r.tipo,

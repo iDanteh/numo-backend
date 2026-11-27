@@ -86,15 +86,21 @@ const collectionRequestSchema = new mongoose.Schema({
       referencia:           { type: String, trim: true, default: null },
       bancoKoreId:          { type: String, trim: true, default: null },
       bancoDescripcion:     { type: String, trim: true, default: null },
-      // Saldo(s) a favor / anticipo(s) REALES que cubren esta forma de pago —
-      // obligatorio cuando formaPagoDescripcion es "saldo a favor" o "anticipo"
-      // (ver tipoSaldoEspecial en collection-request-erp-links.js). Sin esto,
-      // Kore no sabe de qué registro específico descontar — puede haber más de
-      // uno si el importe se cubre repartido entre varios (mismo patrón que
-      // cobroSaldosAFavorConfirmados/cobroAnticiposConfirmados en cobro-panel).
+      // Saldo(s) a favor / anticipo(s) / puntos REALES que cubren esta forma de
+      // pago — obligatorio cuando formaPagoDescripcion es "saldo a favor",
+      // "anticipo" o "puntos" (ver tipoSaldoEspecial en
+      // collection-request-erp-links.js). Para saldo a favor/anticipo, Kore
+      // necesita el `id` del registro puntual (ErpSaldoFavor) para saber de
+      // cuál descontar — puede haber más de uno si el importe se cubre
+      // repartido entre varios (mismo patrón que cobroSaldosAFavorConfirmados/
+      // cobroAnticiposConfirmados en cobro-panel). "Puntos" (monedero Club
+      // Tuberos, 2026-11-18) NO tiene un registro con id propio en Kore — el
+      // validador pre-save de abajo exige `id` solo para saldo_favor/anticipo,
+      // nunca para puntos. `id` queda sin `required` a nivel schema porque la
+      // obligatoriedad real depende del tipo, no es uniforme entre entradas.
       saldosAplicados: {
         type: [{
-          id:    { type: String, required: true, trim: true }, // ErpSaldoFavor.id (Kore)
+          id:    { type: String, trim: true, default: '' }, // ErpSaldoFavor.id (Kore) — solo saldo_favor/anticipo
           monto: { type: Number, required: true },
         }],
         default: [],
@@ -284,20 +290,34 @@ collectionRequestSchema.pre('validate', function (next) {
     }
   }
 
-  // Saldo a favor / anticipo: sin saldosAplicados, Kore recibiría anticipos/
-  // saldosAFavorAUsar vacíos y aplicaría el pago sin descontar del registro
-  // correcto (mismo bug que se corrigió aquí: ver [[project_collection_requests]]).
+  // Saldo a favor / anticipo / puntos: sin saldosAplicados, Kore recibiría
+  // anticipos/saldosAFavorAUsar vacíos y aplicaría el pago sin descontar del
+  // registro correcto (mismo bug que se corrigió aquí: ver
+  // [[project_collection_requests]]). "Puntos" no exige `id` — ver comentario
+  // de saldosAplicados arriba — pero sí exige monto y que la suma cuadre,
+  // igual que sus hermanos: esto es auditoría/trazabilidad LOCAL, nunca se
+  // manda de vuelta a Kore (ninguno de los 3 tipos lo hace hoy).
   for (const f of (this.formasPago ?? [])) {
     const tipo = tipoSaldoEspecial(f);
     if (!tipo) continue;
+    const exigeId = tipo !== 'puntos';
+    // "Puntos" no tiene nada que el llamador deba elegir (a diferencia de saldo_favor/
+    // anticipo, donde el id identifica QUÉ registro de Kore se usó) — el monto SIEMPRE es
+    // el importe completo de esta línea. Autocompletar acá en vez de exigirlo evita romper
+    // documentos ya guardados ANTES de que 'puntos' existiera como tipoSaldoEspecial (bug
+    // real 2026-11-18: identificar() de una solicitud vieja fallaba al hacer cr.save() con
+    // este mismo pre('validate'), aunque nada de esa solicitud hubiera cambiado).
+    if (tipo === 'puntos' && !f.saldosAplicados?.length) {
+      f.saldosAplicados = [{ monto: f.importe }];
+    }
     if (!f.saldosAplicados?.length) {
       return next(new Error(
-        `La forma de pago "${f.formaPagoDescripcion}" requiere saldosAplicados (id + monto de cada saldo a favor/anticipo usado)`,
+        `La forma de pago "${f.formaPagoDescripcion}" requiere saldosAplicados (${exigeId ? 'id + ' : ''}monto de cada ${tipo === 'puntos' ? 'puntos' : 'saldo a favor/anticipo'} usado)`,
       ));
     }
-    if (f.saldosAplicados.some(s => !s.id || !(s.monto > 0))) {
+    if (f.saldosAplicados.some(s => (exigeId && !s.id) || !(s.monto > 0))) {
       return next(new Error(
-        `La forma de pago "${f.formaPagoDescripcion}" tiene un saldoAplicado inválido (falta id o monto > 0)`,
+        `La forma de pago "${f.formaPagoDescripcion}" tiene un saldoAplicado inválido (${exigeId ? 'falta id o ' : ''}falta monto > 0)`,
       ));
     }
     const suma = Math.round(f.saldosAplicados.reduce((s, x) => s + x.monto, 0) * 100) / 100;

@@ -108,49 +108,11 @@ async function guardarPorcentajes({ Bronce, Plata, Oro } = {}, user) {
 }
 
 /**
- * CONGELAMIENTO_MESES (2026-11-03, pedido explícito del usuario) — "Congelamiento de puntos"
- * por inactividad: meses sin una ACUMULACIÓN real tras los cuales el job diario
- * (`loyalty/jobs/congelamiento-puntos.service.js`) resetea el saldo de una tarjeta a 0, vía un
- * AJUSTE real en el ledger (auditable con el historial existente — PR2, sin UI nueva). Vive en
- * `GlobalConfig` sección `lealtad` (mismo mecanismo que los % de nivel), `tipo:'numero'`.
- *
- * Deshabilitado = sin configurar (D11: nunca default inventado) O configurado EXPLÍCITAMENTE en
- * 0 — mismo criterio exacto en lectura y escritura, para que `obtenerCongelamientoMeses() ===
- * null` sea la única señal que el job necesita consultar antes de correr.
- */
-function _validarCongelamientoMeses(valor) {
-  if (valor === null || valor === undefined || valor === '') return 0;
-  const n = Number(valor);
-  if (!Number.isInteger(n) || n < 0) {
-    throw new BadRequestError('Los meses de congelamiento deben ser un número entero positivo (o 0/vacío para deshabilitar).');
-  }
-  return n;
-}
-
-/** `null` cuando no está configurado o está en 0 (deshabilitado) — nunca se asume un valor. */
-async function obtenerCongelamientoMeses() {
-  const valor = await globalConfigService.getValue(SECTION, 'CONGELAMIENTO_MESES').catch(() => null);
-  if (valor === null) return null;
-  const n = Number(valor);
-  return (Number.isInteger(n) && n > 0) ? n : null;
-}
-
-/** Guarda los meses de congelamiento. `meses` null/undefined/0 deshabilita la feature (se
- *  persiste '0', nunca se borra la fila — mismo criterio que guardarFotoFolderId con vacío). */
-async function guardarCongelamientoMeses(meses, user) {
-  const { usuarioId, usuarioNombre } = _userLabel(user);
-  const n = _validarCongelamientoMeses(meses);
-  await globalConfigService.setValue(SECTION, 'CONGELAMIENTO_MESES', String(n), {
-    tipo: 'numero', usuarioId, usuarioNombre,
-  });
-  return n > 0 ? n : null;
-}
-
-/**
  * CONSULTA_CODIGO_MAX_MES (2026-11-09, pedido explícito del usuario) — blindaje adicional sobre
  * la consulta pública de puntos: tope de cuántos ciclos de código ("solicitar código" +
  * "confirmar código" exitoso) puede completar UNA tarjeta por mes calendario (zona
- * America/Mexico_City). Las vistas de sesión (3 extra sin código, ver loyalty-recovery.service.js)
+ * America/Mexico_City). Las vistas de sesión (extra sin código, cantidad configurable — ver
+ * SESION_CONSULTA_USOS_MAX más abajo, loyalty-recovery.service.js)
  * NO cuentan aparte — son parte del mismo ciclo ya contado. Mismo mecanismo que
  * CONGELAMIENTO_MESES (`GlobalConfig` sección `lealtad`, `tipo:'numero'`), idéntico criterio
  * deshabilitado = sin configurar o en 0 (D11: nunca default inventado).
@@ -181,6 +143,248 @@ async function guardarConsultaCodigoMaxMes(max, user) {
     tipo: 'numero', usuarioId, usuarioNombre,
   });
   return n > 0 ? n : null;
+}
+
+/**
+ * SESION_CONSULTA_USOS_MAX (2026-11-20, pedido explícito del usuario) — cuántas vistas EXTRA
+ * (sin pedir un código nuevo) puede hacer una tarjeta dentro de la sesión corta que abre
+ * `confirmarCodigoConsulta` (ver loyalty-recovery.service.js, `verConsultaSesion`). Mismo
+ * mecanismo que el resto (`GlobalConfig` sección `lealtad`, `tipo:'numero'`), pero con semántica
+ * DELIBERADAMENTE DISTINTA a CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES: acá vacío/sin
+ * configurar usa el default histórico **3** (el valor que antes vivía hardcodeado como
+ * `SESION_USOS_INICIALES`, para que una instalación sin tocar esta config no cambie de
+ * comportamiento), y **0 significa DESHABILITADO de verdad** (cada consulta exige un código
+ * nuevo) — nunca "ilimitado", a diferencia de la convención 0/vacío=sin-límite del resto de esta
+ * pantalla: "ilimitado" rompería el propósito de blindaje OTP de la sesión corta.
+ */
+const SESION_CONSULTA_USOS_MAX_DEFAULT = 3;
+
+function _validarSesionConsultaUsosMax(valor) {
+  if (valor === null || valor === undefined || valor === '') {
+    throw new BadRequestError('El límite de consultas sin código es requerido: un número entero mayor o igual a 0 (0 deshabilita las vistas extra).');
+  }
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestError('El límite de consultas sin código debe ser un número entero mayor o igual a 0 (0 deshabilita las vistas extra).');
+  }
+  return n;
+}
+
+/** Entero configurado, o el default (3) si nunca se guardó nada o el valor guardado es inválido
+ *  (defensivo, mismo criterio que obtenerCanjeCodigoVigenciaMin). Nunca null: a diferencia de
+ *  CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES, acá 0 es un valor real (deshabilitado), no la
+ *  señal de "sin configurar". */
+async function obtenerSesionConsultaUsosMax() {
+  const valor = await globalConfigService.getValue(SECTION, 'SESION_CONSULTA_USOS_MAX').catch(() => null);
+  if (valor === null) return SESION_CONSULTA_USOS_MAX_DEFAULT;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n >= 0) ? n : SESION_CONSULTA_USOS_MAX_DEFAULT;
+}
+
+/** Guarda el límite de consultas sin código. A diferencia de guardarCongelamientoMeses/
+ *  guardarConsultaCodigoMaxMes, acá NO admite null/undefined/vacío (no hay "deshabilitar
+ *  guardando vacío" — 0 ya es un valor explícito real con ese significado). */
+async function guardarSesionConsultaUsosMax(max, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarSesionConsultaUsosMax(max);
+  await globalConfigService.setValue(SECTION, 'SESION_CONSULTA_USOS_MAX', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n;
+}
+
+/**
+ * CANJE_CODIGO_VIGENCIA_MIN (2026-11-13, pedido explícito del usuario) — cuántos minutos dura
+ * vigente el código de un solo uso que Numo genera y manda al cliente para autorizar un canje de
+ * puntos en una venta de Kore (ver `loyalty-kore-canje.service.js`). Mismo mecanismo que
+ * CONGELAMIENTO_MESES/CONSULTA_CODIGO_MAX_MES (`GlobalConfig` sección `lealtad`, `tipo:'numero'`),
+ * pero a diferencia de esos dos, acá NO hay un significado especial en 0 — la vigencia siempre
+ * tiene que ser un número positivo real (nunca "deshabilitado"), con **default 5** si todavía no
+ * se configuró nada (pedido explícito del usuario, no D11: acá sí hace falta un default usable
+ * desde el primer canje, no se puede dejar sin vigencia).
+ */
+function _validarCanjeCodigoVigenciaMin(valor) {
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new BadRequestError('La vigencia del código de canje debe ser un número entero mayor a 0 (minutos).');
+  }
+  return n;
+}
+
+const CANJE_CODIGO_VIGENCIA_MIN_DEFAULT = 5;
+
+/** Minutos de vigencia vigentes — default 5 si nunca se configuró explícitamente. */
+async function obtenerCanjeCodigoVigenciaMin() {
+  const valor = await globalConfigService.getValue(SECTION, 'CANJE_CODIGO_VIGENCIA_MIN').catch(() => null);
+  if (valor === null) return CANJE_CODIGO_VIGENCIA_MIN_DEFAULT;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n > 0) ? n : CANJE_CODIGO_VIGENCIA_MIN_DEFAULT;
+}
+
+/** Guarda la vigencia (minutos). No admite 0/vacío — mismo criterio de _validarCanjeCodigoVigenciaMin. */
+async function guardarCanjeCodigoVigenciaMin(minutos, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarCanjeCodigoVigenciaMin(minutos);
+  await globalConfigService.setValue(SECTION, 'CANJE_CODIGO_VIGENCIA_MIN', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n;
+}
+
+/**
+ * PERMITIR_SALDO_NEGATIVO_CANJE (2026-11-20, pedido explícito del usuario, PROVISIONAL) — decisión
+ * de negocio consumida por `loyalty-kore-venta.service.js#_procesarUnAbonoNuevo`: si un abono de
+ * Kore pide descontar más puntos de los que tiene la tarjeta, por default (`false`, sin tocar
+ * esta config) se sigue bloqueando exactamente como hoy (`BadRequestError`). Si se activa
+ * (`true`), el abono se aplica igual (el saldo queda negativo) con una advertencia en la
+ * respuesta — reemplaza el CHECK `loyalty_cards_saldo_no_negativo` de Postgres (D4, eliminado a
+ * propósito, ver migración en shared/models/postgres/index.js): el control pasa a ser 100% de la
+ * app. Mismo mecanismo que el resto (`GlobalConfig` sección `lealtad`), pero `tipo:'booleano'`
+ * (ya contemplado en el STRING(20) de `GlobalConfig.tipo`, aunque ninguna otra config de este
+ * proyecto lo usaba todavía) en vez de `'numero'`. Fuera de alcance: `loyalty-ledger.service.js`
+ * (canje/ajuste manual de staff) sigue bloqueando saldo negativo siempre, esta config no lo toca.
+ */
+function _validarPermitirSaldoNegativoCanje(valor) {
+  if (typeof valor === 'boolean') return valor;
+  if (valor === 'true') return true;
+  if (valor === 'false') return false;
+  throw new BadRequestError('permitirSaldoNegativoCanje debe ser true o false.');
+}
+
+/** `false` (bloquea saldo negativo, comportamiento de siempre) si nunca se configuró nada. */
+async function obtenerPermitirSaldoNegativoCanje() {
+  const valor = await globalConfigService.getValue(SECTION, 'PERMITIR_SALDO_NEGATIVO_CANJE').catch(() => null);
+  return valor === 'true';
+}
+
+async function guardarPermitirSaldoNegativoCanje(valor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const habilitado = _validarPermitirSaldoNegativoCanje(valor);
+  await globalConfigService.setValue(SECTION, 'PERMITIR_SALDO_NEGATIVO_CANJE', String(habilitado), {
+    tipo: 'booleano', usuarioId, usuarioNombre,
+  });
+  return habilitado;
+}
+
+/**
+ * ENVÍO DE CÓDIGO OTP (2026-11-23, pedido explícito del usuario) — config-driven del canal de
+ * envío que consume `loyalty/shared/otp-envio.adapter.js` (reemplaza la simulación inline que
+ * antes vivía hardcodeada en `loyalty-recovery.service.js#solicitarCodigo`). Mismo mecanismo que
+ * el resto (`GlobalConfig` sección `lealtad`, `tipo:'texto'`); las credenciales de WhatsApp
+ * (Phone Number ID, token, App Secret) son `esSecreto:true` (mismo criterio que `bancos.TOKEN`).
+ *
+ * `OTP_ENVIO_MODO` ('simulado' | 'real', default 'simulado') y `OTP_ENVIO_PROVEEDOR` (hoy solo
+ * 'whatsapp' es una implementación real) son el único acoplamiento entre el adapter y esta config
+ * — el usuario de Meta (developers.facebook.com) todavía está tramitando el alta (Phone Number ID/
+ * token pendientes), así que el default 'simulado' preserva el comportamiento actual (código
+ * logueado/`codigoDev`) sin requerir cargar nada.
+ */
+const OTP_ENVIO_MODOS = ['simulado', 'real'];
+const OTP_ENVIO_MODO_DEFAULT = 'simulado';
+const OTP_ENVIO_PROVEEDOR_DEFAULT = 'whatsapp';
+const OTP_WHATSAPP_TEMPLATE_NOMBRE_DEFAULT = 'verificacion_codigo';
+const OTP_WHATSAPP_TEMPLATE_IDIOMA_DEFAULT = 'es_MX';
+
+function _validarOtpEnvioModo(valor) {
+  const str = String(valor ?? '').trim().toLowerCase();
+  if (!OTP_ENVIO_MODOS.includes(str)) {
+    throw new BadRequestError(`El modo de envío de código debe ser uno de: ${OTP_ENVIO_MODOS.join(', ')}.`);
+  }
+  return str;
+}
+
+/** 'simulado' si nunca se configuró (D11-like: el único modo real soportado hoy requiere
+ *  credenciales que todavía no existen) — nunca lanza. */
+async function obtenerOtpEnvioModo() {
+  const valor = await globalConfigService.getValue(SECTION, 'OTP_ENVIO_MODO').catch(() => null);
+  return valor && OTP_ENVIO_MODOS.includes(valor) ? valor : OTP_ENVIO_MODO_DEFAULT;
+}
+
+async function guardarOtpEnvioModo(modo, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const valido = _validarOtpEnvioModo(modo);
+  await globalConfigService.setValue(SECTION, 'OTP_ENVIO_MODO', valido, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return valido;
+}
+
+/** 'whatsapp' si nunca se configuró — hoy es el único proveedor real soportado por el adapter
+ *  (ver `PROVEEDORES` en otp-envio.adapter.js), pero esta config existe desde ya para que un
+ *  cambio de canal futuro no requiera tocar código, solo esta clave. */
+async function obtenerOtpEnvioProveedor() {
+  const valor = await globalConfigService.getValue(SECTION, 'OTP_ENVIO_PROVEEDOR').catch(() => null);
+  return valor ? String(valor).trim() : OTP_ENVIO_PROVEEDOR_DEFAULT;
+}
+
+async function guardarOtpEnvioProveedor(proveedor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const str = String(proveedor ?? '').trim();
+  if (!str) {
+    throw new BadRequestError('proveedor es requerido.');
+  }
+  await globalConfigService.setValue(SECTION, 'OTP_ENVIO_PROVEEDOR', str, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return str;
+}
+
+/**
+ * Credenciales/ajustes del proveedor WhatsApp Business Cloud API — todas opcionales hoy (el
+ * usuario todavía está tramitando el alta en Meta): cualquier campo no configurado vuelve `null`
+ * (o su default, para los dos campos de plantilla), nunca lanza. `token`/`appSecret` son
+ * `esSecreto:true` — nunca quedan en texto plano en `global_configs.valor` ni en el valor
+ * anterior/nuevo del audit log (`ConfigAuditLog`, ver `global-config.service.js#setValue`).
+ * `wabaId` se guarda por completitud (uno de los 4 datos que el usuario está esperando de Meta)
+ * aunque el adapter hoy no lo necesita para enviar mensajes (solo Phone Number ID + token).
+ */
+async function obtenerOtpWhatsappConfig() {
+  const claves = [
+    'OTP_WHATSAPP_PHONE_NUMBER_ID', 'OTP_WHATSAPP_WABA_ID', 'OTP_WHATSAPP_TOKEN',
+    'OTP_WHATSAPP_APP_SECRET', 'OTP_WHATSAPP_TEMPLATE_NOMBRE', 'OTP_WHATSAPP_TEMPLATE_IDIOMA',
+  ];
+  const [phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma] = await Promise.all(
+    claves.map((clave) => globalConfigService.getValue(SECTION, clave).catch(() => null)),
+  );
+  return {
+    phoneNumberId: phoneNumberId || null,
+    wabaId: wabaId || null,
+    token: token || null,
+    appSecret: appSecret || null,
+    templateNombre: templateNombre || OTP_WHATSAPP_TEMPLATE_NOMBRE_DEFAULT,
+    templateIdioma: templateIdioma || OTP_WHATSAPP_TEMPLATE_IDIOMA_DEFAULT,
+  };
+}
+
+/** Patch parcial — mismo criterio que `editarReason`/`editarPromocion`: solo escribe las llaves
+ *  presentes (`undefined` se omite), para poder cargar un dato a la vez a medida que Meta los
+ *  vaya liberando (ej. hoy solo Phone Number ID, después el token, etc.). */
+async function guardarOtpWhatsappConfig({
+  phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma,
+} = {}, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const base = { usuarioId, usuarioNombre };
+
+  if (phoneNumberId !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_PHONE_NUMBER_ID', String(phoneNumberId ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (wabaId !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_WABA_ID', String(wabaId ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (token !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TOKEN', String(token ?? '').trim(), { tipo: 'texto', esSecreto: true, ...base });
+  }
+  if (appSecret !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_APP_SECRET', String(appSecret ?? '').trim(), { tipo: 'texto', esSecreto: true, ...base });
+  }
+  if (templateNombre !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TEMPLATE_NOMBRE', String(templateNombre ?? '').trim(), { tipo: 'texto', ...base });
+  }
+  if (templateIdioma !== undefined) {
+    await globalConfigService.setValue(SECTION, 'OTP_WHATSAPP_TEMPLATE_IDIOMA', String(templateIdioma ?? '').trim(), { tipo: 'texto', ...base });
+  }
+
+  return obtenerOtpWhatsappConfig();
 }
 
 /**
@@ -660,7 +864,13 @@ async function _buscarOAdoptarNivelKore({ koreId, nombre }) {
  *  se pisa en cada sync (a diferencia de `acumulaPuntos` en conceptos/formas de pago) porque acá
  *  es la fuente real, no un hint. `esInicial` nunca se toca por un sync. Marca `activo:false` en
  *  lo que ya no vino de Kore — las filas transicionales (`koreId` todavía null) se excluyen de esa
- *  desactivación, nunca se apagan solas por no aparecer en una corrida puntual. */
+ *  desactivación, nunca se apagan solas por no aparecer en una corrida puntual.
+ *
+ *  Claves tolerantes a 2 casings (2026-11-17, bug real encontrado contra el endpoint real de Kore
+ *  `/configuracion/puntos_numo/categorias`): el contrato original asumía PascalCase (`Id`/`Nombre`/
+ *  `Porcentaje`, igual que conceptos/formas de pago), pero este endpoint entrega camelCase
+ *  (`id`/`nombre`/`porcentajePuntos`) — sin el fallback, `koreId` quedaba '' para toda fila real y
+ *  el `continue` de abajo las descartaba todas en silencio. */
 async function sincronizarNivelesKore() {
   const nivelesKore = await koreCatalogosClient.obtenerNivelesKore();
   const idsVistos = new Set();
@@ -668,14 +878,16 @@ async function sincronizarNivelesKore() {
   let actualizados = 0;
 
   for (const n of nivelesKore) {
-    const koreId = String(n.Id ?? n.ID ?? '').trim();
+    const koreId = String(n.Id ?? n.ID ?? n.id ?? '').trim();
     if (!koreId) continue;
     idsVistos.add(koreId);
 
+    const porcentaje = n.Porcentaje ?? n.porcentajePuntos ?? n.porcentaje;
     const datos = {
       koreId,
-      nombre:     String(n.Nombre ?? '').trim(),
-      porcentaje: n.Porcentaje != null && n.Porcentaje !== '' ? Number(n.Porcentaje) : null,
+      nombre:     String(n.Nombre ?? n.nombre ?? '').trim(),
+      porcentaje: porcentaje != null && porcentaje !== '' ? Number(porcentaje) : null,
+      color:      n.Color ?? n.color ?? null,
       activo:     true,
     };
 
@@ -746,10 +958,20 @@ async function actualizarNivelKore(id, { esInicial } = {}) {
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
-  obtenerCongelamientoMeses,
-  guardarCongelamientoMeses,
   obtenerConsultaCodigoMaxMes,
   guardarConsultaCodigoMaxMes,
+  obtenerSesionConsultaUsosMax,
+  guardarSesionConsultaUsosMax,
+  obtenerCanjeCodigoVigenciaMin,
+  guardarCanjeCodigoVigenciaMin,
+  obtenerPermitirSaldoNegativoCanje,
+  guardarPermitirSaldoNegativoCanje,
+  obtenerOtpEnvioModo,
+  guardarOtpEnvioModo,
+  obtenerOtpEnvioProveedor,
+  guardarOtpEnvioProveedor,
+  obtenerOtpWhatsappConfig,
+  guardarOtpWhatsappConfig,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

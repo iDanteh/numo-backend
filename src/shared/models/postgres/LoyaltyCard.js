@@ -42,14 +42,20 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     type:         DataTypes.STRING(10),
     allowNull:    false,
     defaultValue: 'Bronce',
-    validate:     { isIn: [['Bronce', 'Plata', 'Oro']] },
-    comment:      'Nivel actual de la tarjeta (D2: STRING + isIn, no ENUM — ver rationale en design.md).',
+    // 2026-11-17: se quitó el `isIn` estático que vivía acá (candado duplicado del catálogo
+    // dinámico). Kore gestiona el catálogo completo de niveles y puede agregar nombres nuevos en
+    // cualquier momento (ej. "Esmeralda") — un array fijo en el modelo queda desincronizado tarde
+    // o temprano y rompe altas/cambios de nivel válidos con SequelizeValidationError, como ya pasó.
+    // ÚNICA fuente de verdad: LoyaltyKoreNivel (catálogo real) vía
+    // loyalty-card.service.js#nivelEsValido(), que ya se consulta antes de cualquier
+    // .create()/.update() que toque este campo. No volver a agregar un isIn fijo acá.
+    comment:      'Nivel actual de la tarjeta (D2: STRING, no ENUM — ver rationale en design.md). Validado contra el catálogo dinámico LoyaltyKoreNivel, no acá.',
   },
   saldoPuntos: {
     type:         DataTypes.DECIMAL(12, 2),
     allowNull:    false,
     defaultValue: 0,
-    comment:      'Saldo denormalizado de puntos. Respaldado por CHECK saldo_puntos >= 0 (D4).',
+    comment:      'Saldo denormalizado de puntos. Puede quedar negativo si PERMITIR_SALDO_NEGATIVO_CANJE está activo (2026-11-20) — el CHECK >= 0 (D4) se eliminó a propósito, el control es 100% de la app (ver loyalty-kore-venta.service.js).',
   },
   activa: {
     type:         DataTypes.BOOLEAN,
@@ -275,6 +281,19 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     allowNull: true,
     comment:   'Email que el cliente deja desde la consulta pública para contacto futuro. Sin flujo de verificación — se persiste tal cual, validado solo en formato.',
   },
+  // Fecha de nacimiento CERTIFICADA por el propio cliente desde la consulta pública (2026-11-23,
+  // pedido explícito del usuario) — columna NUEVA, deliberadamente separada de `fechaNacimiento`
+  // (legado, STRING(50) sin formato garantizado, importado de clientes.csv, ver comentario
+  // arriba): mezclar ambas perdería la garantía de que ESTA es una fecha real, validada, con fin
+  // operativo (ej. promociones de cumpleaños). DATEONLY real (no texto libre) — formato
+  // "YYYY-MM-DD", validado en guardarFechaNacimientoConsulta (loyalty-recovery.service.js): fecha
+  // real, no futura, no mayor a ~120 años. Visible en el defaultScope (a diferencia del campo
+  // legado): es un dato que el cliente certifica él mismo, mismo criterio que emailContacto.
+  fechaNacimientoCliente: {
+    type:      DataTypes.DATEONLY,
+    allowNull: true,
+    comment:   'Fecha de nacimiento certificada por el propio cliente desde la consulta pública (2026-11-23) — distinta de fechaNacimiento (legado, texto libre sin formato garantizado). Validada (fecha real, no futura, no > ~120 años) en guardarFechaNacimientoConsulta.',
+  },
   ultimaConsultaAt: {
     type:      DataTypes.DATE,
     allowNull: true,
@@ -302,6 +321,33 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     defaultValue: 0,
     comment:      'Ciclos de código exitosos en el período consultaCodigoMesPeriodo. Se reinicia solo (lectura perezosa) cuando el mes actual ya no coincide con el período guardado.',
   },
+  // ── Código de autorización de canje de puntos en venta (2026-11-13, webhook Kore) ──────────
+  // Columnas PROPIAS, separadas de recuperacionCodigoHash/consultaSesionTokenHash — un cliente
+  // puede tener una consulta pública en curso (desde su casa) al mismo tiempo que un cajero le
+  // dispara un canje en caja, sin que un flujo pise al otro. A diferencia de la consulta pública
+  // (que abre una sesión de varios usos), este código es de UN SOLO USO, consumido de inmediato
+  // al validarse con éxito — ver loyalty-kore-canje.service.js.
+  canjeCodigoHash: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Hash bcrypt del código de autorización de canje (6 dígitos). El texto plano nunca se persiste. Null cuando no hay canje en curso.',
+  },
+  canjeCodigoExpiraEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Vencimiento del código de canje — minutos configurables, ver loyalty-config.service.js#obtenerCanjeCodigoVigenciaMin (default 5).',
+  },
+  canjeIntentosFallidos: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Contador de intentos fallidos consecutivos del código de canje. Independiente del contador de recuperación/NIP.',
+  },
+  canjeBloqueadaHasta: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Bloqueo temporal tras 5 intentos fallidos del código de canje: 15 min desde el 5to fallo.',
+  },
 }, {
   tableName:   'loyalty_cards',
   underscored: true,
@@ -317,7 +363,7 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     // negocio, no PII sensible.
     attributes: {
       exclude: [
-        'nipHash', 'recuperacionCodigoHash', 'consultaSesionTokenHash',
+        'nipHash', 'recuperacionCodigoHash', 'consultaSesionTokenHash', 'canjeCodigoHash',
         'apodo', 'sexo', 'fechaNacimiento', 'calle', 'numExterior', 'numInterior',
         'colonia', 'municipio', 'estado', 'cp', 'comentarios',
       ],
@@ -332,6 +378,9 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     },
     withConsultaSesionTokenHash: {
       attributes: { include: ['consultaSesionTokenHash'] },
+    },
+    withCanjeCodigoHash: {
+      attributes: { include: ['canjeCodigoHash'] },
     },
     // Uso interno del propio dominio loyalty (ej. backfill de enriquecimiento en
     // loyalty-import-apply.service.js) — nunca para servir una respuesta HTTP directa.

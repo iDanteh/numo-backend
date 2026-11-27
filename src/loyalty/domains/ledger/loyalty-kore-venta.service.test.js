@@ -35,9 +35,13 @@ jest.mock('../config/loyalty-config.service', () => ({
   obtenerPorcentajeNivel: jest.fn(),
   sincronizarConceptosKore: jest.fn(),
   sincronizarFormasPagoKore: jest.fn(),
+  obtenerPermitirSaldoNegativoCanje: jest.fn(),
 }));
 jest.mock('./loyalty-venta-fallida.service', () => ({
   registrarVentaFallida: jest.fn(),
+}));
+jest.mock('../../../banks/domains/users/user.service', () => ({
+  findByAuth0Sub: jest.fn(),
 }));
 // Notificación en vivo (2026-11-10) — ver mismo criterio en loyalty-kore-cliente.service.test.js.
 jest.mock('../../../banks/shared/socket', () => ({ emitToLoyaltyCard: jest.fn() }));
@@ -49,6 +53,7 @@ const { sequelize } = require('../../../config/database.postgres');
 const centrosCostoService = require('../../../banks/domains/centros-costo/centros-costo.service');
 const configService = require('../config/loyalty-config.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
+const { findByAuth0Sub } = require('../../../banks/domains/users/user.service');
 const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 const ventaService = require('./loyalty-kore-venta.service');
 
@@ -117,12 +122,18 @@ beforeEach(() => {
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data, saldoResultante: data.saldoResultante }));
   configService.obtenerPorcentajeNivel.mockResolvedValue(5);
   configService.obtenerPromocionVigente.mockResolvedValue(null);
+  // Default: bloquea saldo negativo (comportamiento de siempre) — preserva el resto de esta suite,
+  // ver describe dedicado más abajo para el caso activo.
+  configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
   LoyaltyKoreConcepto.findOne.mockResolvedValue({ koreId: 'CONCEPTO-1', acumulaPuntos: true });
   LoyaltyKoreFormaPago.findOne.mockImplementation(({ where }) => {
     if (where.koreId === 'FP-EFECTIVO') return Promise.resolve({ koreId: 'FP-EFECTIVO', acumulaPuntos: true, esPuntos: false });
     if (where.koreId === 'FP-PUNTOS') return Promise.resolve({ koreId: 'FP-PUNTOS', acumulaPuntos: false, esPuntos: true });
     return Promise.resolve(null);
   });
+  // Por default nadie matchea (sub de Auth0 sin usuario real en Numo) — cada test que quiera
+  // probar la resolución real sobreescribe esto puntualmente.
+  findByAuth0Sub.mockResolvedValue(null);
 });
 
 describe('consultarSaldoKore', () => {
@@ -182,6 +193,26 @@ describe('procesarVentaKore — validación', () => {
   it('404 si la tarjeta no existe', async () => {
     LoyaltyCard.findOne.mockResolvedValue(null);
     await expect(ventaService.procesarVentaKore(PAYLOAD_BASE)).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+describe('procesarVentaKore — resolución de usuarioNombre (Auth0 sub -> nombre real)', () => {
+  it('usa el nombre real cuando usuarioAplicaId matchea un usuario de Numo', async () => {
+    mockCard(makeCard());
+    findByAuth0Sub.mockResolvedValue({ nombre: 'Juan Pérez' });
+    await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    expect(findByAuth0Sub).toHaveBeenCalledWith('U1');
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.usuarioNombre).toBe('Juan Pérez');
+    expect(filaNivel.usuarioId).toBe('U1');
+  });
+
+  it('cae al nombre fijo "Kore (webhook venta)" si el sub no tiene usuario real en Numo', async () => {
+    mockCard(makeCard());
+    findByAuth0Sub.mockResolvedValue(null);
+    await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.usuarioNombre).toBe('Kore (webhook venta)');
   });
 });
 
@@ -341,6 +372,63 @@ describe('procesarVentaKore — devengación (canje)', () => {
 
   it('el abono falla (statusCode 400) si la tarjeta está inactiva', async () => {
     mockCard(makeCard({ activa: false, saldoPuntos: '600.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });
+  });
+});
+
+describe('procesarVentaKore — saldo negativo en canje (PERMITIR_SALDO_NEGATIVO_CANJE, 2026-11-20, PROVISIONAL)', () => {
+  const payloadConPuntos = {
+    ...PAYLOAD_BASE,
+    abonos: [abono({
+      formasPago: [
+        { formaPagoId: 'FP-EFECTIVO', importe: 660 },
+        { formaPagoId: 'FP-PUNTOS', importe: 500 },
+      ],
+      total: 1160,
+    })],
+  };
+
+  it('default (false): un canje que supera el saldo sigue bloqueando el abono (400), mismo mensaje de siempre', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(false);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '100.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });
+    expect(res.abonos[0].error).toMatch(/supera el saldo disponible/);
+  });
+
+  it('activo (true): el canje se aplica igual, el saldo queda negativo y el abono trae `advertencia`', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '100.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('aplicado');
+    expect(res.puntosDescontados).toBe(500);
+    expect(res.puntosAcumulados).toBe(0);
+    expect(res.saldoResultante).toBe(-400);
+    expect(res.abonos[0]).toMatchObject({
+      idAbono: 'ABONO-1', success: true, status: 'aplicado', puntosDescontados: 500,
+      advertencia: expect.any(String),
+    });
+  });
+
+  it('activo (true) pero el saldo alcanza: nunca agrega `advertencia` (el gate solo aplica cuando de verdad excede)', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula, aísla el canje
+    mockCard(makeCard({ saldoPuntos: '600.00' }));
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('aplicado');
+    expect(res.saldoResultante).toBe(100);
+    expect(res.abonos[0]).not.toHaveProperty('advertencia');
+  });
+
+  it('activo (true) pero tarjeta inactiva: sigue bloqueando (400) — el flag nunca permite descontar de una tarjeta inactiva', async () => {
+    configService.obtenerPermitirSaldoNegativoCanje.mockResolvedValue(true);
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false }));
+    mockCard(makeCard({ activa: false, saldoPuntos: '100.00' }));
     const res = await ventaService.procesarVentaKore(payloadConPuntos);
     expect(res.status).toBe('fallido');
     expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });

@@ -13,20 +13,40 @@
 
 const { BadRequestError } = require('../../../shared/errors/AppError');
 
-// Decisión de negocio 2026-10-19: Categoria no reconocida (ej. "Profesionales",
-// "Público en general") NO bloquea la migración — se asigna el nivel más bajo
-// por default. Es una asignación provisional, pendiente de revisión posterior
-// por parte del negocio (no es un mapeo real, es "no tenemos el dato, arranca
-// en el piso"). Se marca con `info: ['nivel_asignado_por_default']`, nunca
-// como advertencia, porque ya no requiere intervención para poder migrar.
+// Decisión de negocio 2026-10-19: Categoria no reconocida NO bloquea la migración — se
+// asigna el nivel más bajo por default. Es una asignación provisional, pendiente de revisión
+// posterior por parte del negocio (no es un mapeo real, es "no tenemos el dato, arranca en el
+// piso"). Se marca con `info: ['nivel_asignado_por_default']`, nunca como advertencia, porque
+// ya no requiere intervención para poder migrar.
 const NIVELES_VALIDOS_MAP = { bronce: 'Bronce', plata: 'Plata', oro: 'Oro' };
 const NIVEL_DEFAULT = 'Bronce';
 
+// Decisión de negocio 2026-11-12: "Profesionales" y "Público en general" dejan de caer al
+// default genérico de arriba — se asignan EXPLÍCITAMENTE al nivel "Azul" (categoría propia de
+// Numo, al 1% de acumulación, no gestionada por Kore — ver seed-lealtad.js). A diferencia del
+// default genérico, esta es una asignación de negocio real, nunca se marca con
+// `nivel_asignado_por_default`.
+const CATEGORIAS_AZUL_MAP = { profesionales: 'Azul', 'publico en general': 'Azul' };
+
+// Normaliza además de mayúsculas/espacios, los acentos (público → publico) — así el mapeo no
+// depende de que el CSV traiga el acento exacto en "Público".
+function _normalizarCategoria(valor) {
+  return String(valor ?? '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
 function _resolverNivel(categoriaOriginal) {
-  const trimmed = String(categoriaOriginal ?? '').trim().toLowerCase();
-  const nivelReconocido = NIVELES_VALIDOS_MAP[trimmed];
+  const normalizado = _normalizarCategoria(categoriaOriginal);
+  const nivelReconocido = NIVELES_VALIDOS_MAP[normalizado];
   if (nivelReconocido) {
     return { nivelSugerido: nivelReconocido, asignadoPorDefault: false };
+  }
+  const nivelAzul = CATEGORIAS_AZUL_MAP[normalizado];
+  if (nivelAzul) {
+    return { nivelSugerido: nivelAzul, asignadoPorDefault: false };
   }
   return { nivelSugerido: NIVEL_DEFAULT, asignadoPorDefault: true };
 }

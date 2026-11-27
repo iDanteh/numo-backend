@@ -22,6 +22,7 @@ const { logger } = require('../../shared/utils/logger');
 const credencialesSvc = require('../sat/credenciales');
 const entityRepo      = require('../repositories/entity.repository');
 const emailSvc         = require('../../shared/services/email.service');
+const { esWorkerPrimario } = require('../../shared/utils/cluster-primario');
 
 const TTL_MS      = 5 * 24 * 60 * 60 * 1000;
 const UMBRAL_D2_H = 48;
@@ -197,15 +198,20 @@ async function enviarAlertaManual(entity) {
 }
 
 // ── Cron: revisa vencimientos cada hora ───────────────────────────────────────
-cron.schedule('0 * * * *', async () => {
-  try { await verificarVencimientoCredenciales(); }
-  catch (err) { logger.error(`[credencialesAlertJob] Error fatal: ${err.message}`); }
-}, { timezone: 'America/Mexico_City' });
+// Gateado por esWorkerPrimario(): este archivo se require() también desde
+// entity.controller.js (rutas, sin gate), así que el auto-registro al cargar
+// el módulo necesita su propio chequeo — ver shared/utils/cluster-primario.js.
+if (esWorkerPrimario()) {
+  cron.schedule('0 * * * *', async () => {
+    try { await verificarVencimientoCredenciales(); }
+    catch (err) { logger.error(`[credencialesAlertJob] Error fatal: ${err.message}`); }
+  }, { timezone: 'America/Mexico_City' });
 
-// ── Cron: revisa credenciales faltantes a las 8:00 am ─────────────────────────
-cron.schedule('0 8 * * *', async () => {
-  try { await verificarCredencialesFaltantes(); }
-  catch (err) { logger.error(`[credencialesAlertJob] Error fatal (faltantes): ${err.message}`); }
-}, { timezone: 'America/Mexico_City' });
+  // ── Cron: revisa credenciales faltantes a las 8:00 am ───────────────────────
+  cron.schedule('0 8 * * *', async () => {
+    try { await verificarCredencialesFaltantes(); }
+    catch (err) { logger.error(`[credencialesAlertJob] Error fatal (faltantes): ${err.message}`); }
+  }, { timezone: 'America/Mexico_City' });
+}
 
 module.exports = { verificarVencimientoCredenciales, verificarCredencialesFaltantes, enviarAlertaManual };

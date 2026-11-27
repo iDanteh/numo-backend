@@ -175,19 +175,27 @@ async function create(data, files = []) {
   // no queda claro de qué registro se descontó cada saldo/anticipo al
   // guardar la solicitud. El mismo chequeo vive en el pre('validate') del
   // modelo — se repite aquí para dar un error claro antes de tocar Mongo,
-  // igual que ya se hace con la validación de Modo 2.
+  // igual que ya se hace con la validación de Modo 2. "Puntos" (monedero Club
+  // Tuberos, 2026-11-18) NO exige `id` — Kore no expone un registro puntual
+  // para el monedero, solo el monto (ver tipoSaldoEspecial).
   const saldoEspecialInvalido = formasPagoParsed.find(f => {
     const tipo = tipoSaldoEspecial(f);
     if (!tipo) return false;
+    const exigeId = tipo !== 'puntos';
+    // Mismo autocompletado que el pre('validate') del modelo — "puntos" no tiene nada
+    // que elegir, el monto es siempre el importe completo de la línea.
+    if (tipo === 'puntos' && !f.saldosAplicados.length) {
+      f.saldosAplicados = [{ monto: f.importe }];
+    }
     if (!f.saldosAplicados.length) return true;
-    if (f.saldosAplicados.some(s => !s.id || !(s.monto > 0))) return true;
+    if (f.saldosAplicados.some(s => (exigeId && !s.id) || !(s.monto > 0))) return true;
     const suma = Math.round(f.saldosAplicados.reduce((s, x) => s + x.monto, 0) * 100) / 100;
     return Math.abs(suma - f.importe) > 0.01;
   });
   if (saldoEspecialInvalido) {
     throw new BadRequestError(
       `La forma de pago "${saldoEspecialInvalido.formaPagoDescripcion}" requiere saldosAplicados ` +
-      '(id + monto de cada saldo a favor/anticipo usado) cuya suma sea igual al importe',
+      '(monto de cada saldo a favor/anticipo/puntos usado, con id cuando aplique) cuya suma sea igual al importe',
     );
   }
 

@@ -55,8 +55,14 @@ const LoyaltyPendingEnrollment = sequelize.define('LoyaltyPendingEnrollment', {
     type:         DataTypes.STRING(10),
     allowNull:    false,
     defaultValue: 'Bronce',
-    validate:     { isIn: [['Bronce', 'Plata', 'Oro']] },
-    comment:      'Nivel con el que se creará la tarjeta al completar el registro (mismo criterio que LoyaltyCard.nivel).',
+    // 2026-11-17: se quitó el `isIn` estático que vivía acá (mismo candado duplicado que
+    // LoyaltyCard.nivel, con el mismo comentario copiado). Aunque este valor lo calcula
+    // `_resolverNivel()` (loyalty-import.service.js) desde un mapeo cerrado propio del import
+    // CSV, el nivel real igual se valida contra el catálogo vivo al completarse el registro
+    // (`cardService.crearTarjeta()` → `nivelEsValido()`, ver loyalty-card.service.js y
+    // loyalty-import-apply.service.js#completarRegistroPendiente/_aplicarFila) — mantener acá un
+    // segundo candado fijo es redundante y el mismo tipo de trampa de mantenimiento.
+    comment:      'Nivel con el que se creará la tarjeta al completar el registro (mismo criterio que LoyaltyCard.nivel; validado contra el catálogo real al completarse, no acá).',
   },
   motivo: {
     type:         DataTypes.STRING(20),

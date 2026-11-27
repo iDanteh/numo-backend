@@ -27,6 +27,14 @@ jest.mock('../../shared/middleware/auth.real', () => ({
 jest.mock('../banks/BankMovement.model');
 jest.mock('./ErpReversion.model');
 jest.mock('../../shared/socket');
+// Reversión de puntos de lealtad por abono puntual (cambio `cxc-reversiones-puntos-abono`,
+// design.md D4/D6) — mockeada como un LÍMITE de dominio (banks/erp -> loyalty, dirección nueva):
+// tiene su propia cobertura completa en loyalty-kore-reversion-abono.service.test.js. Acá solo se
+// prueba el WIRING: que se llame (o no) en el momento correcto, y que un error ahí nunca bloquee
+// el procesamiento bancario.
+jest.mock('../../../loyalty/domains/ledger/loyalty-kore-reversion-abono.service', () => ({
+  revertirPuntosPorAbono: jest.fn(),
+}));
 // KORE_API_KEY ahora vive en Configuraciones Globales (sección kore-webhooks) en vez
 // de process.env — se mockea global-config.service.js en vez de setear/borrar la
 // variable de entorno directamente.
@@ -61,6 +69,7 @@ const errorHandler = require('../../shared/middleware/error-handler');
 const BankMovement = require('../banks/BankMovement.model');
 const ErpReversion = require('./ErpReversion.model');
 const erpRoutes    = require('./erp.routes');
+const { revertirPuntosPorAbono } = require('../../../loyalty/domains/ledger/loyalty-kore-reversion-abono.service');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 const globalConfigService = require('../../../shared/services/global-config.service');
@@ -110,6 +119,10 @@ beforeEach(() => {
   // tests preexistentes que nunca se preocuparon por esto (y no la mockeaban) no truenen al
   // desestructurar `undefined`. Los tests de retención de abajo la sobreescriben explícitamente.
   erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: false, montoRetenido: null });
+  // Default: sin efecto de lealtad (mismo comportamiento que hoy en todos los tests existentes
+  // que no mencionan `referencia`/lealtad explícitamente) — los tests nuevos de abajo lo
+  // sobreescriben.
+  revertirPuntosPorAbono.mockResolvedValue({ reverted: false });
 });
 
 afterEach(() => {
@@ -298,6 +311,94 @@ describe('procesarReversionKore — procesa la reversión', () => {
     await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'B0', folioExterno: '999' });
 
     expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({ serieFolioMismatch: true }));
+  });
+});
+
+// Cambio `cxc-reversiones-puntos-abono` (design.md D4/D6): además de su lógica bancaria de
+// siempre, procesarReversionKore ahora también revierte el efecto de lealtad de UN abono puntual
+// cuando el payload de Kore trae `referencia` — ver loyalty-kore-reversion-abono.service.js
+// (mockeada arriba como límite de dominio). Estos tests prueban el WIRING, no la lógica interna
+// de revertirPuntosPorAbono (ya cubierta en su propio archivo de test).
+describe('procesarReversionKore — wiring de reversión de puntos de Lealtad (D4/D6)', () => {
+  test('con `referencia` presente: llama a revertirPuntosPorAbono ANTES de BankMovement.find (D4)', async () => {
+    const orden = [];
+    revertirPuntosPorAbono.mockImplementation(async () => { orden.push('revertirPuntosPorAbono'); return { reverted: false }; });
+    BankMovement.find.mockImplementation(async () => { orden.push('BankMovement.find'); return []; });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', referencia: '6aee0e1b2ff6fb0001f89db0', motivo: 'Primer reversión',
+    });
+
+    expect(revertirPuntosPorAbono).toHaveBeenCalledWith({
+      serieFolio: 'A0-100', idAbono: '6aee0e1b2ff6fb0001f89db0', motivo: 'Primer reversión',
+    });
+    expect(orden).toEqual(['revertirPuntosPorAbono', 'BankMovement.find']);
+  });
+
+  test('sin `referencia`: revertirPuntosPorAbono NUNCA se llama (regresión del caso bancario puro)', async () => {
+    BankMovement.find.mockResolvedValue([]);
+
+    await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100' });
+
+    expect(revertirPuntosPorAbono).not.toHaveBeenCalled();
+  });
+
+  test('revertirPuntosPorAbono lanza un error inesperado: la lógica bancaria completa igual, solo se loguea (D6)', async () => {
+    const mov = fakeMov({
+      erpIds:   ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' }],
+      deposito: 500,
+      status:   'identificado',
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-loyalty-err' });
+    revertirPuntosPorAbono.mockRejectedValue(new Error('DB de lealtad caída'));
+
+    const result = await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', referencia: '6aee0e1b2ff6fb0001f89db0',
+    });
+
+    // El procesamiento bancario (desvinculación + auditoría) corrió COMPLETO, sin verse afectado.
+    expect(result).toEqual({ reversionId: 'rev-loyalty-err', movimientosAfectados: 1, yaEstabaDesvinculada: false });
+    expect(mov.erpIds).toEqual([]);
+    expect(mov.save).toHaveBeenCalledTimes(1);
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({ efectoLealtad: null }));
+  });
+
+  test('reversión de lealtad exitosa: ErpReversion.efectoLealtad queda poblado', async () => {
+    const mov = fakeMov({
+      erpIds:   ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' }],
+      deposito: 500,
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-loyalty-ok' });
+    revertirPuntosPorAbono.mockResolvedValue({ reverted: true, cardId: 7, puntosRevertidos: '-50.00' });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', referencia: '6aee0e1b2ff6fb0001f89db0',
+    });
+
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({
+      efectoLealtad: { idAbono: '6aee0e1b2ff6fb0001f89db0', cardId: 7, puntosRevertidos: '-50.00' },
+    }));
+  });
+
+  test('sin reversión de lealtad (reverted:false): ErpReversion.efectoLealtad queda null', async () => {
+    const mov = fakeMov({
+      erpIds:   ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' }],
+      deposito: 500,
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-loyalty-noop' });
+    revertirPuntosPorAbono.mockResolvedValue({ reverted: false });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', referencia: '6aee0e1b2ff6fb0001f89db0',
+    });
+
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({ efectoLealtad: null }));
   });
 });
 

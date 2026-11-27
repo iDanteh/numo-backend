@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * loyalty-kore-venta-cancelada.service.test.js — webhook Kore→Numo de cancelación de
+ * loyalty-kore-venta-retiro.service.test.js — webhook Kore→Numo de retiro de
  * venta, total Y parcial (Pieza 1) + bandeja de auditoría cruzada (Pieza 2). Mismo patrón
  * de mocking que loyalty-kore-venta.service.test.js (modelos planos + sequelize.transaction
  * invocando el callback con una tx falsa) — `./loyalty-ledger.service` NO se mockea: corre
@@ -36,7 +36,7 @@ const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
 const CollectionRequest = require('../../../banks/domains/collection-requests/CollectionRequest.model');
 const { movimientosDe } = require('../../../banks/domains/collection-requests/collection-request-asignaciones');
 const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
-const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
+const ventaRetiroService = require('./loyalty-kore-venta-retiro.service');
 
 function makeCard(overrides = {}) {
   const card = { id: 1, saldoPuntos: '100.00', activa: true, ...overrides };
@@ -60,42 +60,42 @@ beforeEach(() => {
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data, saldoResultante: data.saldoResultante ?? '0.00' }));
 });
 
-describe('procesarVentaCanceladaKore — validación', () => {
+describe('procesarVentaRetiroKore — validación', () => {
   it('400 si falta o serieFolio tiene formato inválido', async () => {
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 400 });
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: 'invalido', serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
-      .rejects.toMatchObject({ statusCode: 400 });
-  });
-
-  it('400 si falta o serieFolioCancelacion tiene formato inválido', async () => {
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, tipoCancelacion: 'total' }))
-      .rejects.toMatchObject({ statusCode: 400 });
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: 'invalido', tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: 'invalido', serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 400 });
   });
 
-  it('400 si tipoCancelacion no es "total" ni "parcial"', async () => {
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'otracosa' }))
+  it('400 si falta o serieFolioRetiro tiene formato inválido', async () => {
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, tipoRetiro: 'total' }))
+      .rejects.toMatchObject({ statusCode: 400 });
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: 'invalido', tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 400 });
   });
 
-  it('400 si tipoCancelacion es "parcial" sin importeCancelado o con importeCancelado <= 0', async () => {
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial' }))
+  it('400 si tipoRetiro no es "total" ni "parcial"', async () => {
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'otracosa' }))
       .rejects.toMatchObject({ statusCode: 400 });
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 0,
+  });
+
+  it('400 si tipoRetiro es "parcial" sin importeRetirado o con importeRetirado <= 0', async () => {
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial' }))
+      .rejects.toMatchObject({ statusCode: 400 });
+    await expect(ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 0,
     })).rejects.toMatchObject({ statusCode: 400 });
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: -5,
+    await expect(ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: -5,
     })).rejects.toMatchObject({ statusCode: 400 });
   });
 });
 
-describe('procesarVentaCanceladaKore — idempotencia real', () => {
-  it('responde yaRevertida:true sin tocar nada si la fila :REVERSION:<serieFolioCancelacion> ya existe', async () => {
+describe('procesarVentaRetiroKore — idempotencia real', () => {
+  it('responde yaRevertida:true sin tocar nada si la fila :REVERSION:<serieFolioRetiro> ya existe', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(filaLedger({ tipo: 'AJUSTE', referenciaExterna: `${SF}:REVERSION:${SFC1}` }));
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    const res = await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
     expect(res).toEqual({ ok: true, yaRevertida: true });
     expect(LoyaltyPointsLedger.findOne).toHaveBeenCalledWith({ where: { origen: 'kore', referenciaExterna: `${SF}:REVERSION:${SFC1}` } });
     expect(LoyaltyPointsLedger.findAll).not.toHaveBeenCalled();
@@ -103,16 +103,16 @@ describe('procesarVentaCanceladaKore — idempotencia real', () => {
   });
 });
 
-describe('procesarVentaCanceladaKore — nada que revertir', () => {
+describe('procesarVentaRetiroKore — nada que revertir', () => {
   it('404 si no hay ninguna fila original kore para el serieFolio', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([]);
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 404 });
   });
 });
 
-describe('procesarVentaCanceladaKore — total sin parciales previas', () => {
+describe('procesarVentaRetiroKore — total sin parciales previas', () => {
   it('revierte el neto de ACUMULACION+PROMOCION+CANJE con una sola fila AJUSTE', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([
@@ -122,13 +122,13 @@ describe('procesarVentaCanceladaKore — total sin parciales previas', () => {
     ]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '200.00' }));
 
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total', motivoCancelacion: 'cliente canceló',
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total', motivoRetiro: 'cliente canceló',
     });
 
     // neto = 50 + 30 - 20 = 60 -> se revierte -60.
     expect(res).toEqual({
-      ok: true, revertido: true, tipoCancelacion: 'total', puntosRevertidos: '-60.00', saldoResultante: 140,
+      ok: true, revertido: true, tipoRetiro: 'total', puntosRevertidos: '-60.00', saldoResultante: 140,
     });
     expect(LoyaltyPointsLedger.create).toHaveBeenCalledWith(expect.objectContaining({
       tipo: 'AJUSTE',
@@ -143,30 +143,51 @@ describe('procesarVentaCanceladaKore — total sin parciales previas', () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger()]);
     LoyaltyCard.findByPk.mockResolvedValue(null);
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 404 });
   });
 });
 
-describe('procesarVentaCanceladaKore — parcial', () => {
-  it('calcula la proporción usando el montoVenta de la fila ACUMULACION guardada ($1000 venta, 50 pts, cancela $200 -> 10 pts)', async () => {
+describe('procesarVentaRetiroKore — parcial', () => {
+  it('calcula la proporción usando el montoVenta de la fila ACUMULACION guardada ($1000 venta, 50 pts, retira $200 -> 10 pts)', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([
       filaLedger({ tipo: 'ACUMULACION', puntos: '50.00', referenciaExterna: `${SF}:ACUMULACION`, montoVenta: '1000.00' }),
     ]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '200.00' }));
 
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 200,
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 200,
     });
 
     expect(res).toEqual({
-      ok: true, revertido: true, tipoCancelacion: 'parcial', puntosRevertidos: '-10.00', saldoResultante: 190,
+      ok: true, revertido: true, tipoRetiro: 'parcial', puntosRevertidos: '-10.00', saldoResultante: 190,
     });
     expect(LoyaltyPointsLedger.create).toHaveBeenCalledWith(expect.objectContaining({
       puntos: '-10.00',
       referenciaExterna: `${SF}:REVERSION:${SFC1}`,
     }), expect.anything());
+  });
+
+  it('FIX 2026-11-19: suma el montoVenta de TODAS las filas ACUMULACION (CxC con 2+ abonos), no solo la primera', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    // CxC con 2 abonos: $600 (20 pts) + $400 (10 pts) = $1000 total, 30 pts neto. Antes del fix,
+    // _resolverMontoVentaOriginal tomaba SOLO el primer abono ($600) como "monto total de la
+    // venta" — acá se verifica que usa la suma real ($1000).
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      filaLedger({ tipo: 'ACUMULACION', puntos: '20.00', referenciaExterna: `${SF}:abono1:ACUMULACION`, montoVenta: '600.00' }),
+      filaLedger({ tipo: 'ACUMULACION', puntos: '10.00', referenciaExterna: `${SF}:abono2:ACUMULACION`, montoVenta: '400.00' }),
+    ]);
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '100.00' }));
+
+    // Retira $200 (20% de los $1000 reales) -> debe revertir 20% de 30 pts = 6 pts.
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 200,
+    });
+
+    expect(res).toEqual({
+      ok: true, revertido: true, tipoRetiro: 'parcial', puntosRevertidos: '-6.00', saldoResultante: 94,
+    });
   });
 
   it('usa el montoVenta del body cuando no hay fila ACUMULACION guardada (venta 100% CANJE)', async () => {
@@ -176,13 +197,13 @@ describe('procesarVentaCanceladaKore — parcial', () => {
     ]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '10.00' }));
 
-    // venta de $400, neto = -40, cancela $200 (mitad) -> revierte +20.
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 200, montoVenta: 400,
+    // venta de $400, neto = -40, retira $200 (mitad) -> revierte +20.
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 200, montoVenta: 400,
     });
 
     expect(res).toEqual({
-      ok: true, revertido: true, tipoCancelacion: 'parcial', puntosRevertidos: '20.00', saldoResultante: 30,
+      ok: true, revertido: true, tipoRetiro: 'parcial', puntosRevertidos: '20.00', saldoResultante: 30,
     });
   });
 
@@ -192,8 +213,8 @@ describe('procesarVentaCanceladaKore — parcial', () => {
       filaLedger({ tipo: 'ACUMULACION', puntos: '50.00', referenciaExterna: `${SF}:ACUMULACION`, montoVenta: '1000.00' }),
     ]);
 
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 200, montoVenta: 500,
+    await expect(ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 200, montoVenta: 500,
     })).rejects.toMatchObject({ statusCode: 409 });
     expect(LoyaltyCard.findByPk).not.toHaveBeenCalled();
   });
@@ -204,12 +225,12 @@ describe('procesarVentaCanceladaKore — parcial', () => {
       filaLedger({ tipo: 'CANJE', puntos: '-40.00', referenciaExterna: `${SF}:CANJE` }),
     ]);
 
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'parcial', importeCancelado: 200,
+    await expect(ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'parcial', importeRetirado: 200,
     })).rejects.toMatchObject({ statusCode: 400 });
   });
 
-  it('400 si la suma de cancelaciones (previas + esta) excede el montoVenta original', async () => {
+  it('400 si la suma de retiros (previos + este) excede el montoVenta original', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([
       filaLedger({ tipo: 'ACUMULACION', puntos: '50.00', referenciaExterna: `${SF}:ACUMULACION`, montoVenta: '1000.00' }),
@@ -217,13 +238,13 @@ describe('procesarVentaCanceladaKore — parcial', () => {
       filaLedger({ tipo: 'AJUSTE', puntos: '-45.00', referenciaExterna: `${SF}:REVERSION:${SFC1}` }),
     ]);
 
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC2, tipoCancelacion: 'parcial', importeCancelado: 200,
+    await expect(ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC2, tipoRetiro: 'parcial', importeRetirado: 200,
     })).rejects.toMatchObject({ statusCode: 400 });
     expect(LoyaltyCard.findByPk).not.toHaveBeenCalled();
   });
 
-  it('dos cancelaciones parciales consecutivas: la segunda se calcula correctamente sin pisar la primera', async () => {
+  it('dos retiros parciales consecutivos: el segundo se calcula correctamente sin pisar el primero', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     // Venta de $1000 -> 50 pts. Primera parcial ya canceló $200 -> revirtió -10.
     LoyaltyPointsLedger.findAll.mockResolvedValue([
@@ -233,12 +254,12 @@ describe('procesarVentaCanceladaKore — parcial', () => {
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '40.00' }));
 
     // Segunda parcial: cancela otros $300 (30% de 1000) -> revierte 15 pts más.
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC2, tipoCancelacion: 'parcial', importeCancelado: 300,
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC2, tipoRetiro: 'parcial', importeRetirado: 300,
     });
 
     expect(res).toEqual({
-      ok: true, revertido: true, tipoCancelacion: 'parcial', puntosRevertidos: '-15.00', saldoResultante: 25,
+      ok: true, revertido: true, tipoRetiro: 'parcial', puntosRevertidos: '-15.00', saldoResultante: 25,
     });
     expect(LoyaltyPointsLedger.create).toHaveBeenCalledWith(expect.objectContaining({
       puntos: '-15.00',
@@ -246,7 +267,7 @@ describe('procesarVentaCanceladaKore — parcial', () => {
     }), expect.anything());
   });
 
-  it('cancelación total después de una parcial previa revierte solo el remanente', async () => {
+  it('retiro total después de uno parcial previo revierte solo el remanente', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     // neto original = 60 (ACUMULACION 50 + CANJE -(-10)... usamos un caso simple: ACUMULACION 60).
     LoyaltyPointsLedger.findAll.mockResolvedValue([
@@ -255,18 +276,18 @@ describe('procesarVentaCanceladaKore — parcial', () => {
     ]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '50.00' }));
 
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({
-      serieFolio: SF, serieFolioCancelacion: SFC2, tipoCancelacion: 'total',
+    const res = await ventaRetiroService.procesarVentaRetiroKore({
+      serieFolio: SF, serieFolioRetiro: SFC2, tipoRetiro: 'total',
     });
 
     // remanente = 60 - 10 = 50 -> revierte -50 (no vuelve a tocar los 10 ya revertidos).
     expect(res).toEqual({
-      ok: true, revertido: true, tipoCancelacion: 'total', puntosRevertidos: '-50.00', saldoResultante: 0,
+      ok: true, revertido: true, tipoRetiro: 'total', puntosRevertidos: '-50.00', saldoResultante: 0,
     });
   });
 });
 
-describe('procesarVentaCanceladaKore — saldo insuficiente', () => {
+describe('procesarVentaRetiroKore — saldo insuficiente', () => {
   it('no toca el saldo, registra proceso fallido y responde 200 revertido:false', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([
@@ -274,19 +295,19 @@ describe('procesarVentaCanceladaKore — saldo insuficiente', () => {
     ]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '10.00' })); // 10 - 50 < 0
 
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    const res = await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
 
     expect(res).toEqual({ ok: true, revertido: false, motivo: 'saldo_insuficiente' });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
     expect(registrarVentaFallida).toHaveBeenCalledWith(
       SF,
-      expect.objectContaining({ serieFolio: SF, serieFolioCancelacion: SFC1 }),
+      expect.objectContaining({ serieFolio: SF, serieFolioRetiro: SFC1 }),
       expect.stringContaining('Saldo insuficiente'),
     );
   });
 });
 
-describe('procesarVentaCanceladaKore — carrera (SequelizeUniqueConstraintError)', () => {
+describe('procesarVentaRetiroKore — carrera (SequelizeUniqueConstraintError)', () => {
   it('responde yaRevertida:true si otro request concurrente ya insertó la reversión', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger()]);
@@ -294,7 +315,7 @@ describe('procesarVentaCanceladaKore — carrera (SequelizeUniqueConstraintError
     const err = new Error('duplicate'); err.name = 'SequelizeUniqueConstraintError';
     LoyaltyPointsLedger.create.mockRejectedValue(err);
 
-    const res = await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    const res = await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
     expect(res).toEqual({ ok: true, yaRevertida: true });
   });
 
@@ -304,7 +325,7 @@ describe('procesarVentaCanceladaKore — carrera (SequelizeUniqueConstraintError
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
     LoyaltyPointsLedger.create.mockRejectedValue(new Error('DB caída'));
 
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toThrow('DB caída');
   });
 });
@@ -312,25 +333,25 @@ describe('procesarVentaCanceladaKore — carrera (SequelizeUniqueConstraintError
 // Notificación en vivo (2026-11-10, pedido explícito del usuario): a la sala de la tarjeta
 // puntual, nunca emitToAll (ver docstring del archivo). Se emite incluso en los caminos
 // idempotentes/carrera (inofensivo), pero NUNCA si no se escribió ningún movimiento real.
-describe('procesarVentaCanceladaKore — notificación en vivo (emitToLoyaltyCard)', () => {
+describe('procesarVentaRetiroKore — notificación en vivo (emitToLoyaltyCard)', () => {
   it('ya revertida (idempotente): emite con el cardId de la fila ya existente', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(filaLedger({
       cardId: 5, tipo: 'AJUSTE', referenciaExterna: `${SF}:REVERSION:${SFC1}`,
     }));
 
-    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
 
-    expect(emitToLoyaltyCard).toHaveBeenCalledWith(5, 'lealtad-tarjeta:actualizada', { cardId: 5, motivo: 'cancelacion-kore' });
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(5, 'lealtad-tarjeta:actualizada', { cardId: 5, motivo: 'retiro-kore' });
   });
 
-  it('cancelación total aplicada con éxito: emite con el cardId de la venta original', async () => {
+  it('retiro total aplicado con éxito: emite con el cardId de la venta original', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger({ cardId: 9, tipo: 'ACUMULACION', puntos: '50.00' })]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ id: 9, saldoPuntos: '200.00' }));
 
-    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
 
-    expect(emitToLoyaltyCard).toHaveBeenCalledWith(9, 'lealtad-tarjeta:actualizada', { cardId: 9, motivo: 'cancelacion-kore' });
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(9, 'lealtad-tarjeta:actualizada', { cardId: 9, motivo: 'retiro-kore' });
   });
 
   it('saldo insuficiente: NO emite (no se escribió ningún movimiento real)', async () => {
@@ -338,7 +359,7 @@ describe('procesarVentaCanceladaKore — notificación en vivo (emitToLoyaltyCar
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger({ tipo: 'ACUMULACION', puntos: '50.00' })]);
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '10.00' }));
 
-    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
 
     expect(emitToLoyaltyCard).not.toHaveBeenCalled();
   });
@@ -350,22 +371,22 @@ describe('procesarVentaCanceladaKore — notificación en vivo (emitToLoyaltyCar
     const err = new Error('duplicate'); err.name = 'SequelizeUniqueConstraintError';
     LoyaltyPointsLedger.create.mockRejectedValue(err);
 
-    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+    await ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' });
 
-    expect(emitToLoyaltyCard).toHaveBeenCalledWith(3, 'lealtad-tarjeta:actualizada', { cardId: 3, motivo: 'cancelacion-kore' });
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(3, 'lealtad-tarjeta:actualizada', { cardId: 3, motivo: 'retiro-kore' });
   });
 
   it('404 (no hay venta original que revertir): nunca emite', async () => {
     LoyaltyPointsLedger.findOne.mockResolvedValue(null);
     LoyaltyPointsLedger.findAll.mockResolvedValue([]);
 
-    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+    await expect(ventaRetiroService.procesarVentaRetiroKore({ serieFolio: SF, serieFolioRetiro: SFC1, tipoRetiro: 'total' }))
       .rejects.toMatchObject({ statusCode: 404 });
     expect(emitToLoyaltyCard).not.toHaveBeenCalled();
   });
 });
 
-describe('listarVentasCanceladasConDeposito', () => {
+describe('listarVentasRetiradasConDeposito', () => {
   function filaReversion(overrides = {}) {
     return {
       referenciaExterna: `${SF}:REVERSION:${SFC1}`,
@@ -378,7 +399,7 @@ describe('listarVentasCanceladasConDeposito', () => {
 
   it('vacío si no hay ninguna reversión', async () => {
     LoyaltyPointsLedger.findAll.mockResolvedValue([]);
-    const res = await ventaCanceladaService.listarVentasCanceladasConDeposito();
+    const res = await ventaRetiroService.listarVentasRetiradasConDeposito();
     expect(res).toEqual([]);
     expect(CollectionRequest.findOne).not.toHaveBeenCalled();
   });
@@ -386,7 +407,7 @@ describe('listarVentasCanceladasConDeposito', () => {
   it('excluye una reversión sin CollectionRequest vinculado', async () => {
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaReversion()]);
     CollectionRequest.findOne.mockReturnValue({ sort: jest.fn().mockResolvedValue(null) });
-    const res = await ventaCanceladaService.listarVentasCanceladasConDeposito();
+    const res = await ventaRetiroService.listarVentasRetiradasConDeposito();
     expect(res).toEqual([]);
     expect(movimientosDe).not.toHaveBeenCalled();
   });
@@ -396,17 +417,17 @@ describe('listarVentasCanceladasConDeposito', () => {
     const cr = { _id: 'cr1', cxcs: [{ serie: 'A0', folioExterno: '260605320' }] };
     CollectionRequest.findOne.mockReturnValue({ sort: jest.fn().mockResolvedValue(cr) });
     movimientosDe.mockReturnValue([]);
-    const res = await ventaCanceladaService.listarVentasCanceladasConDeposito();
+    const res = await ventaRetiroService.listarVentasRetiradasConDeposito();
     expect(res).toEqual([]);
   });
 
-  it('incluye una reversión con CollectionRequest + bankMovementId real, con serieFolioCancelacion', async () => {
+  it('incluye una reversión con CollectionRequest + bankMovementId real, con serieFolioRetiro', async () => {
     LoyaltyPointsLedger.findAll.mockResolvedValue([filaReversion()]);
     const cr = { _id: 'cr1', cxcs: [{ serie: 'A0', folioExterno: '260605320' }] };
     CollectionRequest.findOne.mockReturnValue({ sort: jest.fn().mockResolvedValue(cr) });
     movimientosDe.mockReturnValue(['mov1']);
 
-    const res = await ventaCanceladaService.listarVentasCanceladasConDeposito();
+    const res = await ventaRetiroService.listarVentasRetiradasConDeposito();
 
     expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ referenciaExterna: { [require('sequelize').Op.like]: '%:REVERSION:%' } }),
@@ -416,7 +437,7 @@ describe('listarVentasCanceladasConDeposito', () => {
       cardId: 'card-uuid-1',
       collectionRequestId: 'cr1',
       serieFolio: SF,
-      serieFolioCancelacion: SFC1,
+      serieFolioRetiro: SFC1,
       bankMovementId: 'mov1',
       telefono: '5512345678',
       nombre: 'Cliente Uno',

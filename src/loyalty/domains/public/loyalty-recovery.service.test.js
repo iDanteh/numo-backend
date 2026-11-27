@@ -30,6 +30,12 @@ jest.mock('../../shared/nip.util', () => ({
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
+// Envío del código OTP (2026-11-23) — se mockea completo, cubierto aparte en
+// otp-envio.adapter.test.js; acá solo se verifica QUÉ se le pasa (telefono/codigo) y que su
+// resultado nunca afecta la respuesta de solicitarCodigo (el adapter garantiza no lanzar).
+jest.mock('../../shared/otp-envio.adapter', () => ({
+  enviarCodigo: jest.fn(),
+}));
 // Historial de movimientos (2026-11-03) — se mockea completo, cubierto aparte en
 // loyalty-ledger.service.test.js; acá solo se verifica que se agrega al payload de éxito.
 jest.mock('../ledger/loyalty-ledger.service', () => ({
@@ -41,10 +47,17 @@ jest.mock('../ledger/loyalty-ledger.service', () => ({
 jest.mock('../cards/loyalty-card-audit.service', () => ({
   registrarCambioTarjeta: jest.fn(),
 }));
+// Foto propia del cliente (2026-11-23) — se mockea completo, cubierto aparte en
+// drive-loyalty-foto.service.test.js; acá solo se verifica QUÉ se le pasa (buffer/mimetype/
+// nombreArchivo) y que su resultado se persiste en las 3 columnas de foto.
+jest.mock('../cards/drive-loyalty-foto.service', () => ({
+  subirFotoCliente: jest.fn(),
+}));
 // Límite mensual de consultas con código (2026-11-09) — se mockea completo, cubierto aparte en
 // loyalty-config.service.test.js; acá solo se verifica que solicitarCodigo lo consulte y respete.
 jest.mock('../config/loyalty-config.service', () => ({
   obtenerConsultaCodigoMaxMes: jest.fn(),
+  obtenerSesionConsultaUsosMax: jest.fn(),
 }));
 
 const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
@@ -53,11 +66,14 @@ const {
   generarSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+const otpEnvioAdapter = require('../../shared/otp-envio.adapter');
 const ledgerService = require('../ledger/loyalty-ledger.service');
 const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
 const configService = require('../config/loyalty-config.service');
+const { subirFotoCliente } = require('../cards/drive-loyalty-foto.service');
 const {
   solicitarCodigo, confirmarCodigoConsulta, verConsultaSesion, guardarEmailConsulta,
+  guardarFechaNacimientoConsulta, guardarFotoConsulta,
 } = require('./loyalty-recovery.service');
 
 const TELEFONO = '5512345678';
@@ -81,6 +97,10 @@ function makeCard(overrides = {}) {
     consultaSesionExpiraEn: null,
     totalConsultas: 0,
     emailContacto: null,
+    fechaNacimientoCliente: null,
+    fotoUrl: null,
+    fotoDriveFileId: null,
+    fotoMimeType: null,
     consultaCodigoMesPeriodo: null,
     consultaCodigoMesContador: 0,
     update: jest.fn(function (cambios) { Object.assign(this, cambios); return Promise.resolve(this); }),
@@ -109,9 +129,16 @@ beforeEach(() => {
   process.env.NODE_ENV = 'test';
   ledgerService.listarMovimientosPublicos.mockResolvedValue([]);
   generarSesionToken.mockReturnValue(SESION_TOKEN);
+  // Default: envío "exitoso" simulado — ningún test de solicitarCodigo necesita ejercitar el
+  // resultado del adapter salvo el describe dedicado más abajo.
+  otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: true, simulado: true });
   // Default: sin límite configurado (preserva el comportamiento de todos los tests que no
   // ejercitan el límite mensual explícitamente) — ver describe dedicado más abajo.
   configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(null);
+  // Default: 3 (el valor histórico fijo, SESION_USOS_INICIALES de antes de 2026-11-20) — preserva
+  // el comportamiento de todos los tests que no ejercitan este límite explícitamente, ver describe
+  // dedicado más abajo.
+  configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
 });
 
 afterAll(() => {
@@ -219,6 +246,39 @@ describe('solicitarCodigo — teléfono existente genera y persiste un código n
     const loggedFullPhone = logger.info.mock.calls.some((call) =>
       call.some((arg) => typeof arg === 'string' && arg.includes(TELEFONO)));
     expect(loggedFullPhone).toBe(false);
+  });
+});
+
+describe('solicitarCodigo — envío del código vía otp-envio.adapter.js (2026-11-23)', () => {
+  test('llama a enviarCodigo con el teléfono y el código real recién generado (en texto plano, SOLO al adapter)', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(otpEnvioAdapter.enviarCodigo).toHaveBeenCalledWith({ telefono: TELEFONO, codigo: CODIGO_REAL });
+  });
+
+  test('NO llama a enviarCodigo si el teléfono no existe (nunca se generó un código real)', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(otpEnvioAdapter.enviarCodigo).not.toHaveBeenCalled();
+  });
+
+  test('un fallo del adapter (enviado:false) nunca rompe solicitarCodigo ni afecta su respuesta', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+    otpEnvioAdapter.enviarCodigo.mockResolvedValue({ enviado: false, motivo: 'credenciales_no_configuradas' });
+
+    const resultado = await solicitarCodigo(TELEFONO);
+
+    expect(resultado).toEqual({ mensaje: expect.any(String), codigoDev: CODIGO_REAL });
   });
 });
 
@@ -383,6 +443,7 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
     expect(resultado).toEqual({
       nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 1234.5, movimientos: [],
       token: SESION_TOKEN, usosRestantes: 3, emailContacto: null,
+      fechaNacimientoCliente: null, tieneFoto: false,
     });
     expect(generarNip).not.toHaveBeenCalled();
     expect(card.update).toHaveBeenCalledWith({
@@ -434,6 +495,30 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
     const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
 
     expect(resultado.emailContacto).toBe('previo@correo.com');
+  });
+
+  // Mismo criterio que emailContacto (2026-11-23) — el frontend arranca el campo ya bloqueado.
+  test('tarjeta con fechaNacimientoCliente ya guardada → la incluye en la respuesta', async () => {
+    const card = makeCard({ activa: true, fechaNacimientoCliente: '2000-01-15' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.fechaNacimientoCliente).toBe('2000-01-15');
+  });
+
+  // Nunca el link de Drive (fotoUrl) acá — solo un booleano (2026-11-23).
+  test('tarjeta con foto ya guardada → tieneFoto:true, nunca expone fotoUrl/fotoDriveFileId', async () => {
+    const card = makeCard({ activa: true, fotoDriveFileId: 'drive-id-1', fotoUrl: 'https://drive.google.com/x' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.tieneFoto).toBe(true);
+    expect(resultado).not.toHaveProperty('fotoUrl');
+    expect(resultado).not.toHaveProperty('fotoDriveFileId');
   });
 
   test('código incorrecto comparte el mismo camino de error único (_validarCodigo)', async () => {
@@ -556,6 +641,54 @@ describe('Límite mensual de consultas CON CÓDIGO (2026-11-09, blindaje adicion
   });
 });
 
+describe('Límite de consultas SIN código (SESION_CONSULTA_USOS_MAX, 2026-11-20)', () => {
+  test('default (3, sin configurar) → confirmarCodigoConsulta abre la sesión con usosRestantes:3', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(3);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(3);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 3 }));
+  });
+
+  test('valor configurado distinto del default (ej. 5) → se respeta en vez del fijo de antes', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(5);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(5);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 5 }));
+  });
+
+  test('0 (deshabilitado de verdad, NO "ilimitado") → la sesión se abre con usosRestantes:0, sin vistas extra', async () => {
+    configService.obtenerSesionConsultaUsosMax.mockResolvedValue(0);
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.usosRestantes).toBe(0);
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ consultaSesionUsosRestantes: 0 }));
+  });
+
+  test('con 0 configurado, un intento posterior de verConsultaSesion rechaza de inmediato (nunca decrementa en negativo)', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 0 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEvent (2026-10-26)', () => {
   test('solicitarCodigo: fallo (teléfono desconocido) registra evento de auditoría', async () => {
     LoyaltyCard.findOne.mockResolvedValue(null);
@@ -629,6 +762,7 @@ describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEven
     await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).resolves.toEqual({
       nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 100, movimientos: [],
       token: SESION_TOKEN, usosRestantes: 3, emailContacto: null,
+      fechaNacimientoCliente: null, tieneFoto: false,
     });
   });
 
@@ -713,6 +847,7 @@ describe('verConsultaSesion — "ver de nuevo" sin pedir un código nuevo (2026-
     expect(resultado).toEqual({
       nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 500, movimientos: [],
       usosRestantes: 2, emailContacto: null,
+      fechaNacimientoCliente: null, tieneFoto: false,
     });
     expect(card.update).toHaveBeenCalledWith({
       consultaSesionUsosRestantes: 2,
@@ -746,6 +881,28 @@ describe('verConsultaSesion — "ver de nuevo" sin pedir un código nuevo (2026-
     const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
 
     expect(resultado.emailContacto).toBe('previo@correo.com');
+  });
+
+  test('tarjeta con fechaNacimientoCliente ya guardada → la incluye en la respuesta', async () => {
+    const card = makeCardConSesion({ fechaNacimientoCliente: '2000-01-15' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
+
+    expect(resultado.fechaNacimientoCliente).toBe('2000-01-15');
+  });
+
+  test('tarjeta con foto ya guardada → tieneFoto:true, nunca expone fotoUrl/fotoDriveFileId', async () => {
+    const card = makeCardConSesion({ fotoDriveFileId: 'drive-id-1', fotoUrl: 'https://drive.google.com/x' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
+
+    expect(resultado.tieneFoto).toBe(true);
+    expect(resultado).not.toHaveProperty('fotoUrl');
+    expect(resultado).not.toHaveProperty('fotoDriveFileId');
   });
 
   test('registra auditoría de éxito (tipo ver_consulta)', async () => {
@@ -858,6 +1015,210 @@ describe('guardarEmailConsulta — correo de contacto futuro, no consume un uso 
     await expect(guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'cliente@correo.com')).rejects.toMatchObject({
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('guardarFechaNacimientoConsulta — fecha de nacimiento certificada por el cliente (2026-11-23)', () => {
+  test('sin sesión vigente → 422 genérico (mismo error que guardarEmailConsulta)', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+  });
+
+  test.each([
+    ['formato con slash', '15/01/2000'],
+    ['fecha inexistente (desborde de calendario)', '2026-02-30'],
+    ['fecha futura', '2099-01-01'],
+    ['más de ~120 años atrás', '1850-01-01'],
+    ['vacío', ''],
+  ])('%s → error DISTINTO (LOYALTY_FECHA_NACIMIENTO_INVALIDA, no RecoveryFailedError)', async (_caso, valor) => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, valor)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_FECHA_NACIMIENTO_INVALIDA',
+    });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+
+  test('fecha válida → persiste fechaNacimientoCliente, NO toca usosRestantes/totalConsultas, devuelve el valor', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 3, totalConsultas: 5 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15');
+
+    expect(resultado).toEqual({ mensaje: expect.any(String), fechaNacimientoCliente: '2000-01-15' });
+    expect(card.update).toHaveBeenCalledWith({ fechaNacimientoCliente: '2000-01-15' });
+  });
+
+  describe('historial de cambios (registrarCambioTarjeta)', () => {
+    test('primera vez (sin fecha previa) → antes:null, despues:la nueva, origen cliente', async () => {
+      const card = makeCardConSesion({ fechaNacimientoCliente: null });
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+
+      await guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15');
+
+      expect(registrarCambioTarjeta).toHaveBeenCalledWith({
+        cardId: card.id,
+        antes: { fechaNacimientoCliente: null },
+        despues: { fechaNacimientoCliente: '2000-01-15' },
+        accion: 'actualizacion_fecha_nacimiento_publico',
+        origen: 'cliente',
+      });
+    });
+
+    test('actualización (con fecha previa distinta) → antes:la vieja, despues:la nueva', async () => {
+      const card = makeCardConSesion({ fechaNacimientoCliente: '1999-05-20' });
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+
+      await guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15');
+
+      expect(registrarCambioTarjeta).toHaveBeenCalledWith(expect.objectContaining({
+        antes: { fechaNacimientoCliente: '1999-05-20' },
+        despues: { fechaNacimientoCliente: '2000-01-15' },
+      }));
+    });
+  });
+
+  test('registra auditoría de éxito (tipo guardar_fecha_nacimiento)', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15', { ip: '10.0.0.5' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'guardar_fecha_nacimiento', resultado: 'exito', motivo: null, telefono: TELEFONO, ip: '10.0.0.5',
+    });
+  });
+
+  test('tarjeta inactiva → 422 genérico, nunca persiste la fecha', async () => {
+    const card = makeCardConSesion({ activa: false });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarFechaNacimientoConsulta(TELEFONO, SESION_TOKEN, '2000-01-15')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('guardarFotoConsulta — foto propia del cliente (2026-11-23)', () => {
+  const BUFFER = Buffer.from('fake-image-bytes');
+  const MIMETYPE = 'image/jpeg';
+
+  test('sin sesión vigente → 422 genérico (mismo error que guardarEmailConsulta)', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(subirFotoCliente).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['sin buffer', null, MIMETYPE],
+    ['buffer vacío', Buffer.alloc(0), MIMETYPE],
+    ['mimetype no soportado (pdf)', BUFFER, 'application/pdf'],
+  ])('%s → error DISTINTO (LOYALTY_FOTO_INVALIDA, no RecoveryFailedError), nunca sube a Drive', async (_caso, buffer, mimetype) => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarFotoConsulta(TELEFONO, SESION_TOKEN, buffer, mimetype)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_FOTO_INVALIDA',
+    });
+    expect(subirFotoCliente).not.toHaveBeenCalled();
+    expect(card.update).not.toHaveBeenCalled();
+  });
+
+  test('archivo válido → sube a Drive y persiste fotoUrl/fotoDriveFileId/fotoMimeType, devuelve mensaje sin el link', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+    subirFotoCliente.mockResolvedValue({ driveFileId: 'drive-id-1', driveWebViewLink: 'https://drive.google.com/x' });
+
+    const resultado = await guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE);
+
+    expect(subirFotoCliente).toHaveBeenCalledWith(BUFFER, MIMETYPE, expect.stringContaining(TELEFONO));
+    expect(card.update).toHaveBeenCalledWith({
+      fotoUrl: 'https://drive.google.com/x', fotoDriveFileId: 'drive-id-1', fotoMimeType: MIMETYPE,
+    });
+    // D6-D8, minimal response payload — nunca el link de Drive en la respuesta pública.
+    expect(resultado).toEqual({ mensaje: expect.any(String) });
+    expect(resultado).not.toHaveProperty('fotoUrl');
+  });
+
+  describe('historial de cambios (registrarCambioTarjeta)', () => {
+    test('primera vez (sin foto previa) → antes:null en los 3 campos, origen cliente', async () => {
+      const card = makeCardConSesion({ fotoUrl: null, fotoDriveFileId: null, fotoMimeType: null });
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+      subirFotoCliente.mockResolvedValue({ driveFileId: 'drive-id-1', driveWebViewLink: 'https://drive.google.com/x' });
+
+      await guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE);
+
+      expect(registrarCambioTarjeta).toHaveBeenCalledWith({
+        cardId: card.id,
+        antes: { fotoUrl: null, fotoDriveFileId: null, fotoMimeType: null },
+        despues: { fotoUrl: 'https://drive.google.com/x', fotoDriveFileId: 'drive-id-1', fotoMimeType: MIMETYPE },
+        accion: 'actualizacion_foto_publico',
+        origen: 'cliente',
+      });
+    });
+
+    test('si registrarCambioTarjeta rechaza, el error se propaga (no es fire-and-forget)', async () => {
+      const card = makeCardConSesion();
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+      subirFotoCliente.mockResolvedValue({ driveFileId: 'drive-id-1', driveWebViewLink: 'https://drive.google.com/x' });
+      registrarCambioTarjeta.mockRejectedValueOnce(new Error('DB caída'));
+
+      await expect(guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE)).rejects.toThrow('DB caída');
+    });
+  });
+
+  test('registra auditoría de éxito (tipo guardar_foto)', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+    subirFotoCliente.mockResolvedValue({ driveFileId: 'drive-id-1', driveWebViewLink: 'https://drive.google.com/x' });
+
+    await guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE, { ip: '10.0.0.5' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'guardar_foto', resultado: 'exito', motivo: null, telefono: TELEFONO, ip: '10.0.0.5',
+    });
+  });
+
+  test('tarjeta inactiva → 422 genérico, nunca sube a Drive', async () => {
+    const card = makeCardConSesion({ activa: false });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(subirFotoCliente).not.toHaveBeenCalled();
+  });
+
+  test('si subirFotoCliente rechaza (Drive caído), el error se propaga', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+    subirFotoCliente.mockRejectedValue(new Error('Drive caído'));
+
+    await expect(guardarFotoConsulta(TELEFONO, SESION_TOKEN, BUFFER, MIMETYPE)).rejects.toThrow('Drive caído');
     expect(card.update).not.toHaveBeenCalled();
   });
 });

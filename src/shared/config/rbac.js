@@ -235,6 +235,16 @@ const PERMISSIONS = Object.freeze({
   // asigna a contabilidad/cobranza/tienda.
   LOYALTY_IMPORTAR:        'loyalty:importar',
 
+  // Auditoría de Lealtad (2026-11-13, pedido explícito del usuario) — pantalla de
+  // concentrado que lee LoyaltySecurityEvent (eventos OTP: consulta pública y canje con
+  // Kore), ventas fallidas y ventas canceladas con depósito. Permiso PROPIO y exclusivo
+  // de admin a propósito (mismo criterio que LOYALTY_AJUSTES/LOYALTY_TARJETAS_NIVEL/
+  // LOYALTY_IMPORTAR): expone teléfonos completos y patrones de intentos fallidos de
+  // clientes reales, más sensible que el trabajo rutinario de mostrador — no se asigna a
+  // contabilidad/cobranza/tienda. Admin lo tiene por el wildcard '*'; se extiende por
+  // persona vía extraPermissions (pantalla Usuarios) si alguien más lo necesita.
+  LOYALTY_AUDITORIA:       'loyalty:auditoria',
+
   // Kiosco de facturación (2026-10-26) — muestra el espacio "Kiosco de facturación" en
   // "Espacios de NUMO" y permite pedir el pase con el que se entra a su panel de
   // administración (ver shared/services/kiosco-pase.service.js). Solo abre la puerta:

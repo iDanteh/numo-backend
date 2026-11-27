@@ -50,11 +50,24 @@ const DUMMY_HASH = bcrypt.hashSync('no-such-card-nip', BCRYPT_COST);
 const MAX_INTENTOS_FALLIDOS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 
-/** Código de verificación de 6 dígitos para recuperación de NIP. Generado
- * 100% por el sistema (nunca elegido por un usuario), por eso no hace falta
- * filtrar valores "débiles" como sí se hace con generarNip(). */
+// "000000".."999999" repetidos + las dos secuencias obvias (D6, mismo criterio que NIPS_DEBILES,
+// agregado 2026-11-13 — hardening pedido explícito del usuario). El espacio de 1M ya hace la fuerza
+// bruta inviable por sí solo (ver MAX_INTENTOS_FALLIDOS/LOCKOUT_MS), así que el beneficio real es
+// marginal, pero deja este generador consistente con generarNip() sin costo.
+const CODIGOS_DEBILES = new Set([
+  '012345', '543210',
+  ...Array.from({ length: 10 }, (_, d) => String(d).repeat(6)),
+]);
+
+/** Código de verificación de 6 dígitos — recuperación de NIP (loyalty-recovery.service.js) y código
+ * de autorización de canje (loyalty-kore-canje.service.js). Generado 100% por el sistema (nunca
+ * elegido por un usuario), reintentando si cae en un patrón obvio (CODIGOS_DEBILES). */
 function generarCodigoRecuperacion() {
-  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  let codigo;
+  do {
+    codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  } while (CODIGOS_DEBILES.has(codigo));
+  return codigo;
 }
 
 function hashCodigo(codigo) {
@@ -104,6 +117,6 @@ const DUMMY_SESION_TOKEN_HASH = hashSesionToken('no-such-consulta-session-token'
 module.exports = {
   generarNip, hashNip, compararNip, DUMMY_HASH, NIPS_DEBILES,
   MAX_INTENTOS_FALLIDOS, LOCKOUT_MS,
-  generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
+  generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH, CODIGOS_DEBILES,
   generarSesionToken, hashSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 };

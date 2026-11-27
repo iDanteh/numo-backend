@@ -42,6 +42,21 @@ const erpReversionSchema = new mongoose.Schema({
     // Payload crudo tal cual lo mandó Kore, para auditoría/depuración.
     payloadOriginal: { type: mongoose.Schema.Types.Mixed, default: null },
 
+    // Efecto de lealtad del abono puntual revertido (cambio `cxc-reversiones-puntos-abono`,
+    // design.md D3) — denormalizado acá, mismo criterio que erpLinkRemovido/erpLinkAjustado de
+    // arriba: la bandeja "Reversiones CxC" (admin-ops-panel) queda auditable sin tener que cruzar
+    // con el ledger de Lealtad (Postgres) a mano. `null` en el caso mayoritario (abono sin ningún
+    // efecto de lealtad, o cubierto por una cancelación de venta previa — ver
+    // loyalty-kore-reversion-abono.service.js#revertirPuntosPorAbono).
+    efectoLealtad: {
+      type: new mongoose.Schema({
+        idAbono:          { type: String, required: true },
+        cardId:           { type: Number, required: true },
+        puntosRevertidos: { type: Number, required: true },
+      }, { _id: false }),
+      default: null,
+    },
+
     // 2026-08-21 (caso real: Kore avisó una reversión de $100 que JAMÁS aplicó de su lado —
     // no fue una demora, el reverso no existe en su propio historial ni tiempo después).
     // Desde acá no hay forma de distinguir "Kore todavía no lo aplicó" de "Kore falló y

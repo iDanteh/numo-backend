@@ -23,7 +23,7 @@ const cardService = require('./domains/cards/loyalty-card.service');
 const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
-const congelamientoService = require('./jobs/congelamiento-puntos.service');
+const securityEventService = require('./domains/security/loyalty-security-event.service');
 
 const router = express.Router();
 
@@ -74,17 +74,6 @@ router.get('/cards/pendientes-revision-kore', authenticate, permit(PERMISSIONS.L
   res.json(await cardService.listarPendientesRevisionKore({ page, limit, search }));
 }));
 
-// Reporte "Puntos por vencer" (2026-11-03) — tarjetas a `dias` o menos de llegar a la fecha límite
-// de congelamiento por inactividad (ver congelamiento-puntos.service.js#tarjetasPorVencer). Ruta
-// estática antes de 'GET /cards/:id' por el mismo criterio que pendientes-revision-kore arriba.
-router.get('/cards/por-vencer', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
-  const dias = req.query.dias !== undefined ? Number(req.query.dias) : undefined;
-  const tarjetas = await congelamientoService.tarjetasPorVencer(
-    dias !== undefined ? { diasVentana: dias } : {},
-  );
-  res.json({ tarjetas });
-}));
-
 router.get('/cards/:id/movimientos', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   const { page, limit } = req.query;
   res.json(await ledgerService.listarMovimientos(req.params.id, { page, limit }));
@@ -105,10 +94,10 @@ router.get('/cards/:id/historial', authenticate, permit(PERMISSIONS.LOYALTY_READ
 // Ruta estática, agrupada junto al resto de rutas de /cards/:id/* de este dominio.
 router.get('/ledger/export', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   const {
-    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax, telefono,
   } = req.query;
   const movimientos = await ledgerService.listarMovimientosGlobal({
-    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax, telefono,
   });
   res.json({ movimientos });
 }));
@@ -208,18 +197,6 @@ router.put('/config/porcentajes', authenticate, permit(PERMISSIONS.LOYALTY_CONFI
   res.json(await configService.guardarPorcentajes(req.body, req.user));
 }));
 
-// Congelamiento de puntos por inactividad (2026-11-03) — meses sin ACUMULACIÓN tras los cuales
-// el job diario (loyalty/jobs/congelamientoPuntosCron.js) resetea el saldo a 0. Mismo criterio de
-// permisos que PORCENTAJES arriba (LOYALTY_READ/LOYALTY_CONFIG). `{ meses: number | null }` —
-// null = feature deshabilitada (sin configurar o en 0, ver loyalty-config.service.js).
-router.get('/config/congelamiento', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
-  res.json({ meses: await configService.obtenerCongelamientoMeses() });
-}));
-
-router.put('/config/congelamiento', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
-  res.json({ meses: await configService.guardarCongelamientoMeses(req.body?.meses, req.user) });
-}));
-
 // Límite mensual de consultas con código (2026-11-09) — tope de ciclos de código completos
 // ("solicitar" + "confirmar" exitoso) por tarjeta por mes calendario, en la consulta pública de
 // puntos. Mismo criterio de permisos/contrato que CONGELAMIENTO arriba. `{ max: number | null }` —
@@ -230,6 +207,108 @@ router.get('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.L
 
 router.put('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json({ max: await configService.guardarConsultaCodigoMaxMes(req.body?.max, req.user) });
+}));
+
+// Límite de consultas SIN código (2026-11-20) — vistas extra dentro de la sesión corta que abre
+// confirmarCodigoConsulta (ver loyalty-recovery.service.js#verConsultaSesion), sin pedir un código
+// nuevo. Mismo criterio de permisos que arriba. `{ max: number }` — a diferencia de
+// CONSULTA_CODIGO_MAX_MES, acá NUNCA es null: default 3 si nunca se configuró, 0 deshabilita de
+// verdad las vistas extra (nunca "sin límite", ver loyalty-config.service.js).
+router.get('/config/sesion-consulta-usos-max', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.obtenerSesionConsultaUsosMax() });
+}));
+
+router.put('/config/sesion-consulta-usos-max', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.guardarSesionConsultaUsosMax(req.body?.max, req.user) });
+}));
+
+// Vigencia del código de autorización de canje (2026-11-13) — minutos que dura vigente el código
+// de un solo uso que Numo manda al cliente para autorizar un canje de puntos en una venta de Kore
+// (ver loyalty-kore-canje.service.js). Mismo criterio de permisos que arriba. A diferencia de
+// CONGELAMIENTO/CONSULTA_CODIGO_MAX_MES, 0/vacío NO es válido acá (siempre hace falta una
+// vigencia real) — default 5 si nunca se configuró.
+router.get('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ minutos: await configService.obtenerCanjeCodigoVigenciaMin() });
+}));
+
+router.put('/config/canje-codigo-vigencia', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ minutos: await configService.guardarCanjeCodigoVigenciaMin(req.body?.minutos, req.user) });
+}));
+
+// Permitir saldo negativo en canje de puntos en venta (2026-11-20, PROVISIONAL, pedido explícito
+// del usuario) — decisión consumida por loyalty-kore-venta.service.js#_procesarUnAbonoNuevo.
+// Mismo criterio de permisos que el resto. `{ habilitado: boolean }`, default false (bloquea saldo
+// negativo, comportamiento de siempre) si nunca se configuró.
+router.get('/config/permitir-saldo-negativo-canje', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ habilitado: await configService.obtenerPermitirSaldoNegativoCanje() });
+}));
+
+router.put('/config/permitir-saldo-negativo-canje', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ habilitado: await configService.guardarPermitirSaldoNegativoCanje(req.body?.habilitado, req.user) });
+}));
+
+// Envío de código OTP (2026-11-23, pedido explícito del usuario) — config-driven del canal de
+// envío consumido por `loyalty/shared/otp-envio.adapter.js` (ver loyalty-config.service.js para el
+// detalle completo). Mismo criterio de permisos/contrato que el resto de esta pantalla
+// (LOYALTY_READ/LOYALTY_CONFIG). `modo`/`proveedor` son 2 claves independientes (no un grupo) —
+// mismo criterio que CONGELAMIENTO/CONSULTA_CODIGO_MAX_MES arriba: cada una vive en su propia
+// ruta porque el servicio ya las expone como 2 pares obtener/guardar separados.
+router.get('/config/otp-envio-modo', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ modo: await configService.obtenerOtpEnvioModo() });
+}));
+
+router.put('/config/otp-envio-modo', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ modo: await configService.guardarOtpEnvioModo(req.body?.modo, req.user) });
+}));
+
+router.get('/config/otp-envio-proveedor', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ proveedor: await configService.obtenerOtpEnvioProveedor() });
+}));
+
+router.put('/config/otp-envio-proveedor', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ proveedor: await configService.guardarOtpEnvioProveedor(req.body?.proveedor, req.user) });
+}));
+
+// Credenciales/ajustes de WhatsApp Business Cloud API — acá SÍ es un único endpoint de grupo (a
+// diferencia de modo/proveedor arriba): el servicio ya las expone como UN solo par
+// obtener/guardar (`obtenerOtpWhatsappConfig`/`guardarOtpWhatsappConfig`, patch parcial — ver
+// loyalty-config.service.js), así que replicar eso con 6 rutas individuales sería inventar una
+// convención nueva en vez de seguir la que ya existe. `token`/`appSecret` son `esSecreto:true`
+// (nunca se descifran para esta pantalla): se enmascaran acá con el MISMO placeholder fijo que ya
+// usa el enmascarado genérico de Configuraciones Globales para cualquier config esSecreto (ver
+// `global-config.service.js#listConfigsBySection`) — nunca el valor real, ni en el GET ni en la
+// confirmación del PUT.
+const _OTP_WHATSAPP_SECRET_MASK = '••••••••';
+function _enmascararOtpWhatsapp(config) {
+  return {
+    ...config,
+    token:     config.token ? _OTP_WHATSAPP_SECRET_MASK : null,
+    appSecret: config.appSecret ? _OTP_WHATSAPP_SECRET_MASK : null,
+  };
+}
+
+router.get('/config/otp-whatsapp', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(_enmascararOtpWhatsapp(await configService.obtenerOtpWhatsappConfig()));
+}));
+
+router.put('/config/otp-whatsapp', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  const { phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma } = req.body ?? {};
+  const config = await configService.guardarOtpWhatsappConfig(
+    { phoneNumberId, wabaId, token, appSecret, templateNombre, templateIdioma }, req.user,
+  );
+  res.json(_enmascararOtpWhatsapp(config));
+}));
+
+// Auditoría de eventos OTP (2026-11-13, pedido explícito del usuario) — quién pidió/validó un
+// código, cuándo y con qué resultado, para la consulta pública Y el canje con Kore (mismo tabla,
+// `tipo` distingue el flujo). Permiso dedicado LOYALTY_AUDITORIA (pedido explícito del usuario,
+// reemplaza el LOYALTY_CONFIG original de esta misma sesión): expone teléfonos completos y
+// patrones de intentos fallidos, más sensible que el resto de la configuración de Lealtad. NUNCA
+// expone el código en sí — ver docstring de loyalty-security-event.service.js, decisión confirmada
+// con el usuario de no revertir "nunca se persiste el código".
+router.get('/auditoria/eventos-seguridad', authenticate, permit(PERMISSIONS.LOYALTY_AUDITORIA), asyncHandler(async (req, res) => {
+  const { telefono, tipo, resultado, desde, hasta, limit, offset } = req.query ?? {};
+  res.json(await securityEventService.listarEventosSeguridad({ telefono, tipo, resultado, desde, hasta, limit, offset }));
 }));
 
 // Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:

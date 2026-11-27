@@ -21,6 +21,9 @@ jest.mock('../cards/loyalty-card.service', () => ({
   // consulta el catálogo real). Mockeado acá con el mismo set fijo de antes (Bronce/Plata/Oro) para
   // no tener que reescribir todos los tests existentes de este archivo.
   nivelEsValido: jest.fn(async (nombre) => ['Bronce', 'Plata', 'Oro'].includes(nombre)),
+  // Passthrough por default (igual que la mayoría de tests existentes, que ya mandan el nombre
+  // directo) — el test de traducción id→nombre de abajo sobreescribe esto puntualmente.
+  resolverNombreNivel: jest.fn(async (valor) => valor),
 }));
 // Notificación en vivo (2026-11-10) — mockeado para poder verificar que se emite sin depender de
 // una instancia real de Socket.IO (en test, el real ya es un no-op seguro porque `_io` nunca se
@@ -28,7 +31,7 @@ jest.mock('../cards/loyalty-card.service', () => ({
 jest.mock('../../../banks/shared/socket', () => ({ emitToAll: jest.fn() }));
 
 const { LoyaltyCard, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
-const { crearTarjeta, cambiarNivel } = require('../cards/loyalty-card.service');
+const { crearTarjeta, cambiarNivel, resolverNombreNivel } = require('../cards/loyalty-card.service');
 const { emitToAll } = require('../../../banks/shared/socket');
 const { procesarClienteKore } = require('./loyalty-kore-cliente.service');
 
@@ -338,6 +341,24 @@ describe('procesarClienteKore — evento actualizacion', () => {
     });
 
     expect(cambiarNivel).not.toHaveBeenCalled();
+  });
+
+  // Bug real 2026-11-17: Kore pasó a mandar el `id` de categoría ("1") en vez del nombre ("Oro") —
+  // procesarClienteKore debe traducirlo vía resolverNombreNivel() ANTES de pasarlo a cambiarNivel().
+  test('nivel viene como id de Kore ("1"): se traduce a nombre antes de cambiarNivel()', async () => {
+    const existente = card({ id: 39, nivel: 'Bronce' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+    resolverNombreNivel.mockResolvedValueOnce('Oro');
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K39', telefono: '5551234567', nombre: 'X', nivel: '1',
+    });
+
+    expect(resolverNombreNivel).toHaveBeenCalledWith('1');
+    expect(cambiarNivel).toHaveBeenCalledWith(
+      39, 'Oro', expect.objectContaining({ motivo: expect.any(String) }),
+      expect.objectContaining({ dbId: 'kore-webhook' }),
+    );
   });
 
   test('nivel inválido -> BadRequestError (400), no actualiza nada', async () => {

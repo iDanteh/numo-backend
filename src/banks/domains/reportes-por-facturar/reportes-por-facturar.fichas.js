@@ -88,7 +88,10 @@ const SALIDAS = ['devoluciones', 'pagoGastos', 'pagoViaticos', 'faltante'];
 // recibido* (2026-11-27, pedido del usuario: resumen "Recibí efectivo" como su Excel POR FACTURAR, por
 // día de cobro): el efectivo cobrado del día separado en mostrador / cobranza / otras sucursales.
 const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion', 'efectivoCobrado',
-  'recibidoMostrador', 'recibidoCobranza', 'recibidoOtrasSucursales'];
+  'recibidoMostrador', 'recibidoCobranza', 'recibidoOtrasSucursales',
+  // recibidoDiasAnteriores (2026-11-27, pedido del usuario): lo cobrado en días anteriores que suma hoy
+  // porque hoy se timbró su global (importe cobrado, antes de BN). Solo referencia.
+  'recibidoDiasAnteriores'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
@@ -368,6 +371,7 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], seriesJ
   for (const { d, abonos, hasta } of await _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes })) {
     if (yaSumados.has(`${d.remision}|${d.cobro}`)) continue;
     montos.cobroOtraSucursal += d.importe;
+    montos.recibidoDiasAnteriores += d.importe;
     const extras = _ajustarRenglon(d, abonos, { montos, hasta, cuentas: [...cuentasDia, ...anteriores] });
     if (extras == null) d.facturado = d.importe;
     detalle.push(d, ...(extras ?? []));
@@ -707,8 +711,10 @@ const _esPpd = i => String(i?.tipoPago ?? '').toUpperCase().includes('PPD');
 function _sumar(montos, detalle, mov) {
   montos[mov.concepto] += mov._monto;
   if (!ENTRADAS.includes(mov.concepto) && !SIN_FACTURA.includes(mov.concepto)) return;
-  // Resumen "Recibí efectivo" (2026-11-27): solo lo cobrado ESTE día (no los cobros de días anteriores).
-  if (!mov.cobradoEl) {
+  // Resumen "Recibí efectivo" (2026-11-27): lo cobrado ESTE día por tipo; lo de días anteriores aparte.
+  if (mov.cobradoEl) {
+    if (ENTRADAS.includes(mov.concepto)) montos.recibidoDiasAnteriores += mov._monto;
+  } else {
     const k = mov.concepto === 'cobranzaEfectivo' ? 'recibidoCobranza'
       : !mov.deJunta && (mov.concepto === 'cobroOtraSucursal' || mov.concepto === 'cobroOtraSucursalSinFactura') ? 'recibidoOtrasSucursales' : 'recibidoMostrador';
     montos[k] += mov._monto;

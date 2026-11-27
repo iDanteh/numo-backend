@@ -392,3 +392,25 @@ test('la global cuenta el día de su fecha de timbrado', async () => {
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(r.detalle[0]).toMatchObject({ concepto: 'cobroOtraSucursalSinFactura', facturaPosterior: 'I0-77', facturaPosteriorDia: '2026-11-01' });
 });
+
+// 2026-11-27 (pedido del usuario): "Mostrador Kore - Efectivo" como su Excel (CEDIS 20-nov 630,166.35):
+// la global va el día con más cobros, por su total menos tarjeta / transferencia (no resta saldo a
+// favor ni APA); una global de otra sucursal no cuenta.
+test('_mostradorKoreEfectivo: global propia el día de sus ventas, total menos lo no efectivo', async () => {
+  const filas = [{ serie: 'A0', dia: '2026-11-20' }, { serie: 'A0', dia: '2026-11-21' }];
+  const detalle = [
+    { serie: 'A0', dia: '2026-11-20', concepto: 'efectivoPorFacturar', facturaPosterior: 'A0-G1' }, // timbrada el 21
+    { serie: 'A0', dia: '2026-11-21', concepto: 'consignacionFacturada', factura: 'A0-G1', cobradoEl: '2026-11-20' },
+    { serie: 'A0', dia: '2026-11-21', concepto: 'cobroOtraSucursal', factura: 'B0-G9' },
+  ];
+  CFDI.find.mockReturnValue(lean([{ uuid: 'U1', serie: 'A0', folio: 'G1', total: 1000, receptor: { rfc: 'XAXX010101000' }, global: true, source: 'ERP' }]));
+  const k = (fecha, monto, nombre, serieOrigen = 'CPF') => ({ serieOrigen, fecha, monto: -monto, formasPago: [{ nombre, claveSat: nombre === 'EFECTIVO' ? '01' : '04', monto }] });
+  erp.obtenerDesglosesCobroPorFactura.mockResolvedValueOnce([
+    { cobros: [k('2026-11-20T18:00:00Z', 600, 'EFECTIVO'), k('2026-11-20T19:00:00Z', 150, 'TARJETA DE CREDITO')] },
+    { cobros: [k('2026-11-19T18:00:00Z', 200, 'EFECTIVO'), k('2026-11-20T20:00:00Z', 50, 'SALDO A FAVOR')] },
+  ]);
+  const avisos = await fichas._mostradorKoreEfectivo({ rfc: 'X', filas, detalle, propias: new Set(['A0', 'I0']) });
+  expect(avisos).toEqual([]);
+  expect(filas.map(f => f.mostradorKoreEfectivo)).toEqual([850, 0]);
+  expect(erp.obtenerDesglosesCobroPorFactura).toHaveBeenCalledTimes(1);
+});

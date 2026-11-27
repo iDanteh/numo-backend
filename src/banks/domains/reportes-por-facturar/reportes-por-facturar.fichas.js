@@ -91,7 +91,11 @@ const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonif
   'recibidoMostrador', 'recibidoCobranza', 'recibidoOtrasSucursales',
   // recibidoDiasAnteriores (2026-11-27, pedido del usuario): lo cobrado en días anteriores que suma hoy
   // porque hoy se timbró su global (importe cobrado, antes de BN). Solo referencia.
-  'recibidoDiasAnteriores'];
+  'recibidoDiasAnteriores',
+  // mostradorKoreEfectivo (2026-11-27, pedido del usuario: "Mostrador Kore - Efectivo" de su Excel, CEDIS
+  // 23-nov 584,270.49): lo facturado en efectivo (sin BN) de las globales de la sucursal (y sus juntas)
+  // que amparan cobros del día, completas (incluye cobros de días anteriores en esas globales).
+  'mostradorKoreEfectivo'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
@@ -771,6 +775,60 @@ function _clasificar({ facturada, cobro, info }) {
   return { concepto: facturada ? 'efectivoFacturado' : 'efectivoPorFacturar', tipoVenta, saldoDespues };
 }
 
+/**
+ * "Mostrador Kore - Efectivo" por caja (ver INFORMATIVOS; Excel del usuario CEDIS 23-nov 584,270.49 y
+ * 20-nov 630,166.35): cada global de la sucursal (y sus juntas) que ampara cobros de esta caja va el
+ * día en que tiene MÁS cobros (el de sus ventas, aunque se timbre después; un abono tardío o un cobro
+ * de días anteriores no la mueven — HIDALGO B0-261102468 del 21 trae un cobro del 26), por su total
+ * menos lo pagado con tarjeta /
+ * transferencia / cheque (el saldo a favor y las aplicaciones APA no se restan, como en el Excel).
+ * Una consulta a Kore por global (con caché); sin la global en NUMO no se cuenta.
+ */
+async function _mostradorKoreEfectivo({ rfc, filas, detalle, propias }) {
+  for (const f of filas) f.mostradorKoreEfectivo = 0;
+  const candidatas = new Map(); // factura → cajas (serie + día) con cobros del día amparados por ella
+  for (const d of detalle) {
+    if (d.cobradoEl || d.saldoFavorDe) continue;
+    const g = d.facturaPosterior || d.factura;
+    if (!g || !propias.has(_serie(g.split('-')[0]))) continue;
+    if (!candidatas.has(g)) candidatas.set(g, []);
+    candidatas.get(g).push({ serie: d.serie, dia: d.dia });
+  }
+  if (!candidatas.size) return [];
+  const pares = [...candidatas.keys()].map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
+  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares }).select(`uuid serie folio total satStatus erpStatus source ${CAMPOS_GLOBAL}`).lean();
+  const totalDe = new Map();
+  for (const [, c] of _vigentesPorUuid(docs)) if (_esGlobal(c)) totalDe.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, Number(c.total) || 0);
+  const avisos = [];
+  for (const [factura, cajas] of candidatas) {
+    if (!totalDe.has(factura)) continue;
+    const i = factura.indexOf('-');
+    let cuentas;
+    try { cuentas = await obtenerDesglosesCobroPorFactura({ rfc, serieFactura: factura.slice(0, i), folioFactura: factura.slice(i + 1) }); }
+    catch (e) { avisos.push(`No se pudo consultar en Kore la global ${factura} para "Mostrador Kore - Efectivo" (${e.message}).`); continue; }
+    const porDia = new Map();
+    let noEfectivo = 0;
+    for (const c of cuentas ?? []) for (const k of c.cobros ?? []) {
+      if (!k.fecha) continue;
+      const dk = _diaMx(k.fecha);
+      porDia.set(dk, (porDia.get(dk) ?? 0) + 1);
+      if (_serie(k.serieOrigen) === 'APA') continue;
+      const fps = k.formasPago ?? [];
+      const montoReal = k.monto != null ? Math.abs(Number(k.monto) || 0) : null;
+      for (const fp of fps) {
+        if (_forma(fp) || /puntos/i.test(fp?.nombre ?? '')) continue; // efectivo, saldo a favor, depósito: no se restan
+        noEfectivo += (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0);
+      }
+    }
+    // Día de la global: el de más cobros (empate → el más reciente); va en la caja de ese día.
+    const diaGlobal = [...porDia].sort(([a, n], [b, m]) => m - n || b.localeCompare(a))[0]?.[0];
+    const caja = cajas.find(x => x.dia === diaGlobal);
+    const f = caja && filas.find(x => x.serie === caja.serie && x.dia === caja.dia);
+    if (f) f.mostradorKoreEfectivo = _r2(f.mostradorKoreEfectivo + totalDe.get(factura) - noEfectivo);
+  }
+  return avisos;
+}
+
 const _total = m => _r2(ENTRADAS.reduce((s, k) => s + m[k], 0) - SALIDAS.reduce((s, k) => s + m[k], 0));
 
 /**
@@ -870,6 +928,9 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
     }
   }
   await _completarDetalle({ rfc, detalle });
+  advertencias.push(...await _mostradorKoreEfectivo({
+    rfc, filas, detalle, propias: new Set([...series, ...(SUCURSALES_JUNTAS[String(sucursal ?? '').trim().toUpperCase()] ?? [])]),
+  }));
   // Lo sin factura (no suma) va al final del anexo, con su desglose (2026-11-25).
   const _alFinal = d => (SIN_FACTURA.includes(d.concepto) ? 1 : 0);
   detalle.sort((a, b) => _alFinal(a) - _alFinal(b) || a.dia.localeCompare(b.dia) || a.serie.localeCompare(b.serie)
@@ -958,4 +1019,4 @@ async function listarBancos() {
   return todos.map(banco => ({ banco, numeroCuenta: configs.get(banco)?.numeroCuenta ?? null }));
 }
 
-module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, _clasificar, ENTRADAS, SALIDAS, SIN_FACTURA, CONCEPTOS };
+module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, _clasificar, _mostradorKoreEfectivo, ENTRADAS, SALIDAS, SIN_FACTURA, CONCEPTOS };

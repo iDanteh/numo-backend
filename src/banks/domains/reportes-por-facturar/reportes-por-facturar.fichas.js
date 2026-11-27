@@ -196,9 +196,16 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   const detalle = [];
   const fechaDesde = new Date(`${dia}T00:00:00.000-06:00`).toISOString();
   const fechaHasta = new Date(`${dia}T23:59:59.999-06:00`).toISOString();
-  const [cuentas, salidas] = await Promise.all([
+  // Los cobros de los días anteriores (otras sucursales facturadas hoy, ver abajo) se piden a la
+  // vez que los del día para no alargar la ficha (2026-11-27, usuario: "¿no tarda más?").
+  const [cuentas, salidas, previasKore] = await Promise.all([
     obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde, fechaHasta }),
     obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen: serie, fechaDesde, fechaHasta }),
+    obtenerDesglosesCobroAlmacenPorCentro({
+      rfc, centro: serie,
+      fechaDesde: new Date(`${_masDias(dia, -DIAS_OTRAS_PREVIAS)}T00:00:00.000-06:00`).toISOString(),
+      fechaHasta: new Date(`${_masDias(dia, -1)}T23:59:59.999-06:00`).toISOString(),
+    }).then(lista => ({ lista }), error => ({ error })),
   ]);
 
   // 2026-11-26 (pedido del usuario; CONCEPCION ESPINOSA y JUAN ALBERTO AQUINO, cobrados el
@@ -229,9 +236,8 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   // sigue saliendo de las fichas guardadas (_otrasSucursalesFacturadasHoy).
   const globalesOtrasHoy = new Set();
   try {
-    const hasta = new Date(`${_masDias(dia, -1)}T23:59:59.999-06:00`).toISOString();
-    const desde = new Date(`${_masDias(dia, -DIAS_OTRAS_PREVIAS)}T00:00:00.000-06:00`).toISOString();
-    const previas = (await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: serie, fechaDesde: desde, fechaHasta: hasta }) ?? [])
+    if (previasKore.error) throw previasKore.error;
+    const previas = (previasKore.lista ?? [])
       .filter(c => c.serieVenta && !propias.has(_serie(c.serieVenta)) && c.serieFactura);
     const facturas = previas.map(c => `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
     let { dias, faltan } = await _diaDeGlobales(rfc, facturas);

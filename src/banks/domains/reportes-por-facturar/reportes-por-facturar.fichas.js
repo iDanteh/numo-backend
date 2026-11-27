@@ -506,7 +506,8 @@ function _destinoSaldoFavor(cuentas, a) {
  * cliente va a `saldoFavorDevolucion` (informativo). Regresa los renglones extra (null si
  * Kore no trae el movimiento del cobro).
  */
-function _ajustarRenglon(d, abonos, { montos, hasta, cuentas }) {
+function _ajustarRenglon(d, abonos, ctx) {
+  const { montos, hasta, cuentas } = ctx;
   const proporcion = _bnDelCobro(abonos, d.cobro);
   if (proporcion == null) return null;
   const cobrado = d.importe;
@@ -522,10 +523,18 @@ function _ajustarRenglon(d, abonos, { montos, hasta, cuentas }) {
     for (const a of dev.aplicados) {
       if (!(a.importe > 0.005)) continue;
       const destino = _destinoSaldoFavor(cuentas, a);
+      if (!destino?.factura) {
+        // No se halló la remisión que se pagó con ese saldo a favor (cobrada en otra caja) o no
+        // tiene factura: no se puede decir que esté facturado → informativo, no suma.
+        d.saldoFavorPendiente = _r2((d.saldoFavorPendiente ?? 0) + a.importe);
+        montos.saldoFavorDevolucion += a.importe;
+        if (ctx.sinUbicar) ctx.sinUbicar.push(`${d.remision} (${a.movimiento} ${a.importe})`);
+        continue;
+      }
       d.importe = _r2(d.importe - a.importe);
       extras.push({
         dia: d.dia, serie: d.serie, concepto: d.concepto,
-        remision: destino?.remision ?? d.remision, factura: destino?.factura ?? d.factura,
+        remision: destino.remision, factura: destino.factura,
         cobro: a.movimiento, fecha: a.fecha, importe: a.importe, facturado: a.importe,
         saldoFavorDe: d.remision, ...(d.cobradoEl ? { cobradoEl: d.cobradoEl } : {}),
       });
@@ -553,11 +562,13 @@ async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja,
   const { info } = await infoRemisiones({ rfc, remisiones, necesitaSaldo: (k, g) => !(g?.abonos ?? []).some(_esBn) });
   const timbrado = await _timbradoDeFacturas(rfc, conGlobal.map(d => d.factura));
   let sinMovimientos = 0;
+  const sinUbicar = [];
   for (const d of conGlobal) {
-    const extras = _ajustarRenglon(d, info.get(_claveRem(d.remision))?.abonos, { montos, hasta: timbrado.get(d.factura), cuentas });
+    const extras = _ajustarRenglon(d, info.get(_claveRem(d.remision))?.abonos, { montos, hasta: timbrado.get(d.factura), cuentas, sinUbicar });
     if (extras == null) { sinMovimientos++; continue; }
     detalle.splice(detalle.indexOf(d) + 1, 0, ...extras);
   }
+  if (sinUbicar.length) avisos.push(`Caja ${caja}: saldo a favor de devoluciones aplicado a remisiones que no están en esta caja o sin factura (${sinUbicar.join(', ')}); va como informativo, no suma.`);
   if (sinMovimientos) avisos.push(`Kore no dio los movimientos de ${sinMovimientos} cobro(s) de la caja ${caja}: van con lo cobrado como facturado; vuelve a generar la ficha.`);
 }
 

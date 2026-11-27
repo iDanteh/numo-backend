@@ -80,7 +80,9 @@ const ENTRADAS = ['efectivoFacturado', 'consignacionFacturada', 'cobranzaEfectiv
 // pagoGastos (PG) y pagoViaticos (PV): efectivo que sale de la caja — restan (2026-11-26, decisión del usuario).
 const SALIDAS = ['devoluciones', 'pagoGastos', 'pagoViaticos', 'faltante'];
 // bonificacionGlobal (2026-11-26): BN de las globales — lo cobrado que no se factura ni se deposita.
-const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal'];
+// saldoFavorDevolucion (2026-11-27): devolución sobre un pago en efectivo antes de timbrar la global
+// que quedó como saldo a favor del cliente — el dinero sigue en la caja pero no está facturado.
+const INFORMATIVOS = ['retiroEfectivo', 'depositoEfectivo', 'saldoFavor', 'bonificacionGlobal', 'saldoFavorDevolucion'];
 // Efectivo de consignación SIN factura (2026-11-25): no suma al total; va al final del anexo.
 // cobroOtraSucursalSinFactura (2026-11-26, pedido del usuario; Atzompa E0-261102072 cobrada en
 // CEDIS 24-nov sin factura): no suma hasta que se facture; ese día suma en ESTA caja.
@@ -345,17 +347,18 @@ async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie], asegura
   // "solo se debe sumar sin las BON porque eso se deposita").
   const globales = new Set([...diaGlobal.keys(), ...globalesHoy.map(g => `${g.serie}-${g.folio}`), ...globalesOtrasHoy]);
   avisos.push(...avisosPrevios);
-  await _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja: `${serie} del ${dia}` });
+  await _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja: `${serie} del ${dia}`, cuentas: [...cuentasDia, ...anteriores] });
 
   // 4) Cobros de otras sucursales hechos en esta caja SIN factura en días anteriores (fichas
   // guardadas) que se facturaron HOY: suman hoy, por lo facturado (2026-11-26). Los que ya
   // trajo Kore arriba (últimos DIAS_OTRAS_PREVIAS días) no se repiten.
   const yaSumados = new Set(detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => `${d.remision}|${d.cobro}`));
-  for (const d of await _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes })) {
+  for (const { d, abonos, hasta } of await _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarRecientes })) {
     if (yaSumados.has(`${d.remision}|${d.cobro}`)) continue;
-    detalle.push(d);
-    montos.cobroOtraSucursal += d.facturado;
-    montos.bonificacionGlobal += d.importe - d.facturado;
+    montos.cobroOtraSucursal += d.importe;
+    const extras = _ajustarRenglon(d, abonos, { montos, hasta, cuentas: [...cuentasDia, ...anteriores] });
+    if (extras == null) d.facturado = d.importe;
+    detalle.push(d, ...(extras ?? []));
   }
 
   for (const s of salidas ?? []) {
@@ -403,7 +406,8 @@ function _bnDelCobro(abonos, cobro) {
       pagos = [];
     } else if (m.forma && Number(m.importe) > 0) {
       pagos.push({ movimiento: m.movimiento, importe: Number(m.importe) });
-    } else if (m.forma && Number(m.importe) < 0) {
+    } else if (m.forma && Number(m.importe) < 0 && !(Number(m.saldoAnterior) < 0)) {
+      // (Con saldo anterior negativo es uso / reembolso de un saldo a favor, no una cancelación.)
       // Cobro cancelado (RAB, p. ej. GLADIS GOMEZ A0-261101623: CPF de $18,853.88 revertido):
       // ya no cuenta para repartir la BN.
       const i = pagos.findIndex(p => Math.abs(p.importe + Number(m.importe)) < 0.005);
@@ -414,12 +418,131 @@ function _bnDelCobro(abonos, cobro) {
   return pago && Number(pago.importe) > 0 ? bn / Number(pago.importe) : 0;
 }
 
+const _esDevolucion = m => /^DEV-/i.test(String(m?.origen ?? '').trim()) && Number(m?.importe) > 0;
+const _esBnODev = m => _esBn(m) || _esDevolucion(m);
+
 /**
- * `facturado` de cada renglón que suma: lo cobrado menos la BN de la global (solo cobros
- * amparados por una GLOBAL; lo demás se factura por lo cobrado). Ajusta los montos de cada
- * renglón y acumula la diferencia en `bonificacionGlobal` (informativo).
+ * Devolución sobre el pago `cobro` hecha ANTES de timbrar la global (2026-11-27, pedido del
+ * usuario; PROMOTORIA I0-261100351: CPF-261103251 $258.38 en efectivo, RET-261115283
+ * (DEV-059736) $166.41 a saldo a favor, APA-261100950 $42.87 de ese saldo pagan I0-261100364 y
+ * quedan $123.54 a favor del cliente → la global ampara $91.97). Kore la registra como RET con
+ * origen DEV-… (sin forma) y después: APA-… = saldo a favor aplicado a otra remisión; otro
+ * movimiento negativo (p. ej. RET-261117297 EFECTIVO) = se le regresó al cliente. Cada
+ * devolución se reparte entre los pagos con forma hechos desde la BN / devolución anterior.
+ * @returns {{devolucion:number, reembolso:number, aplicados:Array<{movimiento,fecha,importe}>, pendiente:number}|null}
  */
-async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja }) {
+function _devolucionDelCobro(abonos, cobro, hasta = null) {
+  const movs = Array.isArray(abonos) ? abonos : [];
+  if (!movs.some(m => _serie(m.movimiento) === _serie(cobro))) return null;
+  const limite = hasta ? new Date(hasta).getTime() : Infinity;
+  const r = { devolucion: 0, reembolso: 0, aplicados: [], pendiente: 0 };
+  let pagos = [];
+  movs.forEach((m, j) => {
+    if (_esBn(m)) { pagos = []; return; }
+    if (!_esDevolucion(m)) {
+      if (m.forma && Number(m.importe) > 0) pagos.push({ movimiento: m.movimiento, importe: Number(m.importe) });
+      return;
+    }
+    const base = pagos.reduce((s, p) => s + p.importe, 0);
+    const mio = pagos.find(p => _serie(p.movimiento) === _serie(cobro));
+    pagos = [];
+    if (!mio || !(base > 0) || !(new Date(m.fecha).getTime() < limite)) return;
+    const parte = mio.importe / base;
+    const total = Number(m.importe);
+    let resto = total;
+    for (const n of movs.slice(j + 1)) {
+      if (_esBnODev(n) || resto <= 0.005) break;
+      const imp = -Number(n.importe);
+      if (!(imp > 0)) continue;
+      const usado = Math.min(imp, resto);
+      resto -= usado;
+      if (/^APA-/i.test(String(n.movimiento ?? '').trim())) r.aplicados.push({ movimiento: n.movimiento, fecha: n.fecha, importe: _r2(usado * parte) });
+      else r.reembolso += usado * parte;
+    }
+    r.devolucion += total * parte;
+    r.pendiente += resto * parte;
+  });
+  r.devolucion = _r2(r.devolucion); r.reembolso = _r2(r.reembolso); r.pendiente = _r2(r.pendiente);
+  return r;
+}
+
+/** Instante real del timbrado de cada factura vigente: Map 'SERIE-FOLIO' → Date. */
+async function _timbradoDeFacturas(rfc, facturas) {
+  const pares = [...new Set(facturas)].map(f => { const i = f.indexOf('-'); return { serie: f.slice(0, i), folio: f.slice(i + 1) }; });
+  const mapa = new Map();
+  if (!pares.length) return mapa;
+  const docs = await CFDI.find({ 'emisor.rfc': rfc, tipoDeComprobante: 'I', $or: pares })
+    .select(`uuid serie folio fecha satStatus erpStatus source ${CAMPO_TIMBRADO}`).lean();
+  for (const [, c] of _vigentesPorUuid(docs ?? [])) {
+    const ft = c?.timbreFiscalDigital?.fechaTimbrado;
+    // ERP: UTC real; SAT y CFDI.fecha: hora local pintada con Z (+6 h).
+    const t = ft && !isNaN(new Date(ft).getTime())
+      ? new Date(ft).getTime() + (c.source === 'ERP' ? 0 : 6 * 3600000)
+      : (c?.fecha ? new Date(c.fecha).getTime() + 6 * 3600000 : null);
+    if (t) mapa.set(`${_serie(c.serie)}-${String(c.folio ?? '').trim()}`, new Date(t));
+  }
+  return mapa;
+}
+
+/** Remisión / factura que se pagó con el saldo a favor aplicado `a` (mismo importe, ±5 min). */
+function _destinoSaldoFavor(cuentas, a) {
+  const t = new Date(a.fecha).getTime();
+  for (const c of cuentas ?? []) for (const k of c.cobros ?? []) {
+    if (!k.fecha || Math.abs(new Date(k.fecha).getTime() - t) > 5 * 60000) continue;
+    const sf = (k.formasPago ?? []).filter(f => _forma(f) === 'saldoFavor').reduce((s, f) => s + (Number(f.monto) || 0), 0);
+    if (Math.abs(sf - a.importe) > 0.02 || !c.serieVenta) continue;
+    return {
+      remision: `${_serie(c.serieVenta)}-${String(c.folioVenta ?? '').trim()}`,
+      factura: c.serieFactura ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null,
+    };
+  }
+  return null;
+}
+
+/**
+ * Ajusta un renglón amparado por una global: facturado = cobrado − BN − devolución (antes del
+ * timbrado). Lo devuelto que se aplicó como saldo a favor a otra remisión sale como renglón
+ * aparte (lo factura esa remisión; el dinero entró con este cobro); lo que sigue a favor del
+ * cliente va a `saldoFavorDevolucion` (informativo). Regresa los renglones extra (null si
+ * Kore no trae el movimiento del cobro).
+ */
+function _ajustarRenglon(d, abonos, { montos, hasta, cuentas }) {
+  const proporcion = _bnDelCobro(abonos, d.cobro);
+  if (proporcion == null) return null;
+  const cobrado = d.importe;
+  const bn = _r2(cobrado * proporcion);
+  let facturado = _r2(cobrado - bn);
+  const extras = [];
+  const dev = _devolucionDelCobro(abonos, d.cobro, hasta);
+  if (dev && dev.devolucion > 0.005) {
+    facturado = _r2(Math.max(0, facturado - dev.devolucion));
+    d.devolucion = dev.devolucion;
+    if (dev.reembolso > 0.005) d.devolucionReembolsada = dev.reembolso;
+    if (dev.pendiente > 0.005) { d.saldoFavorPendiente = dev.pendiente; montos.saldoFavorDevolucion += dev.pendiente; }
+    for (const a of dev.aplicados) {
+      if (!(a.importe > 0.005)) continue;
+      const destino = _destinoSaldoFavor(cuentas, a);
+      d.importe = _r2(d.importe - a.importe);
+      extras.push({
+        dia: d.dia, serie: d.serie, concepto: d.concepto,
+        remision: destino?.remision ?? d.remision, factura: destino?.factura ?? d.factura,
+        cobro: a.movimiento, fecha: a.fecha, importe: a.importe, facturado: a.importe,
+        saldoFavorDe: d.remision, ...(d.cobradoEl ? { cobradoEl: d.cobradoEl } : {}),
+      });
+    }
+  }
+  montos[d.concepto] += facturado + extras.reduce((s, x) => s + x.facturado, 0) - cobrado;
+  montos.bonificacionGlobal += bn;
+  d.facturado = facturado;
+  return extras;
+}
+
+/**
+ * `facturado` de cada renglón que suma: lo cobrado menos la BN de la global y menos las
+ * devoluciones antes del timbrado (solo cobros amparados por una GLOBAL; lo demás se factura por
+ * lo cobrado). Ajusta los montos y acumula la BN en `bonificacionGlobal` (informativo).
+ */
+async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja, cuentas = [] }) {
   const filas = detalle.filter(d => ENTRADAS.includes(d.concepto));
   for (const d of filas) d.facturado = d.importe;
   // Incluye los cobros de otras sucursales (2026-11-26, pedido del usuario: "debería sumar por lo facturado").
@@ -428,14 +551,12 @@ async function _aplicarFacturado({ rfc, detalle, montos, globales, avisos, caja 
   const remisiones = conGlobal.map(d => { const i = d.remision.indexOf('-'); return { serie: d.remision.slice(0, i), folio: d.remision.slice(i + 1), fechaCreacion: d._fechaCreacion }; });
   // Movimientos frescos salvo que la memoria ya traiga la BN (se aplica una vez, al timbrar).
   const { info } = await infoRemisiones({ rfc, remisiones, necesitaSaldo: (k, g) => !(g?.abonos ?? []).some(_esBn) });
+  const timbrado = await _timbradoDeFacturas(rfc, conGlobal.map(d => d.factura));
   let sinMovimientos = 0;
   for (const d of conGlobal) {
-    const proporcion = _bnDelCobro(info.get(_claveRem(d.remision))?.abonos, d.cobro);
-    if (proporcion == null) { sinMovimientos++; continue; }
-    const facturado = _r2(d.importe * (1 - proporcion));
-    montos[d.concepto] += facturado - d.importe;
-    montos.bonificacionGlobal += d.importe - facturado;
-    d.facturado = facturado;
+    const extras = _ajustarRenglon(d, info.get(_claveRem(d.remision))?.abonos, { montos, hasta: timbrado.get(d.factura), cuentas });
+    if (extras == null) { sinMovimientos++; continue; }
+    detalle.splice(detalle.indexOf(d) + 1, 0, ...extras);
   }
   if (sinMovimientos) avisos.push(`Kore no dio los movimientos de ${sinMovimientos} cobro(s) de la caja ${caja}: van con lo cobrado como facturado; vuelve a generar la ficha.`);
 }
@@ -477,11 +598,11 @@ async function _otrasSucursalesFacturadasHoy({ rfc, serie, dia, asegurarReciente
     let dias = await _diaDeFacturas(rfc, [factura]);
     if (!dias.has(factura) && dia >= _hoyAyer().ayer && await asegurarRecientes()) dias = await _diaDeFacturas(rfc, [factura]);
     if (dias.get(factura) !== dia) continue;
-    const proporcion = _bnDelCobro(c.abonos, x.cobro) ?? 0;
-    const importe = _r2(x.importe);
+    // El facturado (BN y devoluciones antes del timbrado) lo calcula _ajustarRenglon.
+    const hasta = (await _timbradoDeFacturas(rfc, [factura])).get(factura) ?? null;
     salida.push({
-      dia, serie, concepto: 'cobroOtraSucursal', remision: x.remision, factura, cobro: x.cobro, fecha: x.fecha,
-      importe, facturado: _r2(importe * (1 - proporcion)), cobradoEl: x.dia,
+      d: { dia, serie, concepto: 'cobroOtraSucursal', remision: x.remision, factura, cobro: x.cobro, fecha: x.fecha, importe: _r2(x.importe), cobradoEl: x.dia },
+      abonos: c.abonos, hasta,
     });
   }
   return salida;

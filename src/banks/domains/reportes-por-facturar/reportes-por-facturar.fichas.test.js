@@ -135,6 +135,27 @@ test('calcularFicha: cobro de otra sucursal en esta caja un día anterior, globa
   expect(r.detalle.find(d => d.remision === 'I0-386')).toMatchObject({ concepto: 'cobroOtraSucursal', factura: 'I0-9', cobradoEl: '2026-10-31', importe: 4143.21 });
 });
 
+test('calcularFicha: devolución antes de timbrar la global → facturado = cobrado − devolución; saldo a favor aplicado va a la otra remisión (I0-261100351, 2026-11-27)', async () => {
+  // Global I0-9 timbrada el 31-oct 18:00 MX (ERP = UTC real).
+  CFDI.find.mockReturnValue(lean([{ uuid: 'G9', serie: 'I0', folio: '9', fecha: '2026-10-31T18:00:00Z', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, global: true, source: 'ERP', timbreFiscalDigital: { fechaTimbrado: '2026-11-01T00:00:00Z' } }]));
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ fechaDesde }) => (fechaDesde.startsWith('2026-10-31') ? [
+    { cuentaId: 'a', serieVenta: 'I0', folioVenta: '351', serieFactura: 'I0', folioFactura: '9', cobros: [cobro('CPF', 258.38, [EF(258.38)], { folioOrigen: '3251', fecha: '2026-10-31T15:44:00Z' })] },
+    { cuentaId: 'b', serieVenta: 'I0', folioVenta: '364', serieFactura: 'I0', folioFactura: '9', cobros: [cobro('CPF', 42.87, [{ claveSat: '30', nombre: 'SALDO A FAVOR', monto: 42.87 }], { folioOrigen: '3279', fecha: '2026-10-31T17:41:00Z' })] },
+  ] : []));
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  koreRem.infoRemisiones.mockResolvedValue({ info: new Map([['I0|351', { nombreTipoMovimiento: 'CONSIGNACION', abonos: [
+    { fecha: '2026-10-31T15:44:00Z', movimiento: 'CPF-3251', forma: 'EFECTIVO', importe: 258.38, saldoAnterior: 258.38, saldo: 0 },
+    { fecha: '2026-10-31T17:35:00Z', movimiento: 'RET-5283', origen: 'DEV-059736', forma: null, importe: 166.41, saldoAnterior: 0, saldo: -166.41 },
+    { fecha: '2026-10-31T17:41:00Z', movimiento: 'APA-950', forma: 'SALDO A FAVOR', importe: -42.87, saldoAnterior: -166.41, saldo: -123.54 },
+  ] }]]) });
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.totales.cobroOtraSucursal).toBe(134.84);
+  expect(r.totales.saldoFavorDevolucion).toBe(123.54);
+  expect(r.totales.bonificacionGlobal).toBe(0);
+  expect(r.detalle.find(d => d.remision === 'I0-351')).toMatchObject({ importe: 215.51, facturado: 91.97, devolucion: 166.41, saldoFavorPendiente: 123.54 });
+  expect(r.detalle.find(d => d.saldoFavorDe === 'I0-351')).toMatchObject({ remision: 'I0-364', factura: 'I0-9', cobro: 'APA-950', importe: 42.87, facturado: 42.87 });
+});
+
 test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', async () => {
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockRejectedValue(new Error('429'));
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);

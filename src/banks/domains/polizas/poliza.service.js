@@ -4079,6 +4079,55 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
  * `esConceptoMarcadorAjuste` y se preserva en vez de usar la serie-folio de
  * la factura, para que la columna H siga mostrando el marcador del ajuste.
  */
+/**
+ * CEDIS (2026-11-27, pedido del usuario; DEV-059842 NC A0-261113595 → OPA-01516 anticipo
+ * A0-261113669, DIEGO ANTONIO AQUINO 275.62): una devolución que Kore deja como saldo a favor
+ * genera la NC (Cargo Devoluciones + IVA / Abono Clientes, Bancos o Caja por identificar) y un
+ * CFDI de anticipo "sin cobro" (Reg 22C: Cargo Bancos por identificar / Abono Anticipos + IVA
+ * anticipos) del mismo cliente e importe. No entró dinero: la NC debe salir en DEV junto con la
+ * creación de su OPA (Cargo Devoluciones + IVA / Abono Anticipos + IVA anticipos), sin el abono de
+ * la NC (el cargo 'Venta Sin Cobro' del anticipo ya no sale en el export), y el anticipo ya no sale
+ * en Ventas.
+ * Empareja por RFC del receptor e importe (±0.02), una NC con un anticipo.
+ * @returns {{ contado: object[], credito: object[], pares: { serieNc: string, abonosOpa: object[] }[] }}
+ */
+function _juntarDevolucionConSuOpa(contado, credito) {
+  const todos = [...contado, ...credito];
+  const porSerie = new Map();
+  for (const m of todos) {
+    if (!porSerie.has(m.serie)) porSerie.set(m.serie, []);
+    porSerie.get(m.serie).push(m);
+  }
+  const ncs = [];
+  const anticipos = [];
+  for (const [serie, movs] of porSerie) {
+    const esNc = movs.every(m => m.tipoComprobante === 'E' && /^devoluci/i.test(m.tipoOrigen || ''));
+    if (esNc) {
+      const abonos = movs.filter(m => Number(m.haber) > 0 && !(Number(m.debe) > 0));
+      if (abonos.length === 1) ncs.push({ serie, rfc: movs[0].rfcReceptor, total: Number(abonos[0].haber), abono: abonos[0] });
+      continue;
+    }
+    // Su Cargo 'Venta Sin Cobro' ya no llega aquí (`_extraerCobrosSucursal` lo quita del export):
+    // queda solo el Abono Anticipos + IVA. Con Cargo real (sí hubo cobro) no se toca.
+    if (!movs.every(m => /^Reg 22C/i.test(m.reglaNombre || '') && Number(m.haber) > 0 && !(Number(m.debe) > 0))) continue;
+    const total = Math.round(movs.reduce((s, m) => s + Number(m.haber), 0) * 100) / 100;
+    anticipos.push({ serie, rfc: movs[0].rfcReceptor, total, abonos: movs });
+  }
+  const fuera = new Set();
+  const pares = [];
+  for (const nc of ncs) {
+    if (!nc.rfc) continue;
+    const a = anticipos.find(x => !x.usado && x.rfc === nc.rfc && Math.abs(x.total - nc.total) < 0.02);
+    if (!a) continue;
+    a.usado = true;
+    fuera.add(nc.abono);
+    for (const m of a.abonos) fuera.add(m);
+    // Anticipo antes que su IVA (mayor importe primero), como el ejemplo del usuario.
+    pares.push({ serieNc: nc.serie, abonosOpa: [...a.abonos].sort((x, y) => Number(y.haber) - Number(x.haber)) });
+  }
+  return { contado: contado.filter(m => !fuera.has(m)), credito: credito.filter(m => !fuera.has(m)), pares };
+}
+
 function enriquecerConceptoConCliente(movs, nombresClientes, ticketsPorFactura = null) {
   return movs.map(m => {
     // `m` es una instancia de Sequelize — sus campos reales viven detrás de
@@ -4312,6 +4361,12 @@ async function exportContpaqXlsx(id, overrides = {}) {
     const credito = movimientos.filter(m => m.metodoPago === 'PPD');
 
     if (esCedis) {
+      // Devolución que quedó como saldo a favor (2026-11-27, pedido del usuario: CEDIS 26-nov
+      // DEV-059842 / OPA-01516): la NC sale en DEV junto con la creación de su OPA, y el anticipo
+      // ya no sale en Ventas (ver `_juntarDevolucionConSuOpa`).
+      const juntas = _juntarDevolucionConSuOpa(contado, credito);
+      contado.splice(0, contado.length, ...juntas.contado);
+      credito.splice(0, credito.length, ...juntas.credito);
       // CEDIS: hasta 6 pólizas — Contado, Crédito, Bonificaciones de Contado,
       // Bonificaciones de Crédito, Descuentos/Devoluciones/Cancelaciones de
       // Contado y de Crédito. Solo se genera la que tenga movimientos —
@@ -4323,6 +4378,19 @@ async function exportContpaqXlsx(id, overrides = {}) {
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
+
+      // La creación de la OPA va justo después de su NC, en el bloque DEV donde quedó la NC.
+      // Si la NC no quedó en DEV (no debería), la OPA va al final del DEV de Crédito para no descuadrar.
+      // El DEV de Crédito se enriquece al armar el bloque (`push` de abajo); el de Contado ya viene
+      // enriquecido, así que ahí la OPA se enriquece aquí (dos veces perdería el "OPA-xxxxx").
+      for (const { serieNc, abonosOpa } of juntas.pares) {
+        const dev = [rSplit.descuentosDevoluciones, cSplit.descuentosDevoluciones]
+          .find(d => d.some(m => m.serie === serieNc)) ?? rSplit.descuentosDevoluciones;
+        const opa = dev === cSplit.descuentosDevoluciones ? enriquecerConceptoConCliente(abonosOpa, nombresClientes) : abonosOpa;
+        let i = dev.length - 1;
+        dev.forEach((m, k) => { if (m.serie === serieNc) i = k; });
+        dev.splice(i + 1, 0, ...opa);
+      }
 
       let folio = overrides.folioContado ?? poliza.numero;
       bloques = [];
@@ -6099,7 +6167,7 @@ module.exports = {
   resolverBankMovimientoDeCompensacionIntereses,
   listBorradorCandidatasCompensacionesIntereses, cancelarTodasCompensacionesIntereses,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
-  _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
+  _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito, _juntarDevolucionConSuOpa,
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.

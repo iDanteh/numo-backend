@@ -3829,7 +3829,7 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
 // que ya se calcularon todos sus `movs`.
 function _inyectarCobrosSucursal(bloques, filas, filasTarjetaCobroSucursal = []) {
   if (!filas.length || !bloques.length) return;
-  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
+  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones|Cancelaciones y Devoluciones) de/.test(t || '');
   // Discrimina por metodoPago (no por cuenta): el Cargo a la cuenta puente
   // (2103040001) Y el Abono a Clientes (misma cuenta que la venta) ambos
   // llevan metodoPago='PPD' cuando la factura original es de Crédito.
@@ -3902,7 +3902,7 @@ function _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos
     });
   }
   if (!porCentro.size) return;
-  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
+  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones|Cancelaciones y Devoluciones) de/.test(t || '');
   const candidatoContado =
     bloques.find(b => b.tipoVenta === 'Contado') ??
     bloques.find(b => b.tipoVenta == null) ??
@@ -4624,8 +4624,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes, ticketsPorFactura), overrides.folioCredito);
       push('Bonificaciones de Contado',             cSplit.bonificaciones);
       push('Bonificaciones de Crédito',             enriquecerConceptoConCliente(rSplit.bonificaciones, nombresClientes));
-      push('Descuentos y Devoluciones de Contado',  cSplit.descuentosDevoluciones);
-      push('Descuentos y Devoluciones de Crédito',  enriquecerConceptoConCliente(rSplit.descuentosDevoluciones, nombresClientes));
+      push('Cancelaciones y Devoluciones de Contado', cSplit.descuentosDevoluciones);
+      push('Cancelaciones y Devoluciones de Crédito', enriquecerConceptoConCliente(rSplit.descuentosDevoluciones, nombresClientes));
 
       if (bloques.length === 0) {
         throw new ValidationError('No hay movimientos para generar la póliza de CEDIS.');
@@ -4856,10 +4856,10 @@ async function exportContpaqXlsx(id, overrides = {}) {
     const GRUPO_POR_TIPO_VENTA = {
       'Contado': 'Ventas', 'Credito': 'Ventas',
       'Bonificaciones de Contado': 'Bonificaciones', 'Bonificaciones de Crédito': 'Bonificaciones',
-      'Descuentos y Devoluciones de Contado': 'Descuentos y Devoluciones',
-      'Descuentos y Devoluciones de Crédito': 'Descuentos y Devoluciones',
+      'Cancelaciones y Devoluciones de Contado': 'Cancelaciones y Devoluciones',
+      'Cancelaciones y Devoluciones de Crédito': 'Cancelaciones y Devoluciones',
     };
-    const gruposOrdenados = ['Ventas', 'Bonificaciones', 'Descuentos y Devoluciones'];
+    const gruposOrdenados = ['Ventas', 'Bonificaciones', 'Cancelaciones y Devoluciones'];
     const bloquesPorGrupo = new Map(gruposOrdenados.map(g => [g, []]));
     for (const bloque of bloques) {
       bloquesPorGrupo.get(GRUPO_POR_TIPO_VENTA[bloque.tipoVenta]).push(bloque);
